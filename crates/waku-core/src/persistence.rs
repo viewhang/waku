@@ -272,7 +272,12 @@ pub struct PersistedState {
     /// detect from PATH.
     #[serde(default)]
     pub provider_binary_overrides: HashMap<ProviderKind, String>,
-    /// Unknown daemon settings survive edits made by this desktop version.
+    /// Native profiles are persisted by the daemon settings store
+    #[serde(skip)]
+    assistant_profiles: Vec<waku_protocol::settings::AssistantProfile>,
+    #[serde(skip)]
+    model_services: Vec<waku_protocol::settings::ModelService>,
+    /// Unknown daemon settings survive edits made by this desktop version
     #[serde(skip)]
     daemon_settings_extra: BTreeMap<String, serde_json::Value>,
     /// Sessions changed since the last save.
@@ -374,6 +379,8 @@ impl PersistedState {
             computer_use_allowed_apps: Vec::new(),
             disabled_providers: Vec::new(),
             provider_binary_overrides: HashMap::new(),
+            assistant_profiles: Vec::new(),
+            model_services: Vec::new(),
             daemon_settings_extra: BTreeMap::new(),
             dirty_sessions: HashSet::new(),
         }
@@ -468,6 +475,8 @@ impl PersistedState {
         crate::DaemonSettings {
             computer_use_enabled: self.computer_use_enabled,
             computer_use_allowed_apps: self.computer_use_allowed_apps.clone(),
+            assistants: self.assistant_profiles.clone(),
+            model_services: self.model_services.clone(),
             disabled_providers: self.disabled_providers.clone(),
             provider_binary_overrides: self.provider_binary_overrides.clone(),
             extra: self.daemon_settings_extra.clone(),
@@ -501,6 +510,8 @@ impl PersistedState {
     pub fn apply_daemon_settings(&mut self, settings: crate::DaemonSettings) {
         self.computer_use_enabled = settings.computer_use_enabled;
         self.computer_use_allowed_apps = settings.computer_use_allowed_apps;
+        self.assistant_profiles = settings.assistants;
+        self.model_services = settings.model_services;
         self.disabled_providers = settings.disabled_providers;
         self.provider_binary_overrides = settings.provider_binary_overrides;
         self.daemon_settings_extra = settings.extra;
@@ -1233,6 +1244,7 @@ impl StateStore {
         session.turns = stored.turns;
         session.queued_messages = stored.queued_messages;
         session.workspace = stored.workspace;
+        session.assistant = stored.assistant;
         session.provider_cursor = stored.provider_cursor;
         session.runtime_mode = stored.runtime_mode;
         session.reasoning_effort = stored.reasoning_effort;
@@ -1515,6 +1527,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         project_id: Uuid::parse_str(&project_id).ok()?,
         workspace: SessionWorkspace::Local,
         provider: serde_json::from_value(serde_json::Value::String(provider)).ok()?,
+        assistant: None,
         model,
         // Hydration replaces these; the list never reads them.
         runtime_mode: RuntimeMode::default(),

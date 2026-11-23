@@ -326,6 +326,7 @@ function fileTypeIconName(path: string): FileTypeIconName {
 
 const PROVIDER_ICONS: Record<ProviderKind, string> = {
   amp: 'i-waku-provider-amp',
+  assistant: 'i-waku-bot',
   claude: 'i-waku-provider-claude',
   codex: 'i-waku-provider-openai',
   cursor: 'i-waku-provider-cursor',
@@ -358,6 +359,7 @@ export const PROVIDERS: Array<{
 ]
 
 export function providerMeta(provider: ProviderKind) {
+  if (provider === 'assistant') return { id: provider, name: 'Assistant', shortName: 'Assistant', command: '' }
   return PROVIDERS.find((candidate) => candidate.id === provider) ?? PROVIDERS[2]!
 }
 

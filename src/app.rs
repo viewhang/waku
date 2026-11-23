@@ -212,7 +212,9 @@ enum BranchPickerAction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SettingsPage {
+    Assistants,
     General,
+    ModelServices,
     Providers,
     Skills,
     Usage,
@@ -1068,6 +1070,9 @@ pub struct Waku {
     task_switcher: task_switcher::TaskSwitcherUi,
     model_search: Entity<TextInput>,
     settings_search: Entity<TextInput>,
+    assistant_form: assistants::AssistantForm,
+    model_service_form: Option<model_services::ModelServiceForm>,
+    assistant_model_scroll: gpui::UniformListScrollHandle,
     daemon_port_input: Entity<TextInput>,
     daemon_origins_input: Entity<TextInput>,
     daemon_reconfigure_pending: bool,
@@ -1616,6 +1621,7 @@ pub struct Waku {
 }
 
 mod activity_diff;
+mod assistants;
 mod autocomplete;
 mod background_work;
 mod branches;
@@ -1627,6 +1633,7 @@ mod drafts;
 mod file_search;
 mod goal_dialog;
 mod image_preview;
+mod model_services;
 mod project_picker;
 mod render;
 mod right_panel;
@@ -2001,6 +2008,8 @@ impl Waku {
                 .clear_on_escape()
                 .placeholder(tr!("settings.search"))
         });
+        let assistant_form = assistants::AssistantForm::new(window, cx);
+        let assistant_model_scroll = gpui::UniformListScrollHandle::new();
         let daemon_port = state.daemon_exposure.port.to_string();
         let daemon_origins = state.daemon_exposure.allowed_origins_text();
         let daemon_port_input = cx.new(|cx| {
@@ -2496,7 +2505,11 @@ impl Waku {
                 &model_search,
                 |this: &mut Self, search, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Edited) {
-                        if search.read(cx).content().trim().is_empty() {
+                        if this.assistant_model_picker_open() {
+                            this.model_picker_highlight = Some(0);
+                            this.assistant_model_scroll
+                                .scroll_to_item(0, gpui::ScrollStrategy::Top);
+                        } else if search.read(cx).content().trim().is_empty() {
                             this.model_picker_highlight = None;
                             this.reveal_selected_picker_model();
                         } else {
@@ -2747,6 +2760,9 @@ impl Waku {
                 branch_create_input,
                 project_search,
                 settings_search,
+                assistant_form,
+                model_service_form: None,
+                assistant_model_scroll,
                 daemon_port_input,
                 daemon_origins_input,
                 daemon_reconfigure_pending: false,

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use parking_lot::Mutex;
 use uuid::Uuid;
 pub use waku_protocol::settings::DaemonSettings;
+use waku_protocol::settings::{ModelService, ServiceModel};
 
 pub struct DaemonSettingsStore {
     path: PathBuf,
@@ -60,7 +61,7 @@ impl DaemonSettingsStore {
             Err(error) => return Err(error),
         };
         settings.discard_legacy_app_keys();
-        if write_current {
+        if migrate_assistant_services(&mut settings) || write_current {
             write_atomic(&path, &settings)?;
         }
         Ok(Self {
@@ -73,13 +74,131 @@ impl DaemonSettingsStore {
         self.settings.lock().clone()
     }
 
+    pub fn model_service(&self, id: Uuid) -> Option<ModelService> {
+        self.settings
+            .lock()
+            .model_services
+            .iter()
+            .find(|service| service.id == id)
+            .cloned()
+    }
+
+    /// Older sessions still refer to the shared endpoint credential by URL
+    pub fn legacy_model_service(&self, assistant: Uuid, base_url: &str) -> Option<ModelService> {
+        let base_url = base_url.trim().trim_end_matches('/');
+        let settings = self.settings.lock();
+        let default = settings
+            .assistants
+            .iter()
+            .find(|item| item.id == assistant)
+            .and_then(|item| item.model_service_id);
+        settings
+            .model_services
+            .iter()
+            .filter(|service| service.base_url == base_url)
+            .filter(|service| service.legacy_key || default == Some(service.id))
+            .max_by_key(|service| default == Some(service.id))
+            .cloned()
+    }
+
     pub fn replace(&self, mut settings: DaemonSettings) -> io::Result<()> {
         settings.discard_legacy_app_keys();
+        migrate_assistant_services(&mut settings);
         let mut current = self.settings.lock();
         write_atomic(&self.path, &settings)?;
         *current = settings;
         Ok(())
     }
+
+    /// Catalog edits are committed separately so older preference snapshots cannot overwrite them
+    pub(crate) fn replace_preferences(&self, mut settings: DaemonSettings) -> io::Result<()> {
+        let mut current = self.settings.lock();
+        settings.model_services.clone_from(&current.model_services);
+        settings.discard_legacy_app_keys();
+        migrate_assistant_services(&mut settings);
+        write_atomic(&self.path, &settings)?;
+        *current = settings;
+        Ok(())
+    }
+
+    pub(crate) fn save_model_service(
+        &self,
+        mut service: ModelService,
+        key: Option<&str>,
+    ) -> anyhow::Result<ModelService> {
+        if service.name.trim().is_empty() {
+            anyhow::bail!("Enter a model service name");
+        }
+        if let Some(model) = service
+            .models
+            .iter()
+            .find(|model| !model.options.valid_token_limits())
+        {
+            anyhow::bail!("Invalid token limits for {}", model.id);
+        }
+        let mut current = self.settings.lock();
+        let mut next = current.clone();
+        let saved = next
+            .model_services
+            .iter_mut()
+            .find(|item| item.id == service.id);
+        service.legacy_key = key != Some("")
+            && saved
+                .as_ref()
+                .is_some_and(|item| item.legacy_key && item.base_url == service.base_url);
+        if let Some(saved) = saved {
+            *saved = service.clone();
+        } else {
+            next.model_services.push(service.clone());
+        }
+        crate::driver::assistant::commit_api_key(&service, key, || {
+            write_atomic(&self.path, &next)
+        })?;
+        *current = next;
+        Ok(service)
+    }
+}
+
+/// Move legacy endpoint and model pairs into shared services on first load
+fn migrate_assistant_services(settings: &mut DaemonSettings) -> bool {
+    let mut changed = false;
+    for profile in &mut settings.assistants {
+        let endpoint = profile.base_url.trim().trim_end_matches('/');
+        if profile.model_service_id.is_some() || endpoint.is_empty() {
+            continue;
+        }
+        let index = settings
+            .model_services
+            .iter()
+            .position(|service| service.legacy_key && service.base_url == endpoint)
+            .unwrap_or_else(|| {
+                settings.model_services.push(ModelService {
+                    id: profile.id,
+                    name: url::Url::parse(endpoint)
+                        .ok()
+                        .filter(|url| url.has_host())
+                        .map(|url| {
+                            url[url::Position::BeforeHost..url::Position::AfterPort].to_owned()
+                        })
+                        .unwrap_or_else(|| profile.name.clone()),
+                    base_url: endpoint.to_owned(),
+                    enabled: true,
+                    models: Vec::new(),
+                    legacy_key: true,
+                });
+                settings.model_services.len() - 1
+            });
+        let service = &mut settings.model_services[index];
+        if !profile.model.trim().is_empty() && service.model(&profile.model).is_none() {
+            service
+                .models
+                .push(ServiceModel::new(profile.model.clone()));
+        }
+        profile.model_service_id = Some(service.id);
+        profile.base_url.clear();
+        changed = true;
+    }
+    changed
 }
 
 fn quarantine_corrupt_settings(path: &Path) -> io::Result<PathBuf> {
@@ -106,6 +225,35 @@ fn to_io_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_assistants_to_one_service_per_legacy_endpoint() {
+        let mut settings: DaemonSettings = serde_json::from_value(serde_json::json!({
+            "assistants": [
+                { "id": Uuid::new_v4(), "name": "Guide", "system_prompt": "read", "model": "first", "base_url": "https://example.test/v1/", "read_readme": true },
+                { "id": Uuid::new_v4(), "name": "Chat", "system_prompt": "help", "model": "second", "base_url": "https://example.test/v1", "read_readme": false }
+            ]
+        })).unwrap();
+
+        assert!(migrate_assistant_services(&mut settings));
+        assert!(!migrate_assistant_services(&mut settings));
+        assert_eq!(settings.model_services.len(), 1);
+        let service = &settings.model_services[0];
+        assert!(service.legacy_key);
+        assert_eq!(
+            service
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(settings.assistants.iter().all(|profile| {
+            profile.model_service_id == Some(service.id) && profile.base_url.is_empty()
+        }));
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert!(saved["assistants"][0].get("read_readme").is_none());
+    }
     use serde_json::Value;
     use uuid::Uuid;
     use waku_protocol::model::ProviderKind;

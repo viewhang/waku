@@ -296,6 +296,7 @@ impl Waku {
                 message,
                 turn_id,
                 message_id,
+                attachments,
             } => {
                 // A prompt reached this runtime: another client's submission,
                 // or the echo of this one. The session decides whether that
@@ -303,7 +304,7 @@ impl Waku {
                 // projection this client persists carries the prompt whose
                 // reply it is about to stream.
                 if let Some(session) = self.state.session_mut(session_id)
-                    && session.adopt_submitted_prompt(&message, turn_id, message_id)
+                    && session.adopt_submitted_prompt(&message, turn_id, message_id, attachments)
                 {
                     self.state.mark_session_dirty(session_id);
                 }
@@ -395,6 +396,19 @@ impl Waku {
             DriverEvent::TextDelta(delta) => {
                 if self.accepts_turn_output(session_id) {
                     self.append_text_delta(session_id, runtime, delta);
+                }
+            }
+            DriverEvent::AssistantAttachment(attachment) => {
+                if self.accepts_turn_output(session_id) {
+                    self.append_text_delta(session_id, runtime, String::new());
+                    if let Some(message) = self
+                        .state
+                        .session_mut(session_id)
+                        .and_then(|session| session.messages.last_mut())
+                        .filter(|message| message.role == MessageRole::Assistant)
+                    {
+                        message.attachments.push(attachment);
+                    }
                 }
             }
             DriverEvent::ReasoningDelta(delta) => {

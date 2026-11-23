@@ -6,7 +6,9 @@ use uuid::Uuid;
 
 use crate::WireDriverEvent;
 use crate::computer_use::{ComputerTarget, ComputerUsePhase, ComputerUseState};
-use crate::model::{ActivityKind, DriverEvent, PermissionOption, UserInputQuestion};
+use crate::model::{
+    ActivityKind, DriverEvent, MessageAttachment, PermissionOption, UserInputQuestion,
+};
 
 pub fn decode_enum<T: DeserializeOwned>(value: &str) -> anyhow::Result<T> {
     serde_json::from_value(Value::String(value.to_owned()))
@@ -38,6 +40,9 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
         DriverEvent::TurnStarted => ("turnStarted", Value::Null),
         DriverEvent::TurnParked => ("turnParked", Value::Null),
         DriverEvent::TextDelta(text) => ("textDelta", Value::String(text)),
+        DriverEvent::AssistantAttachment(attachment) => {
+            ("assistantAttachment", serde_json::to_value(attachment)?)
+        }
         DriverEvent::ReasoningDelta(text) => ("reasoningDelta", Value::String(text)),
         DriverEvent::Activity {
             id,
@@ -94,9 +99,10 @@ pub fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
             message,
             turn_id,
             message_id,
+            attachments,
         } => (
             "promptSubmitted",
-            json!({ "message": message, "turnId": turn_id, "messageId": message_id }),
+            json!({ "message": message, "turnId": turn_id, "messageId": message_id, "attachments": attachments }),
         ),
         DriverEvent::SteerAccepted { message } => ("steerAccepted", json!({ "message": message })),
         DriverEvent::SteerRejected { message, reason } => (
@@ -137,6 +143,7 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         "turnStarted" => DriverEvent::TurnStarted,
         "turnParked" => DriverEvent::TurnParked,
         "textDelta" => DriverEvent::TextDelta(serde_json::from_value(payload)?),
+        "assistantAttachment" => DriverEvent::AssistantAttachment(serde_json::from_value(payload)?),
         "reasoningDelta" => DriverEvent::ReasoningDelta(serde_json::from_value(payload)?),
         "activity" => {
             let activity: ActivityWire = serde_json::from_value(payload)?;
@@ -181,6 +188,7 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
                 message: submitted.message,
                 turn_id: submitted.turn_id,
                 message_id: submitted.message_id,
+                attachments: submitted.attachments,
             }
         }
         "steerAccepted" => {
@@ -224,6 +232,8 @@ struct SubmittedPromptWire {
     message: String,
     turn_id: Uuid,
     message_id: Uuid,
+    #[serde(default)]
+    attachments: Vec<MessageAttachment>,
 }
 
 #[derive(Deserialize)]

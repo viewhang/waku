@@ -33,7 +33,9 @@ export function ProviderIcon({
   const theme = useTheme();
   const tint = color ?? PROVIDER_BRAND_COLORS[provider] ?? theme.text;
   const xml = useMemo(
-    () => PROVIDER_ICON_XML[provider].replaceAll('fill="#000"', `fill="${tint}"`),
+    () => PROVIDER_ICON_XML[provider]
+      .replaceAll('fill="#000"', `fill="${tint}"`)
+      .replaceAll('stroke="#000"', `stroke="${tint}"`),
     [provider, tint],
   );
   return (

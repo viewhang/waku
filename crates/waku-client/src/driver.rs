@@ -7,8 +7,8 @@ use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
 use uuid::Uuid;
 use waku_protocol::computer_use::ComputerToolRequest;
 use waku_protocol::model::{
-    BackgroundWorkKey, DriverEvent, GoalOperation, ProviderResumeCursor, RuntimeMode,
-    UserInputAnswer,
+    BackgroundWorkKey, DriverEvent, GoalOperation, MessageAttachment, ProviderResumeCursor,
+    RuntimeMode, UserInputAnswer,
 };
 
 #[derive(Clone)]
@@ -45,8 +45,14 @@ impl DriverHandle {
     /// Send a prompt along with the ids this client gave the turn it opened
     /// and that turn's user message, so the daemon can publish the same
     /// identity to every other client attached to the runtime.
-    pub fn prompt(&self, prompt: String, turn_id: Option<Uuid>, message_id: Option<Uuid>) {
-        self.inner.prompt(prompt, turn_id, message_id);
+    pub fn prompt(
+        &self,
+        prompt: String,
+        turn_id: Option<Uuid>,
+        message_id: Option<Uuid>,
+        attachments: Vec<MessageAttachment>,
+    ) {
+        self.inner.prompt(prompt, turn_id, message_id, attachments);
     }
 
     pub fn supports_steer(&self) -> bool {
@@ -113,7 +119,13 @@ impl DriverHandle {
 }
 
 pub trait DriverControl: Send + Sync {
-    fn prompt(&self, prompt: String, turn_id: Option<Uuid>, message_id: Option<Uuid>);
+    fn prompt(
+        &self,
+        prompt: String,
+        turn_id: Option<Uuid>,
+        message_id: Option<Uuid>,
+        attachments: Vec<MessageAttachment>,
+    );
     fn supports_steer(&self) -> bool {
         false
     }
@@ -138,6 +150,7 @@ pub trait DriverControl: Send + Sync {
 }
 
 pub struct DriverStartOptions {
+    pub assistant: Option<waku_protocol::settings::AssistantProfile>,
     pub binary: PathBuf,
     pub cwd: PathBuf,
     pub mode: RuntimeMode,

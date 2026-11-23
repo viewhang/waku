@@ -168,6 +168,7 @@ fn prepare_submission(
     session_id: Uuid,
     prompt: &str,
     turn_count: usize,
+    record_checkpoint: bool,
 ) -> anyhow::Result<PreparedSubmission> {
     let workspace = match workspace {
         SessionWorkspace::NewWorktree { base_branch } => {
@@ -194,19 +195,22 @@ fn prepare_submission(
     };
     let project_path = workspace.path().unwrap_or(&project.path);
 
-    // Every turn gets its own immutable starting snapshot. Reusing the prior
-    // response's ending ref would attribute branch switches or terminal edits
-    // made between turns to the next response.
-    let checkpoint_warning = workspace_ack(
-        &workspace_client,
-        waku_client::WorkspaceOperation::CaptureTurnStart {
-            cwd: project_path.to_path_buf(),
-            session_id,
-            turn_count,
-        },
-    )
-    .err()
-    .map(|error| tr!("errors.capture_pre_turn_checkpoint", error = error));
+    // Each CLI turn gets a fresh snapshot so edits between turns are excluded
+    // Native assistant turns only read files and need no Git checkpoint
+    let checkpoint_warning = if record_checkpoint {
+        workspace_ack(
+            &workspace_client,
+            waku_client::WorkspaceOperation::CaptureTurnStart {
+                cwd: project_path.to_path_buf(),
+                session_id,
+                turn_count,
+            },
+        )
+        .err()
+        .map(|error| tr!("errors.capture_pre_turn_checkpoint", error = error))
+    } else {
+        None
+    };
 
     // Process startup can synchronously resolve executables, bind sockets,
     // and spawn children. It belongs behind the same animated preparation
@@ -416,6 +420,7 @@ fn perform_provider_rewind(
     }
 
     match provider {
+        ProviderKind::Assistant => anyhow::bail!("This assistant session does not support rewind"),
         ProviderKind::Claude => {
             let Some(ProviderResumeCursor::Claude {
                 session_id: native_session_id,
@@ -665,6 +670,9 @@ fn perform_response_fork(mut request: ResponseForkRequest) -> Result<PreparedRes
     let provider = request.source.provider;
     let native_fork = (|| -> anyhow::Result<ProviderForkResult> {
         match provider {
+            ProviderKind::Assistant => {
+                anyhow::bail!("This assistant session does not support forking")
+            }
             ProviderKind::Claude => {
                 let ProviderResumeCursor::Claude {
                     session_id: native_session_id,
@@ -1607,6 +1615,7 @@ impl Waku {
             .sessions
             .iter()
             .find(|session| session.id == session_id)
+            .filter(|session| session.provider != ProviderKind::Assistant)
             .and_then(|session| {
                 session
                     .turns
@@ -2638,17 +2647,18 @@ impl Waku {
         session: &AgentSession,
         cwd: PathBuf,
     ) -> anyhow::Result<DriverStartRequest> {
-        let binary = self
-            .probes
-            .iter()
-            .find(|probe| probe.provider == session.provider)
-            .and_then(|probe| probe.path.clone())
-            .ok_or_else(|| {
-                anyhow::anyhow!(tr!(
-                    "errors.provider_not_found",
-                    provider = session.provider.display_name()
-                ))
-            })?;
+        let binary = if session.provider == ProviderKind::Assistant {
+            PathBuf::new()
+        } else {
+            self.provider_probe(session.provider)
+                .and_then(|probe| probe.path.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(tr!(
+                        "errors.provider_not_found",
+                        provider = session.provider.display_name()
+                    ))
+                })?
+        };
         let agent_preset = self.agent_preset_for_session(session);
         let SessionOptions {
             mode,
@@ -2661,6 +2671,7 @@ impl Waku {
             session_id: session.id,
             provider: session.provider,
             options: DriverStartOptions {
+                assistant: session.assistant.clone(),
                 binary,
                 cwd,
                 mode,
@@ -2752,6 +2763,7 @@ impl Waku {
                         session_id,
                         &naming_prompt,
                         next_turn_count,
+                        true,
                     )
                 })
                 .await;
@@ -3139,6 +3151,7 @@ impl Waku {
         let next_turn_count = session.turns.len() + 1;
         let project_id = session.project_id;
         let workspace = session.workspace.clone();
+        let record_checkpoint = session.provider != ProviderKind::Assistant;
         let driver_start = (!self.runtimes.contains_key(&session_id)).then(|| {
             let provisional_cwd = self
                 .workspace_path_for_session(session)
@@ -3235,6 +3248,7 @@ impl Waku {
                         session_id,
                         &preparation_prompt,
                         next_turn_count,
+                        record_checkpoint,
                     )
                 })
                 .await;
@@ -3372,7 +3386,17 @@ impl Waku {
         // while templates expand and skills adopt provider-native syntax.
         // Claude's commands pass through untouched; its CLI owns expansion.
         let prompt = submission.prompt;
-        let driver_prompt = self.resolve_provider_submission(provider, &prompt);
+        let (driver_prompt, attachments) = if provider == ProviderKind::Assistant {
+            (
+                submission.display_content.unwrap_or(prompt),
+                submission.attachments,
+            )
+        } else {
+            (
+                self.resolve_provider_submission(provider, &prompt),
+                Vec::new(),
+            )
+        };
         // The turn and its user message landed at accept time. Their ids go
         // with the prompt so every other client attached to the runtime
         // mirrors the same rows instead of minting its own.
@@ -3385,7 +3409,7 @@ impl Waku {
             .unwrap_or((None, None));
         let mut failed_to_start = false;
         match driver {
-            Ok(driver) => driver.prompt(driver_prompt, turn_id, message_id),
+            Ok(driver) => driver.prompt(driver_prompt, turn_id, message_id, attachments),
             Err(error) => {
                 failed_to_start = true;
                 let message = tr!("errors.start_agent", error = error);

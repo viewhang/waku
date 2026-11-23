@@ -27,6 +27,7 @@ pub(crate) fn start_remote(
     let command = waku_client::Command::Start {
         options: waku_client::WireDriverStartOptions {
             provider: waku_client::encode_enum(provider)?,
+            assistant: options.assistant,
             binary: options.binary,
             cwd: options.cwd,
             mode: waku_client::encode_enum(options.mode)?,
@@ -233,11 +234,18 @@ impl RemoteDriverControl {
 }
 
 impl DriverControl for RemoteDriverControl {
-    fn prompt(&self, prompt: String, turn_id: Option<uuid::Uuid>, message_id: Option<uuid::Uuid>) {
+    fn prompt(
+        &self,
+        prompt: String,
+        turn_id: Option<uuid::Uuid>,
+        message_id: Option<uuid::Uuid>,
+        attachments: Vec<crate::model::MessageAttachment>,
+    ) {
         self.notify(waku_client::Command::Prompt {
             prompt,
             turn_id,
             message_id,
+            attachments,
         });
     }
 

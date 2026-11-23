@@ -14,6 +14,7 @@ pub use waku_protocol::attachments::{
     MAX_ATTACHMENT_FILES, StoredAttachment,
 };
 
+#[derive(Clone)]
 pub struct AttachmentStore {
     root: PathBuf,
 }

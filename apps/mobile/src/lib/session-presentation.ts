@@ -165,6 +165,7 @@ export function relativeSessionTime(timestamp: number, now = Date.now()): string
 export function providerLabel(provider: ProviderKind): string {
   const labels: Record<ProviderKind, string> = {
     amp: 'Amp',
+    assistant: 'Assistant',
     claude: 'Claude',
     codex: 'Codex',
     cursor: 'Cursor',

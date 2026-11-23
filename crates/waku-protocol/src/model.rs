@@ -11,6 +11,7 @@ use uuid::Uuid;
 #[serde(rename_all = "camelCase")]
 pub enum ProviderKind {
     Amp,
+    Assistant,
     Claude,
     #[default]
     Codex,
@@ -29,6 +30,7 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
+    /// Providers discovered through installed agent CLIs
     pub const ALL: [Self; 11] = [
         Self::Amp,
         Self::Claude,
@@ -46,6 +48,7 @@ impl ProviderKind {
     pub fn id(self) -> &'static str {
         match self {
             Self::Amp => "amp",
+            Self::Assistant => "assistant",
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Cursor => "cursor",
@@ -62,6 +65,7 @@ impl ProviderKind {
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Amp => "Amp",
+            Self::Assistant => "Assistant",
             Self::Claude => "Claude Code",
             Self::Codex => "Codex CLI",
             Self::Cursor => "Cursor CLI",
@@ -78,6 +82,7 @@ impl ProviderKind {
     pub fn short_name(self) -> &'static str {
         match self {
             Self::Amp => "Amp",
+            Self::Assistant => "Assistant",
             Self::Claude => "Claude",
             Self::Codex => "Codex",
             Self::Cursor => "Cursor",
@@ -94,6 +99,7 @@ impl ProviderKind {
     pub fn command(self) -> &'static str {
         match self {
             Self::Amp => "amp",
+            Self::Assistant => "",
             Self::Claude => "claude",
             Self::Codex => "codex",
             // Cursor documents `agent` as its primary command, but that name is
@@ -168,6 +174,9 @@ impl ProviderKind {
     tag = "provider"
 )]
 pub enum ProviderResumeCursor {
+    Assistant {
+        session_id: String,
+    },
     Amp {
         thread_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,6 +231,7 @@ pub enum ProviderResumeCursor {
 impl ProviderResumeCursor {
     pub fn from_session_id(provider: ProviderKind, id: String) -> Self {
         match provider {
+            ProviderKind::Assistant => Self::Assistant { session_id: id },
             ProviderKind::Amp => Self::Amp {
                 thread_id: id,
                 fork_context: None,
@@ -256,6 +266,7 @@ impl ProviderResumeCursor {
 
     pub fn provider(&self) -> ProviderKind {
         match self {
+            Self::Assistant { .. } => ProviderKind::Assistant,
             Self::Amp { .. } => ProviderKind::Amp,
             Self::Claude { .. } => ProviderKind::Claude,
             Self::Codex { .. } => ProviderKind::Codex,
@@ -273,7 +284,8 @@ impl ProviderResumeCursor {
     pub fn native_id(&self) -> &str {
         match self {
             Self::Amp { thread_id, .. } => thread_id,
-            Self::Claude { session_id, .. }
+            Self::Assistant { session_id }
+            | Self::Claude { session_id, .. }
             | Self::Cursor { session_id, .. }
             | Self::DeepSeek { session_id }
             | Self::Fx { session_id }
@@ -950,6 +962,9 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "SessionWorkspace::is_local")]
     pub workspace: SessionWorkspace,
     pub provider: ProviderKind,
+    /// Native sessions retain the configuration chosen when they were created
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant: Option<crate::settings::AssistantProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub runtime_mode: RuntimeMode,
@@ -1033,6 +1048,7 @@ impl AgentSession {
             project_id,
             workspace: SessionWorkspace::Local,
             provider,
+            assistant: None,
             model: None,
             runtime_mode: RuntimeMode::FullAccess,
             reasoning_effort: None,
@@ -1070,6 +1086,7 @@ impl AgentSession {
             project_id: self.project_id,
             workspace: SessionWorkspace::Local,
             provider: self.provider,
+            assistant: None,
             model: self.model.clone(),
             runtime_mode: RuntimeMode::default(),
             reasoning_effort: None,
@@ -1204,6 +1221,9 @@ impl AgentSession {
     }
 
     pub fn can_choose_model(&self, provider: ProviderKind) -> bool {
+        if self.provider == ProviderKind::Assistant || provider == ProviderKind::Assistant {
+            return false;
+        }
         !self.status.is_busy() && (self.messages.is_empty() || self.provider == provider)
     }
 
@@ -1392,6 +1412,7 @@ impl AgentSession {
         message: &str,
         turn_id: Uuid,
         message_id: Uuid,
+        attachments: Vec<MessageAttachment>,
     ) -> bool {
         let now = unix_time();
         if let Some(active) = self.active_turn_id() {
@@ -1403,6 +1424,7 @@ impl AgentSession {
             }
             let mut prompt = Message::new_for_turn(MessageRole::User, message, active);
             prompt.id = message_id;
+            prompt.attachments = attachments;
             self.messages.push(prompt);
             self.updated_at = now;
             return true;
@@ -1420,6 +1442,7 @@ impl AgentSession {
         });
         let mut prompt = Message::new_for_turn(MessageRole::User, message, turn_id);
         prompt.id = message_id;
+        prompt.attachments = attachments;
         self.messages.push(prompt);
         self.status = SessionStatus::Connecting;
         self.last_reply_at = Some(now);
@@ -1866,6 +1889,7 @@ pub enum DriverEvent {
         message: String,
         turn_id: Uuid,
         message_id: Uuid,
+        attachments: Vec<MessageAttachment>,
     },
     TurnStarted,
     /// The provider's turn ended while detached work it will wake the
@@ -1873,6 +1897,7 @@ pub enum DriverEvent {
     /// `TurnStarted` continues it — and the session shows it is waiting.
     TurnParked,
     TextDelta(String),
+    AssistantAttachment(MessageAttachment),
     ReasoningDelta(String),
     Activity {
         id: Option<String>,
@@ -4777,7 +4802,7 @@ mod tests {
         let turn_id = Uuid::new_v4();
         let message_id = Uuid::new_v4();
 
-        assert!(session.adopt_submitted_prompt("second", turn_id, message_id));
+        assert!(session.adopt_submitted_prompt("second", turn_id, message_id, vec![]));
 
         assert_eq!(session.status, SessionStatus::Connecting);
         assert_eq!(session.active_turn_id(), Some(turn_id));
@@ -4798,7 +4823,7 @@ mod tests {
         session.status = SessionStatus::Connecting;
         let message_id = session.messages[0].id;
 
-        assert!(!session.adopt_submitted_prompt("first", turn_id, message_id));
+        assert!(!session.adopt_submitted_prompt("first", turn_id, message_id, vec![]));
 
         assert_eq!(session.turns.len(), 1);
         assert_eq!(session.messages.len(), 1);
@@ -4813,7 +4838,7 @@ mod tests {
         session.status = SessionStatus::Working;
         let message_id = Uuid::new_v4();
 
-        assert!(session.adopt_submitted_prompt("continue", Uuid::new_v4(), message_id));
+        assert!(session.adopt_submitted_prompt("continue", Uuid::new_v4(), message_id, vec![]));
 
         assert_eq!(session.turns.len(), 1);
         let prompt = session.messages.last().unwrap();

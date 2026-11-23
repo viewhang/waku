@@ -1485,6 +1485,28 @@ fn a_turn_without_an_answer_folds_completely() {
 }
 
 #[test]
+fn an_image_only_assistant_answer_stays_visible_after_the_turn_completes() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Assistant);
+    session.begin_turn("Draw a square");
+    session.push_message(MessageRole::Assistant, "");
+    session.messages[1]
+        .attachments
+        .push(crate::model::MessageAttachment {
+            path: "/tmp/square.png".into(),
+            mention: "square.png".into(),
+            name: "square.png".into(),
+            is_dir: false,
+            is_image: true,
+            blob_reference: Some("square".into()),
+        });
+    session.finish_active_turn(TurnStatus::Completed);
+    assert_eq!(
+        folded_transcript_row_kinds(&session, &HashSet::new()),
+        vec![Message(0), Message(1)]
+    );
+}
+
+#[test]
 fn assistant_response_footer_is_owned_by_the_terminal_part_and_copies_the_visible_answer() {
     let project_id = Uuid::new_v4();
     let mut session = AgentSession::new(project_id, ProviderKind::Codex);
@@ -1880,6 +1902,8 @@ fn settings_search_filters_pages_for_arrow_cycling() {
         SettingsPage::General,
         SettingsPage::Appearance,
         SettingsPage::Providers,
+        SettingsPage::ModelServices,
+        SettingsPage::Assistants,
         SettingsPage::Skills,
         SettingsPage::Usage,
         SettingsPage::Daemon,
@@ -1891,6 +1915,8 @@ fn settings_search_filters_pages_for_arrow_cycling() {
 
     assert_eq!(pages("theme"), vec![SettingsPage::Appearance]);
     assert_eq!(pages("skill"), vec![SettingsPage::Skills]);
+    assert_eq!(pages("sync"), vec![SettingsPage::ModelServices]);
+    assert_eq!(pages("react"), vec![SettingsPage::Assistants]);
 
     // A keyword shared across pages keeps them all reachable.
     let mut codex_pages = vec![

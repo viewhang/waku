@@ -1401,6 +1401,7 @@ mod tests {
                 runtime_id,
                 Command::Start {
                     options: WireDriverStartOptions {
+                        assistant: None,
                         provider: "codex".into(),
                         binary: PathBuf::from("codex"),
                         cwd: PathBuf::from("."),
@@ -1468,6 +1469,7 @@ mod tests {
                 runtime_id,
                 Command::Start {
                     options: WireDriverStartOptions {
+                        assistant: None,
                         provider: "codex".into(),
                         binary: PathBuf::from("codex"),
                         cwd: PathBuf::from("."),
@@ -1512,6 +1514,7 @@ mod tests {
                 runtime_id,
                 Command::Prompt {
                     prompt: "streamed from the first client".into(),
+                    attachments: Vec::new(),
                     turn_id: None,
                     message_id: None,
                 },
@@ -1585,6 +1588,7 @@ mod tests {
                 runtime_id,
                 Command::Start {
                     options: WireDriverStartOptions {
+                        assistant: None,
                         provider: "codex".into(),
                         binary: PathBuf::from("codex"),
                         cwd: PathBuf::from("."),
@@ -2152,6 +2156,7 @@ mod tests {
                 runtime_id: blocked_runtime_id,
                 command: Command::Prompt {
                     prompt: "after start".into(),
+                    attachments: Vec::new(),
                     turn_id: None,
                     message_id: None,
                 },
@@ -2244,6 +2249,7 @@ mod tests {
 
     fn test_start_options() -> WireDriverStartOptions {
         WireDriverStartOptions {
+            assistant: None,
             provider: "codex".into(),
             binary: PathBuf::from("codex"),
             cwd: PathBuf::from("."),

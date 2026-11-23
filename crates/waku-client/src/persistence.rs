@@ -398,6 +398,10 @@ pub struct PersistedState {
     #[serde(default)]
     pub provider_binary_overrides: HashMap<ProviderKind, String>,
     #[serde(skip)]
+    pub assistant_profiles: Vec<waku_protocol::settings::AssistantProfile>,
+    #[serde(skip)]
+    pub model_services: Vec<waku_protocol::settings::ModelService>,
+    #[serde(skip)]
     daemon_settings_extra: BTreeMap<String, serde_json::Value>,
     #[serde(skip)]
     dirty_sessions: HashSet<Uuid>,
@@ -453,6 +457,8 @@ impl PersistedState {
             computer_use_allowed_apps: Vec::new(),
             disabled_providers: Vec::new(),
             provider_binary_overrides: HashMap::new(),
+            assistant_profiles: Vec::new(),
+            model_services: Vec::new(),
             daemon_settings_extra: BTreeMap::new(),
             dirty_sessions: HashSet::new(),
         }
@@ -540,6 +546,8 @@ impl PersistedState {
         DaemonSettings {
             computer_use_enabled: self.computer_use_enabled,
             computer_use_allowed_apps: self.computer_use_allowed_apps.clone(),
+            assistants: self.assistant_profiles.clone(),
+            model_services: self.model_services.clone(),
             disabled_providers: self.disabled_providers.clone(),
             provider_binary_overrides: self.provider_binary_overrides.clone(),
             extra: self.daemon_settings_extra.clone(),
@@ -551,6 +559,8 @@ impl PersistedState {
         self.computer_use_enabled =
             crate::computer_use::resolve_enabled(settings.computer_use_enabled);
         self.computer_use_allowed_apps = settings.computer_use_allowed_apps;
+        self.assistant_profiles = settings.assistants;
+        self.model_services = settings.model_services;
         self.disabled_providers = settings.disabled_providers;
         self.provider_binary_overrides = settings.provider_binary_overrides;
         self.daemon_settings_extra = settings.extra;

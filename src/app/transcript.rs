@@ -838,10 +838,11 @@ pub(super) fn transcript_rows_fingerprint(
     for message in &session.messages {
         hash = mix(hash, message.role as u64);
         hash = mix_turn_id(hash, message.turn_id);
-        // The fold counts a blank text part as work, so a part crossing that
-        // line moves rows. `trim` stops at the first non-space character, so
-        // this stays a per-message constant on the frame path.
-        hash = mix(hash, message.content.trim().is_empty() as u64);
+        // The fold keeps answer text and attachments visible
+        hash = mix(
+            hash,
+            (!message.content.trim().is_empty() || !message.attachments.is_empty()) as u64,
+        );
     }
 
     hash = mix(hash, session.transcript_blocks.len() as u64);
@@ -1096,30 +1097,29 @@ fn response_footer_message_index_from_rows(
 }
 
 /// Where the turn's answer begins within its own rows: the trailing run of
-/// assistant text parts. Everything before that is work and folds.
+/// assistant text and attachments. Everything before that is work and folds
 ///
 /// A blank part renders nothing, so it counts as work rather than extending the
-/// run backwards over the reasoning and tool calls between it and the answer.
-/// A turn that produced no text at all — interrupted, or pure tool output — has
-/// no answer, and all of it folds.
+/// run backwards over the reasoning and tool calls between it and the answer
 fn turn_answer_start(session: &AgentSession, turn_rows: &[TranscriptRowKind]) -> usize {
-    let is_answer_text = |row: &TranscriptRowKind| match *row {
-        TranscriptRowKind::Message(message_index) => session
-            .messages
-            .get(message_index)
-            .is_some_and(|message| !message.content.trim().is_empty()),
+    let is_answer_part = |row: &TranscriptRowKind| match *row {
+        TranscriptRowKind::Message(message_index) => {
+            session.messages.get(message_index).is_some_and(|message| {
+                !message.content.trim().is_empty() || !message.attachments.is_empty()
+            })
+        }
         TranscriptRowKind::TurnBlock(_)
         | TranscriptRowKind::TurnFold(_)
         | TranscriptRowKind::ResponseFooter(_, _)
         | TranscriptRowKind::ChangedFiles(_)
         | TranscriptRowKind::WorkingIndicator => false,
     };
-    let Some(last_text) = turn_rows.iter().rposition(is_answer_text) else {
+    let Some(last_part) = turn_rows.iter().rposition(is_answer_part) else {
         return turn_rows.len();
     };
-    turn_rows[..last_text]
+    turn_rows[..last_part]
         .iter()
-        .rposition(|row| !is_answer_text(row))
+        .rposition(|row| !is_answer_part(row))
         .map_or(0, |index| index + 1)
 }
 

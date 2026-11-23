@@ -97,7 +97,9 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
         // Pi, Oh My Pi, and Kimi Code all take their catalog from the user's
         // configured LLM providers. A fabricated fallback would make
         // unavailable models look selectable.
-        ProviderKind::Kimi | ProviderKind::OhMyPi | ProviderKind::Pi => Vec::new(),
+        ProviderKind::Assistant | ProviderKind::Kimi | ProviderKind::OhMyPi | ProviderKind::Pi => {
+            Vec::new()
+        }
     }
 }
 
@@ -128,7 +130,7 @@ pub fn discover_catalog(
     let (discovered, discovered_presets) = match provider {
         // Amp exposes stable agent modes rather than a model inventory. Keep
         // the picker aligned with the modes advertised by the current CLI.
-        ProviderKind::Amp => (Vec::new(), None),
+        ProviderKind::Amp | ProviderKind::Assistant => (Vec::new(), None),
         ProviderKind::Codex => (discover_codex_models(binary), None),
         ProviderKind::Claude => (discover_claude_models(binary), None),
         ProviderKind::Cursor => (discover_cursor_models(binary), None),

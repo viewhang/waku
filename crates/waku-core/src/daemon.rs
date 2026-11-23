@@ -19,8 +19,8 @@ use crate::attachments::AttachmentStore;
 use crate::computer_use::{ComputerTarget, ComputerUsePhase, ComputerUseState};
 use crate::driver::{self, DriverHandle, DriverStartOptions, SessionOptions};
 use crate::model::{
-    ActivityKind, AgentSession, Checkpoint, CheckpointStatus, DriverEvent, PermissionOption,
-    Project, ProviderKind, ProviderResumeCursor, SessionStatus,
+    ActivityKind, AgentSession, Checkpoint, CheckpointStatus, DriverEvent, MessageAttachment,
+    PermissionOption, Project, ProviderKind, ProviderResumeCursor, SessionStatus,
 };
 use crate::persistence::{ComposerDraftStore, PersistedState, StateStore};
 use crate::settings::DaemonSettingsStore;
@@ -47,7 +47,7 @@ pub struct WakuBackend {
     terminals: Mutex<HashMap<Uuid, (Uuid, crate::terminal::DaemonTerminal)>>,
     #[cfg(all(test, unix))]
     terminal_shell: Option<alacritty_terminal::tty::Shell>,
-    settings: DaemonSettingsStore,
+    settings: Arc<DaemonSettingsStore>,
     task_store: StateStore,
     task_state: Mutex<PersistedState>,
     removed_session_ids: Mutex<HashSet<Uuid>>,
@@ -83,7 +83,7 @@ impl WakuBackend {
             terminals: Mutex::new(HashMap::new()),
             #[cfg(all(test, unix))]
             terminal_shell: None,
-            settings,
+            settings: Arc::new(settings),
             task_store,
             task_state: Mutex::new(task_state),
             removed_session_ids: Mutex::new(HashSet::new()),
@@ -243,8 +243,30 @@ impl Backend for WakuBackend {
             Command::GetSettings => Ok(ResponsePayload::Settings {
                 settings: self.settings.get(),
             }),
+            Command::SaveModelService { service, api_key } => {
+                let service = self
+                    .settings
+                    .save_model_service(service, api_key.as_deref())?;
+                Ok(ResponsePayload::ModelServiceSaved { service })
+            }
+            Command::TestModelService {
+                base_url,
+                api_key,
+                model,
+            } => {
+                driver::assistant::test_model(&base_url, &api_key, &model)?;
+                Ok(ResponsePayload::Ack)
+            }
+            Command::ListModelServiceModels {
+                base_url,
+                api_key,
+                protocol,
+            } => {
+                let models = driver::assistant::list_models(&base_url, &api_key, protocol)?;
+                Ok(ResponsePayload::ModelServiceModels { models })
+            }
             Command::UpdateSettings { settings } => {
-                self.settings.replace(settings)?;
+                self.settings.replace_preferences(settings)?;
                 Ok(ResponsePayload::Ack)
             }
             Command::ProbeProvider {
@@ -512,6 +534,7 @@ impl Backend for WakuBackend {
                 // must not start every installed agent CLI, and another
                 // provider is queried only after the user explicitly picks it.
                 let mut sessions = match provider {
+                    ProviderKind::Assistant => Vec::new(),
                     ProviderKind::Amp => {
                         crate::amp_session::list_provider_sessions(&binary, limit)?
                     }
@@ -559,6 +582,9 @@ impl Backend for WakuBackend {
                 // numbering, but bound imported display text to recent turns.
                 const VISIBLE_TURN_LIMIT: usize = 100;
                 let history = match &cursor {
+                    ProviderResumeCursor::Assistant { .. } => {
+                        bail!("Assistant history belongs to Waku")
+                    }
                     ProviderResumeCursor::Amp { thread_id, .. } => {
                         let binary = self.provider_binary(ProviderKind::Amp)?;
                         crate::amp_session::provider_session_history(
@@ -776,6 +802,7 @@ impl Backend for WakuBackend {
                 let previous = self.sessions.lock().remove(&session_id);
                 drop(previous);
                 let provider = decode_enum(&options.provider)?;
+                let assistant = options.assistant;
                 let options = DriverStartOptions {
                     binary: options.binary,
                     cwd: options.cwd,
@@ -794,7 +821,43 @@ impl Backend for WakuBackend {
                 };
                 let (wake, _wake_events) = smol::channel::bounded(1);
                 let (event_sender, event_receiver) = driver::event_channel(wake);
-                let handle = driver::start_local(provider, options, event_sender)?;
+                let handle = if provider == ProviderKind::Assistant {
+                    let profile = assistant.context("Missing assistant configuration")?;
+                    let mut stored = self
+                        .task_state
+                        .lock()
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == session_id)
+                        .cloned();
+                    if let Some(session) = stored.as_mut() {
+                        self.task_store.hydrate(session)?;
+                    }
+                    driver::assistant::start(
+                        profile,
+                        self.settings.clone(),
+                        self.attachments.clone(),
+                        stored
+                            .map(|mut session| {
+                                let completed: HashSet<_> = session
+                                    .turns
+                                    .iter()
+                                    .filter(|turn| {
+                                        turn.status == crate::model::TurnStatus::Completed
+                                    })
+                                    .map(|turn| turn.id)
+                                    .collect();
+                                session.messages.retain(|message| {
+                                    message.turn_id.is_some_and(|id| completed.contains(&id))
+                                });
+                                session.messages
+                            })
+                            .unwrap_or_default(),
+                        event_sender,
+                    )?
+                } else {
+                    driver::start_local(provider, options, event_sender)?
+                };
                 let supports_steer = handle.supports_steer();
                 std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
@@ -848,6 +911,7 @@ impl Backend for WakuBackend {
                     prompt,
                     turn_id,
                     message_id,
+                    attachments,
                 } = &command
                 {
                     // Publish the submission into the runtime's event stream
@@ -861,6 +925,7 @@ impl Backend for WakuBackend {
                         message: prompt.clone(),
                         turn_id: turn_id.unwrap_or_else(Uuid::new_v4),
                         message_id: message_id.unwrap_or_else(Uuid::new_v4),
+                        attachments: attachments.clone(),
                     })?)?;
                 }
                 handle_driver_command(&driver, command)
@@ -1198,6 +1263,9 @@ impl WakuBackend {
         turns_to_remove: usize,
     ) -> anyhow::Result<(ProviderResumeCursor, HashMap<String, String>)> {
         match source.provider {
+            ProviderKind::Assistant => {
+                bail!("This assistant session does not support this operation")
+            }
             ProviderKind::Claude => {
                 let Some(ProviderResumeCursor::Claude { session_id, .. }) =
                     source.provider_cursor.as_ref()
@@ -1389,6 +1457,9 @@ impl WakuBackend {
         }
 
         match source.provider {
+            ProviderKind::Assistant => {
+                bail!("This assistant session does not support this operation")
+            }
             ProviderKind::Claude => {
                 let Some(ProviderResumeCursor::Claude { session_id, .. }) =
                     source.provider_cursor.as_ref()
@@ -1714,7 +1785,11 @@ fn handle_driver_command(
     command: Command,
 ) -> anyhow::Result<ResponsePayload> {
     match command {
-        Command::Prompt { prompt, .. } => driver.prompt(prompt),
+        Command::Prompt {
+            prompt,
+            attachments,
+            ..
+        } => driver.prompt_with_attachments(prompt, attachments),
         Command::Steer { prompt } => driver.steer(prompt),
         Command::Cancel => driver.cancel(),
         Command::CancelComputerUse => driver.cancel_computer_use(),
@@ -1775,6 +1850,9 @@ fn handle_driver_command(
         }
         Command::AttachSession
         | Command::Start { .. }
+        | Command::SaveModelService { .. }
+        | Command::TestModelService { .. }
+        | Command::ListModelServiceModels { .. }
         | Command::GetSettings
         | Command::UpdateSettings { .. }
         | Command::ProbeProvider { .. }
@@ -1852,6 +1930,9 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
         DriverEvent::TurnStarted => ("turnStarted", Value::Null),
         DriverEvent::TurnParked => ("turnParked", Value::Null),
         DriverEvent::TextDelta(text) => ("textDelta", Value::String(text)),
+        DriverEvent::AssistantAttachment(attachment) => {
+            ("assistantAttachment", serde_json::to_value(attachment)?)
+        }
         DriverEvent::ReasoningDelta(text) => ("reasoningDelta", Value::String(text)),
         DriverEvent::Activity {
             id,
@@ -1908,9 +1989,10 @@ fn event_to_wire(event: DriverEvent) -> anyhow::Result<WireDriverEvent> {
             message,
             turn_id,
             message_id,
+            attachments,
         } => (
             "promptSubmitted",
-            json!({ "message": message, "turnId": turn_id, "messageId": message_id }),
+            json!({ "message": message, "turnId": turn_id, "messageId": message_id, "attachments": attachments }),
         ),
         DriverEvent::SteerAccepted { message } => ("steerAccepted", json!({ "message": message })),
         DriverEvent::SteerRejected { message, reason } => (
@@ -1951,6 +2033,7 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
         "turnStarted" => DriverEvent::TurnStarted,
         "turnParked" => DriverEvent::TurnParked,
         "textDelta" => DriverEvent::TextDelta(serde_json::from_value(payload)?),
+        "assistantAttachment" => DriverEvent::AssistantAttachment(serde_json::from_value(payload)?),
         "reasoningDelta" => DriverEvent::ReasoningDelta(serde_json::from_value(payload)?),
         "activity" => {
             let activity: ActivityWire = serde_json::from_value(payload)?;
@@ -1995,6 +2078,7 @@ pub fn event_from_wire(event: WireDriverEvent) -> anyhow::Result<DriverEvent> {
                 message: submitted.message,
                 turn_id: submitted.turn_id,
                 message_id: submitted.message_id,
+                attachments: submitted.attachments,
             }
         }
         "steerAccepted" => {
@@ -2038,6 +2122,8 @@ struct SubmittedPromptWire {
     message: String,
     turn_id: Uuid,
     message_id: Uuid,
+    #[serde(default)]
+    attachments: Vec<MessageAttachment>,
 }
 
 #[derive(Deserialize)]
@@ -2224,6 +2310,14 @@ mod tests {
             message: "ship it".into(),
             turn_id,
             message_id,
+            attachments: vec![MessageAttachment {
+                name: "sample.png".into(),
+                path: "/tmp/sample.png".into(),
+                mention: "sample.png".into(),
+                is_dir: false,
+                is_image: true,
+                blob_reference: Some("sample-ref".into()),
+            }],
         })
         .unwrap();
         assert_eq!(wire.kind, "promptSubmitted");
@@ -2232,8 +2326,9 @@ mod tests {
         assert_eq!(wire.payload["messageId"], message_id.to_string());
         assert!(matches!(
             event_from_wire(wire).unwrap(),
-            DriverEvent::PromptSubmitted { message, turn_id: decoded_turn, message_id: decoded_message }
+            DriverEvent::PromptSubmitted { message, turn_id: decoded_turn, message_id: decoded_message, attachments }
                 if message == "ship it" && decoded_turn == turn_id && decoded_message == message_id
+                    && attachments[0].blob_reference.as_deref() == Some("sample-ref")
         ));
     }
 }

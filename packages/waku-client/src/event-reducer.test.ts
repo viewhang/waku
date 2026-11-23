@@ -115,6 +115,23 @@ describe('promptSubmitted', () => {
   })
 })
 
+test('mirrors image attachments on submitted prompts and completed assistant replies', () => {
+  const source = {
+    path: '/example/source.png', mention: 'source.png', name: 'source.png',
+    is_dir: false, is_image: true, blob_reference: 'waku-attachment:source',
+  }
+  const output = { ...source, name: 'edited.png', blob_reference: 'waku-attachment:edited' }
+  const submitted = apply(idleSession(), 'promptSubmitted', { ...SUBMISSION, attachments: [source] })
+  const started = apply(submitted, 'turnStarted', null)
+  const replied = apply(started, 'assistantAttachment', output)
+  const settled = apply(replied, 'turnFinished', { success: true })
+
+  expect(settled.messages.at(-2)?.attachments).toEqual([source])
+  expect(settled.messages.at(-1)).toMatchObject({
+    role: 'assistant', content: '', streaming: false, attachments: [output],
+  })
+})
+
 test('MCP tool identity survives partial updates and stays separate in expanded details', () => {
   const call = {
     id: 'tool-1', source_id: 'call-1', kind: 'tool' as const,

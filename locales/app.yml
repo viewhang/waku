@@ -2185,3 +2185,158 @@ usage_error.unknown_error:
   en: unknown error
 usage_error.curl_no_status:
   en: curl returned no HTTP status line
+
+assistant.settings:
+  en: Assistants
+assistant.keywords:
+  en: "assistant agent react direct model api system prompt"
+assistant.name:
+  en: Name
+assistant.model:
+  en: Model ID
+assistant.prompt:
+  en: System prompt
+assistant.save:
+  en: Save assistant
+assistant.new:
+  en: New assistant
+assistant.edit:
+  en: Edit
+assistant.start:
+  en: New task
+assistant.fields_required:
+  en: Enter an assistant name
+assistant.current_project:
+  en: "Selected project: %{project}"
+assistant.text_only:
+  en: This assistant accepts text. Remove attachments to continue
+assistant.test_ok:
+  en: The model connection works
+assistant.invalid_response:
+  en: The daemon returned an unexpected response
+assistant.default_model:
+  en: Default model
+assistant.choose_model:
+  en: Choose a model
+assistant.switch_history:
+  en: The next message sends this conversation’s context to the selected provider
+model_services.settings:
+  en: Model Services
+model_services.keywords:
+  en: provider models openai compatible endpoint api key sync
+model_services.add:
+  en: Add provider
+model_services.save:
+  en: Save provider
+model_services.manage:
+  en: Manage model services
+model_services.endpoint:
+  en: API Base URL
+model_services.enabled:
+  en: Available in model picker
+model_services.sync:
+  en: Sync models
+model_services.synced:
+  en: Model list updated
+model_services.add_model:
+  en: Add model
+model_services.edit_model:
+  en: Edit model
+model_services.save_model:
+  en: Save model
+model_services.remove_model:
+  en: Remove
+model_services.test:
+  en: Test
+model_services.working:
+  en: Working…
+model_services.no_models:
+  en: Add or sync models from an enabled provider
+model_services.model_required:
+  en: Enter the model ID first
+model_services.name_required:
+  en: Enter a provider name
+model_services.invalid_url:
+  en: Enter an HTTPS address or a local HTTP address
+model_services.api_key:
+  en: API key
+model_services.show_key:
+  en: Show API key
+model_services.hide_key:
+  en: Hide API key
+model_services.reading_key:
+  en: Reading saved key…
+model_services.key_read_failed:
+  en: Could not read the saved key. Enter a new key to replace it
+model_services.edit:
+  en: Edit provider
+model_services.cancel:
+  en: Cancel
+model_services.add_and_use:
+  en: Add and use
+model_services.models:
+  en: Models
+model_services.model_name:
+  en: Model name (optional)
+model_services.duplicate_model:
+  en: This model ID is already in the list
+model_services.sync_empty:
+  en: The provider returned no models. Add a model by ID
+model_services.connection_ok:
+  en: API connection works
+model_services.change_when_idle:
+  en: Provider added. Choose its model when the conversation is idle
+model_services.search_models:
+  en: Search models
+model_services.key_rejected:
+  en: The provider rejected the request. Check the API key and its permissions
+service_model.group:
+  en: Group name
+service_model.purpose:
+  en: Model purpose
+service_model.chat:
+  en: Chat
+service_model.generate:
+  en: Generate image
+service_model.edit_image:
+  en: Edit image
+service_model.kind:
+  en: Model type
+service_model.text:
+  en: Text
+service_model.image:
+  en: Image
+service_model.embedding:
+  en: Embedding
+service_model.rerank:
+  en: Rerank
+service_model.protocol:
+  en: Chat protocol
+service_model.capabilities:
+  en: Model capabilities
+service_model.reasoning:
+  en: Reasoning
+service_model.tools:
+  en: Tools
+service_model.inputs:
+  en: Input modalities
+service_model.vision:
+  en: Vision
+service_model.audio:
+  en: Audio
+service_model.video:
+  en: Video
+service_model.context:
+  en: Context window
+service_model.max_input:
+  en: Maximum input tokens
+service_model.max_output:
+  en: Maximum output tokens
+service_model.token_hint:
+  en: Waku checks an input estimate before sending. The dialogue API enforces the configured output cap
+service_model.invalid_tokens:
+  en: Enter positive whole numbers within the context window
+service_model.edit_needs_image:
+  en: Attach an image and describe the edit in the conversation
+service_model.rerank_format:
+  en: Put the query on the first line and one document on each following line

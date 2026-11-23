@@ -846,6 +846,10 @@ impl Waku {
     pub(super) fn render_provider_model_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
         let session = self.selected_session();
+        if let Some(session) = session.filter(|session| session.provider == ProviderKind::Assistant)
+        {
+            return self.render_session_assistant_model(session, cx);
+        }
         let provider = session.map(|session| session.provider).unwrap_or_default();
         let selected_model = session.and_then(|session| self.catalog_model_id_for_session(session));
         let selected_model_name = self.model_display_name(provider, selected_model);
@@ -2141,11 +2145,11 @@ impl Waku {
         if self.execute_local_composer_command(prompt, cx) {
             return None;
         }
-        // Nothing installed or switched on can run this. Refuse before the
-        // draft is consumed, so the text and its attachments survive until a
-        // provider is available — every send route lands here, so `enter`,
-        // the button, and steering are all covered by this one check.
-        if self.model_picker_has_no_providers() {
+        // Keep the draft when the selected task lacks a CLI
+        let native = self
+            .selected_session()
+            .is_some_and(|session| session.provider == ProviderKind::Assistant);
+        if !native && self.model_picker_has_no_providers() {
             return None;
         }
         for attachment in &self.composer_attachments {
@@ -2717,10 +2721,9 @@ impl Waku {
         });
         let has_draft = !self.composer.read(cx).content(cx).trim().is_empty()
             || !self.composer_attachments.is_empty();
-        // With no provider to run it, a draft has nowhere to go. The button
-        // reads as unavailable and the submission path refuses too, so
-        // `enter` cannot slip past a disabled control.
-        let no_providers = self.model_picker_has_no_providers();
+        // Native sessions use the configured model even if no CLI is installed
+        let native = session.is_some_and(|session| session.provider == ProviderKind::Assistant);
+        let no_providers = !native && self.model_picker_has_no_providers();
         let can_send = has_draft && !no_providers;
         let (autocomplete, autocomplete_actionable) =
             match self.render_composer_autocomplete(window, cx) {
@@ -2800,7 +2803,7 @@ impl Waku {
                         .child(self.render_provider_model_control(cx))
                         .children(self.render_model_traits_control(cx))
                         .children(self.render_agent_preset_control(cx))
-                        .child(self.render_access_control(cx))
+                        .when(!native, |row| row.child(self.render_access_control(cx)))
                         .children(self.render_goal_control(cx))
                         .child(div().flex_1())
                         .child(match submit_action {

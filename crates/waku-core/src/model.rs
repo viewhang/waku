@@ -5,9 +5,13 @@ use std::path::Path;
 pub use waku_protocol::model::*;
 
 pub fn provider_probe(provider: ProviderKind, binary_override: Option<&str>) -> ProviderProbe {
-    let path = match binary_override {
-        Some(binary) => crate::command_env::resolve_binary_override(binary),
-        None => crate::command_env::find_executable(provider.command()),
+    let path = if provider == ProviderKind::Assistant {
+        None
+    } else {
+        match binary_override {
+            Some(binary) => crate::command_env::resolve_binary_override(binary),
+            None => crate::command_env::find_executable(provider.command()),
+        }
     };
     ProviderProbe {
         provider,

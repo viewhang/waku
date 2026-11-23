@@ -2,6 +2,7 @@ import type {
   ActivityItem,
   ActivityKind,
   AgentSession,
+  MessageAttachment,
   ProviderResumeCursor,
   ReportedCommand,
   SequencedEvent,
@@ -102,6 +103,7 @@ export function reduceRuntimeEvent(
         typeof value.turnId === 'string' ? value.turnId : clock.randomUUID(),
         typeof value.messageId === 'string' ? value.messageId : clock.randomUUID(),
         clock,
+        Array.isArray(value.attachments) ? value.attachments.filter(isAttachment) : [],
       )
       break
     }
@@ -146,6 +148,11 @@ export function reduceRuntimeEvent(
     case 'textDelta':
       if (typeof payload === 'string' && acceptsTurnOutput(session)) {
         appendText(session, payload, clock)
+      }
+      break
+    case 'assistantAttachment':
+      if (isAttachment(payload) && acceptsTurnOutput(session)) {
+        appendAssistantContent(session, '', clock, payload)
       }
       break
     case 'reasoningDelta':
@@ -339,6 +346,7 @@ function adoptSubmittedPrompt(
   turnId: string,
   messageId: string,
   clock: ReducerClock,
+  attachments: MessageAttachment[],
 ) {
   const now = clock.nowSeconds()
   const active = activeTurn(session)
@@ -354,6 +362,7 @@ function adoptSubmittedPrompt(
       content: message,
       created_at: now,
       streaming: false,
+      ...(attachments.length ? { attachments } : {}),
     })
     return
   }
@@ -375,6 +384,7 @@ function adoptSubmittedPrompt(
     content: message,
     created_at: now,
     streaming: false,
+    ...(attachments.length ? { attachments } : {}),
   })
   session.status = 'connecting'
   session.last_reply_at = now
@@ -382,10 +392,27 @@ function adoptSubmittedPrompt(
 
 function appendText(session: AgentSession, delta: string, clock: ReducerClock) {
   if (!delta) return
+  appendAssistantContent(session, delta, clock)
+}
+
+function isAttachment(value: unknown): value is MessageAttachment {
+  const entry = asRecord(value)
+  return !!entry && typeof entry.path === 'string' && typeof entry.name === 'string'
+    && typeof entry.mention === 'string' && typeof entry.is_dir === 'boolean'
+    && typeof entry.is_image === 'boolean'
+}
+
+function appendAssistantContent(
+  session: AgentSession,
+  delta: string,
+  clock: ReducerClock,
+  attachment?: MessageAttachment,
+) {
   completeReasoning(session)
   const previous = session.messages.at(-1)
   if (previous?.role === 'assistant' && previous.streaming) {
     previous.content += delta
+    if (attachment) previous.attachments = [...(previous.attachments ?? []), attachment]
   } else {
     session.messages.push({
       id: clock.randomUUID(),
@@ -394,6 +421,7 @@ function appendText(session: AgentSession, delta: string, clock: ReducerClock) {
       content: delta,
       created_at: clock.nowSeconds(),
       streaming: true,
+      ...(attachment ? { attachments: [attachment] } : {}),
     })
   }
 }

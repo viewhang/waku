@@ -1,0 +1,928 @@
+//! Dispatch configured model operations while keeping chat history in Rig
+
+use anyhow::{Context as _, Result, bail};
+use base64::Engine as _;
+use reqwest::multipart::{Form, Part};
+use rig::agent::{AgentBuilder, FinalResponse, MultiTurnStreamItem, NoToolConfig};
+use rig::client::CompletionClient as _;
+use rig::completion::CompletionModel;
+use rig::message::{self, DocumentSourceKind, Message, MimeType as _, UserContent};
+use rig::providers::{anthropic, gemini, openai};
+use rig::streaming::{StreamedAssistantContent, StreamingPrompt as _};
+use serde_json::{Value, json};
+use smol::stream::StreamExt as _;
+use url::Url;
+use waku_protocol::settings::{
+    ModelKind, ModelModality, ModelProtocol, ModelPurpose, ServiceModelOptions,
+};
+
+use crate::attachments::{AttachmentStore, AttachmentUpload, MAX_ATTACHMENT_BYTES};
+use crate::driver::DriverEventSender;
+use crate::model::{DriverEvent, MessageAttachment};
+
+pub(super) struct Media {
+    pub(super) mime: &'static str,
+    pub(super) name: String,
+    pub(super) bytes: Vec<u8>,
+}
+
+pub(super) fn media_mime(name: &str) -> Option<&'static str> {
+    match name.rsplit_once('.')?.1.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        "wav" => Some("audio/wav"),
+        "mp3" => Some("audio/mp3"),
+        "aiff" | "aif" => Some("audio/aiff"),
+        "aac" => Some("audio/aac"),
+        "flac" => Some("audio/flac"),
+        "ogg" => Some("audio/ogg"),
+        "mp4" => Some("video/mp4"),
+        "mov" => Some("video/mov"),
+        "webm" => Some("video/webm"),
+        "mpeg" | "mpg" => Some("video/mpeg"),
+        _ => None,
+    }
+}
+
+/// Resolve only daemon attachments selected by the user, with one combined size limit
+pub(super) fn read_media(
+    store: &AttachmentStore,
+    attachments: Vec<MessageAttachment>,
+    options: &ServiceModelOptions,
+) -> Result<Vec<Media>> {
+    let mut total = 0;
+    attachments
+        .into_iter()
+        .map(|attachment| {
+            let mime =
+                media_mime(&attachment.name).context("Unsupported model attachment format")?;
+            let modality = if mime.starts_with("image/") {
+                ModelModality::Vision
+            } else if mime.starts_with("audio/") {
+                ModelModality::Audio
+            } else {
+                ModelModality::Video
+            };
+            if attachment.is_dir || !options.accepts(modality) {
+                bail!("The selected model and API do not accept {mime} input");
+            }
+            if options.protocol == ModelProtocol::OpenAiChat
+                && modality == ModelModality::Audio
+                && !matches!(mime, "audio/wav" | "audio/mp3")
+            {
+                bail!("Chat Completions audio requires WAV or MP3");
+            }
+            let reference = attachment
+                .blob_reference
+                .as_deref()
+                .context("Missing managed attachment reference")?;
+            let bytes = store.read_file(reference, &attachment.path)?;
+            total += bytes.len();
+            if bytes.is_empty() || total > MAX_ATTACHMENT_BYTES {
+                bail!("Model attachments are empty or exceed Waku's combined size limit");
+            }
+            Ok(Media {
+                mime,
+                name: attachment.name,
+                bytes,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn message(prompt: String, media: Vec<Media>) -> Result<Message> {
+    let mut content = Vec::new();
+    if !prompt.trim().is_empty() || media.is_empty() {
+        content.push(UserContent::text(prompt));
+    }
+    for asset in media {
+        let data = DocumentSourceKind::Base64(
+            base64::engine::general_purpose::STANDARD.encode(asset.bytes),
+        );
+        let part = if asset.mime.starts_with("image/") {
+            UserContent::Image(message::Image {
+                data,
+                media_type: Some(
+                    message::ImageMediaType::from_mime_type(asset.mime)
+                        .context("Unsupported image encoding")?,
+                ),
+                detail: Some(message::ImageDetail::Auto),
+                ..Default::default()
+            })
+        } else if asset.mime.starts_with("audio/") {
+            UserContent::Audio(message::Audio {
+                data,
+                media_type: Some(
+                    message::AudioMediaType::from_mime_type(asset.mime)
+                        .context("Unsupported audio encoding")?,
+                ),
+                ..Default::default()
+            })
+        } else {
+            UserContent::Video(message::Video {
+                data,
+                media_type: Some(
+                    message::VideoMediaType::from_mime_type(asset.mime)
+                        .context("Unsupported video encoding")?,
+                ),
+                ..Default::default()
+            })
+        };
+        content.push(part);
+    }
+    Ok(Message::User {
+        content: rig::OneOrMany::many(content)?,
+    })
+}
+
+/// Estimate preflight tokens locally since custom gateways do not share a tokenizer
+fn estimate(message: &Message) -> Result<usize> {
+    Ok(match message {
+        Message::User { content } => {
+            let mut size = 12;
+            for block in content.iter() {
+                size += match block {
+                    UserContent::Text(text) => text.text.len(),
+                    UserContent::Image(_) => 2_048,
+                    UserContent::Audio(audio) => audio.data.to_string().len().div_ceil(256),
+                    UserContent::Video(video) => video.data.to_string().len().div_ceil(128),
+                    other => serde_json::to_vec(other)?.len(),
+                };
+            }
+            size
+        }
+        other => serde_json::to_vec(other)?.len(),
+    })
+}
+
+pub(super) struct Chat<'a> {
+    pub url: &'a Url,
+    pub key: &'a str,
+    pub model: &'a str,
+    pub options: &'a ServiceModelOptions,
+    pub preamble: &'a str,
+    pub history: &'a [Message],
+}
+
+impl Chat<'_> {
+    pub async fn send(
+        self,
+        http: &reqwest::Client,
+        prompt: Message,
+        events: &DriverEventSender,
+    ) -> Result<FinalResponse> {
+        let base = self.url.as_str().trim_end_matches('/');
+        let model = self.model;
+        match self.options.protocol {
+            ModelProtocol::OpenAiChat => {
+                let client = openai::CompletionsClient::builder()
+                    .api_key(self.key)
+                    .base_url(base)
+                    .http_client(http.clone())
+                    .build()?;
+                self.stream(client.agent(model), prompt, events).await
+            }
+            ModelProtocol::OpenAiResponses => {
+                let client = openai::Client::builder()
+                    .api_key(self.key)
+                    .base_url(base)
+                    .http_client(http.clone())
+                    .build()?;
+                self.stream(client.agent(model), prompt, events).await
+            }
+            ModelProtocol::AnthropicMessages => {
+                let client = anthropic::Client::builder()
+                    .api_key(self.key)
+                    .base_url(base.trim_end_matches("/v1"))
+                    .http_client(http.clone())
+                    .build()?;
+                self.stream(client.agent(model), prompt, events).await
+            }
+            ModelProtocol::Gemini => {
+                let model = self.model.strip_prefix("models/").unwrap_or(self.model);
+                if !model
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+                {
+                    bail!("Invalid Gemini model ID");
+                }
+                let client = gemini::Client::builder()
+                    .api_key(self.key)
+                    .base_url(base.trim_end_matches("/v1beta").trim_end_matches("/v1"))
+                    .http_client(http.clone())
+                    .build()?;
+                self.stream(client.agent(model), prompt, events).await
+            }
+        }
+    }
+
+    async fn stream<M: CompletionModel + 'static>(
+        self,
+        mut builder: AgentBuilder<M, (), NoToolConfig>,
+        prompt: Message,
+        events: &DriverEventSender,
+    ) -> Result<FinalResponse> {
+        let window = self.options.context_window.map(|value| value as usize);
+        let limit = [self.options.max_input_tokens, self.options.context_window]
+            .into_iter()
+            .flatten()
+            .min();
+        let mut input = self.preamble.len();
+        if let Some(limit) = limit {
+            for message in self.history.iter().chain(std::iter::once(&prompt)) {
+                input += estimate(message)?;
+                if input > limit as usize {
+                    bail!("Estimated input exceeds the configured token budget ({input} tokens)");
+                }
+            }
+        }
+        let configured = self.options.max_output_tokens.map(|value| value as usize);
+        let output = match window {
+            Some(window) => Some(configured.unwrap_or(4096).min(window.saturating_sub(input))),
+            None => configured,
+        };
+        if output == Some(0) {
+            bail!("The configured context window leaves no room for a reply");
+        }
+        // Keep the legacy limit field for compatible gateways that only accept it
+        let completion_limit = self.options.protocol == ModelProtocol::OpenAiChat
+            && (self.options.reasoning || self.url.host_str() == Some("api.openai.com"));
+        let params = protocol_parameters(self.options, self.model, output, completion_limit)?;
+        if let Some(output) = output.filter(|_| !completion_limit) {
+            builder = builder.max_tokens(output as u64);
+        }
+        let agent = builder
+            .preamble(self.preamble)
+            .additional_params(params)
+            .build();
+        let mut stream = agent
+            .stream_prompt(prompt)
+            .with_history(self.history.iter().cloned())
+            .await;
+        while let Some(item) = stream.next().await {
+            match item? {
+                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) => {
+                    let _ = events.send(DriverEvent::TextDelta(text.text));
+                }
+                MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ReasoningDelta { reasoning, .. },
+                ) if self.options.reasoning => {
+                    let _ = events.send(DriverEvent::ReasoningDelta(reasoning));
+                }
+                MultiTurnStreamItem::FinalResponse(response) => return Ok(response),
+                _ => {}
+            }
+        }
+        bail!("The model stream ended before completing its response")
+    }
+}
+
+fn protocol_parameters(
+    options: &ServiceModelOptions,
+    model: &str,
+    output: Option<usize>,
+    completion_limit: bool,
+) -> Result<Value> {
+    Ok(match options.protocol {
+        ModelProtocol::OpenAiChat => {
+            let mut params = json!({});
+            if options.reasoning {
+                params["reasoning_effort"] = json!("medium");
+            }
+            if let Some(output) = output.filter(|_| completion_limit) {
+                params["max_completion_tokens"] = json!(output);
+            }
+            params
+        }
+        ModelProtocol::OpenAiResponses if options.reasoning => {
+            json!({"store": false, "reasoning":{"effort":"medium","summary":"auto"}})
+        }
+        ModelProtocol::OpenAiResponses => json!({"store":false}),
+        ModelProtocol::AnthropicMessages if options.reasoning => {
+            if [
+                "opus-4-6",
+                "opus-4-7",
+                "sonnet-4-6",
+                "opus-4-8",
+                "fable",
+                "mythos",
+            ]
+            .iter()
+            .any(|family| model.contains(family))
+            {
+                json!({"thinking": {"type":"adaptive"}})
+            } else {
+                let output = output.unwrap_or(2048);
+                if output <= 1024 {
+                    bail!("Anthropic extended thinking needs an output limit above 1,024 tokens");
+                }
+                json!({"thinking": {"type":"enabled","budget_tokens": (output - 1).clamp(1024, 2048)}})
+            }
+        }
+        ModelProtocol::Gemini if options.reasoning => {
+            json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}})
+        }
+        ModelProtocol::Gemini => json!({"generationConfig": {}}),
+        _ => json!({}),
+    })
+}
+
+pub(super) struct Operation<'a> {
+    pub url: &'a Url,
+    pub key: &'a str,
+    pub model: &'a str,
+    pub options: &'a ServiceModelOptions,
+    pub prompt: &'a str,
+    pub media: Vec<Media>,
+}
+
+impl Operation<'_> {
+    pub async fn send(
+        self,
+        http: &reqwest::Client,
+        store: Option<&AttachmentStore>,
+        events: &DriverEventSender,
+    ) -> Result<String> {
+        let base = self.url.as_str().trim_end_matches('/');
+        let estimated = self.prompt.len() + self.media.len() * 2048;
+        if [self.options.context_window, self.options.max_input_tokens]
+            .into_iter()
+            .flatten()
+            .any(|limit| estimated > limit as usize)
+        {
+            bail!("Estimated input exceeds the configured token budget ({estimated} tokens)");
+        }
+        if self.prompt.trim().is_empty() {
+            bail!("Enter a prompt for the selected model");
+        }
+        let (endpoint, payload, label) = match self.options.purpose {
+            ModelPurpose::ImageGeneration => (
+                "/images/generations",
+                json!({"model":self.model,"prompt":self.prompt,"n":1}),
+                "Generated image",
+            ),
+            ModelPurpose::ImageEdit => {
+                if self.media.is_empty() {
+                    bail!("Attach an image to edit");
+                }
+                let mut form = Form::new()
+                    .text("model", self.model.to_owned())
+                    .text("prompt", self.prompt.to_owned());
+                let field = if self.media.len() == 1 {
+                    "image"
+                } else {
+                    "image[]"
+                };
+                for media in self.media {
+                    form = form.part(
+                        field,
+                        Part::bytes(media.bytes)
+                            .file_name(media.name)
+                            .mime_str(media.mime)?,
+                    );
+                }
+                let response = http
+                    .post(format!("{base}/images/edits"))
+                    .bearer_auth(self.key)
+                    .multipart(form)
+                    .send()
+                    .await?;
+                return image_result(http, response, store, events, "Edited image").await;
+            }
+            ModelPurpose::Chat => match self.options.kind {
+                ModelKind::Embedding => (
+                    "/embeddings",
+                    json!({"model":self.model,"input":self.prompt}),
+                    "",
+                ),
+                ModelKind::Rerank => {
+                    let mut lines = self
+                        .prompt
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty());
+                    let query = lines.next().context("Enter a search query")?;
+                    let documents: Vec<_> = lines.collect();
+                    if documents.is_empty() {
+                        bail!(
+                            "Put the query on the first line and one document per following line"
+                        );
+                    }
+                    (
+                        "/rerank",
+                        json!({"model":self.model,"query":query,"documents":documents}),
+                        "",
+                    )
+                }
+                _ => bail!("Invalid model operation"),
+            },
+        };
+        let response = http
+            .post(format!("{base}{endpoint}"))
+            .bearer_auth(self.key)
+            .json(&payload)
+            .send()
+            .await?;
+        if !label.is_empty() {
+            return image_result(http, response, store, events, label).await;
+        }
+        let result = read_json(response).await?;
+        let key = if self.options.kind == ModelKind::Embedding {
+            "data"
+        } else {
+            "results"
+        };
+        let output = result
+            .get(key)
+            .filter(|value| value.is_array())
+            .context("The model returned no results")?;
+        let text = format!(
+            "\x60\x60\x60json\n{}\n\x60\x60\x60",
+            serde_json::to_string_pretty(output)?
+        );
+        let _ = events.send(DriverEvent::TextDelta(text.clone()));
+        Ok(text)
+    }
+}
+
+async fn image_result(
+    http: &reqwest::Client,
+    response: reqwest::Response,
+    store: Option<&AttachmentStore>,
+    events: &DriverEventSender,
+    label: &str,
+) -> Result<String> {
+    let value = read_json(response).await?;
+    let image = value["data"]
+        .get(0)
+        .context("The provider returned no image")?;
+    let bytes = if let Some(data) = image["b64_json"].as_str() {
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .context("Invalid image data")?
+    } else {
+        let url = Url::parse(image["url"].as_str().context("Missing image data")?)?;
+        if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+            bail!("The provider returned an invalid image download URL");
+        }
+        read_body(http.get(url).send().await?, MAX_ATTACHMENT_BYTES).await?
+    };
+    let extension = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        "jpg"
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        "webp"
+    } else {
+        bail!("The provider returned an unsupported image format");
+    };
+    let Some(store) = store else {
+        return Ok(label.to_owned());
+    };
+    let name = format!(
+        "{}.{}",
+        label.to_ascii_lowercase().replace(' ', "-"),
+        extension
+    );
+    let stored = store.import(
+        &name,
+        AttachmentUpload::File {
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        },
+    )?;
+    let _ = events.send(DriverEvent::AssistantAttachment(MessageAttachment {
+        path: stored.path,
+        mention: name,
+        name: stored.name,
+        is_dir: false,
+        is_image: true,
+        blob_reference: Some(stored.reference),
+    }));
+    Ok(label.to_owned())
+}
+
+async fn read_json(response: reqwest::Response) -> Result<Value> {
+    Ok(serde_json::from_slice(
+        &read_body(response, 2 * MAX_ATTACHMENT_BYTES).await?,
+    )?)
+}
+
+async fn read_body(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    let status = response.status();
+    if !status.is_success() {
+        bail!("Model request failed: HTTP {status}");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len() + chunk.len() > limit {
+            bail!("The model response exceeds Waku's size limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::net::TcpListener;
+
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/j1sAAAAASUVORK5CYII=";
+
+    struct Received {
+        path: String,
+        headers: String,
+        body: Vec<u8>,
+    }
+
+    fn reply(mime: &'static str, body: String) -> (Url, std::thread::JoinHandle<Received>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/v1", listener.local_addr().unwrap())).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let mut headers = String::new();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(size) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = size.trim().parse().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            let mut input = vec![0; length];
+            reader.read_exact(&mut input).unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            Received {
+                path: request.split_whitespace().nth(1).unwrap().to_owned(),
+                headers,
+                body: input,
+            }
+        });
+        (url, handle)
+    }
+
+    fn sse(events: Vec<Value>) -> String {
+        events
+            .into_iter()
+            .map(|data| format!("data: {data}\n\n"))
+            .collect()
+    }
+
+    #[test]
+    fn native_catalogs_use_the_provider_path_and_key_header() {
+        for (protocol, path, header, response) in [
+            (
+                ModelProtocol::AnthropicMessages,
+                "/v1/models",
+                "x-api-key",
+                json!({"data":[{"id":"demo"}]}),
+            ),
+            (
+                ModelProtocol::Gemini,
+                "/v1beta/models",
+                "x-goog-api-key",
+                json!({"models":[{"name":"models/demo"}]}),
+            ),
+        ] {
+            let (url, server) = reply("application/json", response.to_string());
+            assert_eq!(
+                super::super::list_models(url.as_str(), "test-key", protocol).unwrap(),
+                ["demo"]
+            );
+            let received = server.join().unwrap();
+            assert_eq!(received.path, path);
+            assert!(
+                received
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains(&format!("{header}: test-key"))
+            );
+        }
+    }
+
+    fn receive_chat(protocol: ModelProtocol) -> String {
+        match protocol {
+            ModelProtocol::OpenAiChat => {
+                sse(vec![
+                    json!({"choices":[{"index":0,"delta":{"reasoning_content":"Plan"},"finish_reason":null}]}),
+                    json!({"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}),
+                    json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+                ]) + "data: [DONE]\n\n"
+            }
+            ModelProtocol::OpenAiResponses => sse(vec![
+                json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_test","output_index":0,"delta":"Plan","summary_index":0,"sequence_number":1}),
+                json!({"type":"response.output_text.delta","item_id":"msg_test","output_index":1,"delta":"OK","content_index":0,"sequence_number":2}),
+                json!({"type":"response.completed","sequence_number":3,"response":{
+                    "id":"resp_test","object":"response","created_at":0,"status":"completed","model":"demo","output":[]
+                }}),
+            ]),
+            ModelProtocol::AnthropicMessages => sse(vec![
+                json!({"type":"message_start","message":{"id":"msg_test","role":"assistant","content":[],"model":"demo","usage":{"input_tokens":4,"output_tokens":0}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Plan"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"OK"}}),
+                json!({"type":"content_block_stop","index":1}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+                json!({"type":"message_stop"}),
+            ]),
+            ModelProtocol::Gemini => sse(vec![json!({
+                "candidates":[{"content":{"parts":[{"text":"Plan","thought":true},{"text":"OK"}],"role":"model"},"finishReason":"STOP","index":0}],
+                "usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":1,"totalTokenCount":5}
+            })]),
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_protocols_send_reasoning_limits_and_supported_media() {
+        let http = super::super::http_client().unwrap();
+        for protocol in [
+            ModelProtocol::OpenAiChat,
+            ModelProtocol::OpenAiResponses,
+            ModelProtocol::AnthropicMessages,
+            ModelProtocol::Gemini,
+        ] {
+            let (events, received_events) = crate::driver::test_event_channel();
+            let (url, server) = reply("text/event-stream", receive_chat(protocol));
+            let options = ServiceModelOptions {
+                protocol,
+                reasoning: true,
+                tools: false,
+                max_output_tokens: Some(2048),
+                context_window: Some(32000),
+                max_input_tokens: Some(16000),
+                inputs: vec![
+                    ModelModality::Vision,
+                    ModelModality::Audio,
+                    ModelModality::Video,
+                ],
+                ..Default::default()
+            };
+            let mut media = vec![Media {
+                mime: "image/png",
+                name: "source.png".into(),
+                bytes: vec![1, 2, 3],
+            }];
+            if protocol.supports(ModelModality::Audio) {
+                media.push(Media {
+                    mime: "audio/wav",
+                    name: "source.wav".into(),
+                    bytes: vec![4, 5, 6],
+                });
+            }
+            if protocol.supports(ModelModality::Video) {
+                media.push(Media {
+                    mime: "video/mp4",
+                    name: "source.mp4".into(),
+                    bytes: vec![7, 8, 9],
+                });
+            }
+            let response = Chat {
+                url: &url,
+                key: "example-key",
+                model: "demo",
+                options: &options,
+                preamble: "system instruction",
+                history: &[],
+            }
+            .send(
+                &http,
+                message("Look at the input".into(), media).unwrap(),
+                &events,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{protocol:?}: {error:#}"));
+            assert_eq!(response.response(), "OK", "{protocol:?}");
+            assert!(
+                std::iter::from_fn(|| received_events.try_recv().ok()).any(|event| {
+                    matches!(event, DriverEvent::ReasoningDelta(text) if text == "Plan")
+                }),
+                "{protocol:?}"
+            );
+            let received = server.join().unwrap();
+            let body: Value = serde_json::from_slice(&received.body).unwrap();
+            let payload = body.to_string();
+            assert!(payload.contains("AQID"), "{payload}");
+            assert!(
+                body.get("tools").is_none_or(
+                    |tools| tools.is_null() || tools.as_array().is_some_and(Vec::is_empty)
+                )
+            );
+            match protocol {
+                ModelProtocol::OpenAiChat => {
+                    assert_eq!(received.path, "/v1/chat/completions");
+                    assert_eq!(body["max_completion_tokens"], 2048);
+                    assert_eq!(body["reasoning_effort"], "medium");
+                    assert!(payload.contains("input_audio"));
+                }
+                ModelProtocol::OpenAiResponses => {
+                    assert_eq!(received.path, "/v1/responses");
+                    assert_eq!(body["max_output_tokens"], 2048);
+                    assert_eq!(body["reasoning"]["effort"], "medium");
+                    assert_eq!(body["store"], false);
+                    assert!(payload.contains("input_image"));
+                }
+                ModelProtocol::AnthropicMessages => {
+                    assert_eq!(received.path, "/v1/messages");
+                    assert_eq!(body["max_tokens"], 2048);
+                    assert_eq!(body["thinking"]["type"], "enabled");
+                    assert!(
+                        received
+                            .headers
+                            .to_ascii_lowercase()
+                            .contains("x-api-key: example-key")
+                    );
+                }
+                ModelProtocol::Gemini => {
+                    assert!(
+                        received
+                            .path
+                            .starts_with("/v1beta/models/demo:streamGenerateContent")
+                    );
+                    assert_eq!(body["generationConfig"]["maxOutputTokens"], 2048);
+                    assert_eq!(
+                        body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+                        true
+                    );
+                    assert!(payload.contains("audio/wav"));
+                    assert!(payload.contains("video/mp4"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn token_budgets_reject_input_and_adjust_the_wire_output_cap() {
+        let http = super::super::http_client().unwrap();
+        let (events, _) = crate::driver::test_event_channel();
+        let (url, server) = reply("text/event-stream", receive_chat(ModelProtocol::OpenAiChat));
+        let options = ServiceModelOptions {
+            context_window: Some(100),
+            max_input_tokens: Some(18),
+            max_output_tokens: Some(90),
+            ..Default::default()
+        };
+        let make_chat = |options| Chat {
+            url: &url,
+            key: "example-key",
+            model: "demo",
+            options,
+            preamble: "",
+            history: &[],
+        };
+        let error = make_chat(&options)
+            .send(&http, Message::user("1234567"), &events)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("configured token budget"));
+        let relaxed = ServiceModelOptions {
+            max_input_tokens: Some(40),
+            ..options.clone()
+        };
+        make_chat(&relaxed)
+            .send(&http, Message::user("1234567"), &events)
+            .await
+            .unwrap();
+        let sent: Value = serde_json::from_slice(&server.join().unwrap().body).unwrap();
+        assert_eq!(sent["max_tokens"], 81);
+    }
+
+    #[tokio::test]
+    async fn generation_edits_embeddings_and_rerank_dispatch_to_their_endpoints() {
+        let http = super::super::http_client().unwrap();
+        let root = std::env::temp_dir().join(format!("waku-model-files-{}", uuid::Uuid::new_v4()));
+        let store = AttachmentStore::new(root.clone());
+        let (events, received_events) = crate::driver::test_event_channel();
+        for (purpose, kind, endpoint, prompt) in [
+            (
+                ModelPurpose::ImageGeneration,
+                ModelKind::Image,
+                "/v1/images/generations",
+                "Draw a square",
+            ),
+            (
+                ModelPurpose::ImageEdit,
+                ModelKind::Image,
+                "/v1/images/edits",
+                "Make it red",
+            ),
+            (
+                ModelPurpose::Chat,
+                ModelKind::Embedding,
+                "/v1/embeddings",
+                "Embed this",
+            ),
+            (
+                ModelPurpose::Chat,
+                ModelKind::Rerank,
+                "/v1/rerank",
+                "red\nred square\nblue circle",
+            ),
+        ] {
+            let options = ServiceModelOptions {
+                purpose,
+                kind,
+                ..Default::default()
+            };
+            let response = match kind {
+                ModelKind::Image => json!({"data":[{"b64_json":PNG}]}),
+                ModelKind::Embedding => json!({"data":[{"embedding":[0.25,0.75]}]}),
+                ModelKind::Rerank => json!({"results":[{"index":0,"relevance_score":0.9}]}),
+                _ => unreachable!(),
+            };
+            let (url, server) = reply("application/json", response.to_string());
+            let mut media = Vec::new();
+            if purpose == ModelPurpose::ImageEdit {
+                let file = store
+                    .import(
+                        "source.png",
+                        AttachmentUpload::File {
+                            data_base64: PNG.into(),
+                        },
+                    )
+                    .unwrap();
+                let attachment = MessageAttachment {
+                    path: file.path,
+                    mention: file.name.clone(),
+                    name: file.name,
+                    is_dir: false,
+                    is_image: true,
+                    blob_reference: Some(file.reference),
+                };
+                assert!(
+                    read_media(
+                        &store,
+                        vec![attachment.clone()],
+                        &ServiceModelOptions::default()
+                    )
+                    .is_err()
+                );
+                media = read_media(&store, vec![attachment], &options).unwrap();
+            }
+            Operation {
+                url: &url,
+                key: "example-key",
+                model: "demo",
+                options: &options,
+                prompt,
+                media,
+            }
+            .send(&http, Some(&store), &events)
+            .await
+            .unwrap();
+            let received = server.join().unwrap();
+            assert_eq!(received.path, endpoint);
+            if purpose == ModelPurpose::ImageEdit {
+                let body = String::from_utf8_lossy(&received.body);
+                assert!(received.headers.contains("multipart/form-data"));
+                assert!(body.contains("filename=\"source.png\"") && body.contains("Make it red"));
+                assert!(
+                    received
+                        .body
+                        .windows(8)
+                        .any(|part| part == b"\x89PNG\r\n\x1a\n")
+                );
+            } else {
+                let sent: Value = serde_json::from_slice(&received.body).unwrap();
+                assert_eq!(sent["model"], "demo");
+                match kind {
+                    ModelKind::Image => assert_eq!(sent["prompt"], prompt),
+                    ModelKind::Embedding => assert_eq!(sent["input"], prompt),
+                    ModelKind::Rerank => {
+                        assert_eq!(sent["documents"], json!(["red square", "blue circle"]))
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            if kind == ModelKind::Image {
+                let DriverEvent::AssistantAttachment(image) = received_events.try_recv().unwrap()
+                else {
+                    panic!("Missing image attachment")
+                };
+                assert_eq!(
+                    store
+                        .read_file(image.blob_reference.as_deref().unwrap(), &image.path)
+                        .unwrap(),
+                    base64::engine::general_purpose::STANDARD
+                        .decode(PNG)
+                        .unwrap()
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

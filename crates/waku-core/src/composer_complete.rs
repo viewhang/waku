@@ -157,6 +157,7 @@ fn assemble_slash_commands(
         .or_else(|| home.as_deref().map(|home| home.join(".claude")));
     let mut commands = Vec::new();
     match provider {
+        ProviderKind::Assistant => return Vec::new(),
         ProviderKind::Claude => {
             scan_command_files(
                 &project_root.join(".claude/commands"),

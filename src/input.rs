@@ -632,6 +632,8 @@ pub struct TextInput {
     focus_handle: FocusHandle,
     mode: FieldMode,
     read_only: bool,
+    password: bool,
+    password_revealed: bool,
     /// Enter submits this multi-line field instead of inserting a newline;
     /// Shift+Enter still breaks the line. (One-line fields always submit.)
     submit_on_enter: bool,
@@ -738,6 +740,8 @@ impl TextInput {
             focus_handle,
             mode: FieldMode::SingleLine,
             read_only: false,
+            password: false,
+            password_revealed: false,
             submit_on_enter: false,
             auto_height: false,
             accepts_media_paste: false,
@@ -781,6 +785,46 @@ impl TextInput {
             },
             blink_cursor,
             _subscriptions,
+        }
+    }
+
+    /// Mask the display while keeping cursor and selection on the actual input
+    pub fn password(mut self) -> Self {
+        self.password = true;
+        self
+    }
+
+    pub fn set_password_revealed(&mut self, revealed: bool, cx: &mut Context<Self>) {
+        self.password_revealed = revealed;
+        self.last_layout = None;
+        cx.notify();
+    }
+
+    pub fn password_revealed(&self) -> bool {
+        self.password_revealed
+    }
+
+    fn masks_content(&self) -> bool {
+        self.password && !self.password_revealed
+    }
+
+    /// The shaped password uses one bullet per character, with its own UTF-8 offsets
+    fn layout_index(&self, offset: usize) -> usize {
+        if self.masks_content() {
+            self.content[..offset].chars().count() * '•'.len_utf8()
+        } else {
+            offset
+        }
+    }
+
+    fn content_index(&self, layout_index: usize) -> usize {
+        if self.masks_content() {
+            self.content
+                .char_indices()
+                .nth(layout_index / '•'.len_utf8())
+                .map_or(self.content.len(), |(offset, _)| offset)
+        } else {
+            layout_index.min(self.content.len())
         }
     }
 
@@ -1040,7 +1084,8 @@ impl TextInput {
     /// field has painted once.
     pub fn position_for_offset(&self, offset: usize) -> Option<(Point<Pixels>, Pixels)> {
         let layout = self.last_layout.as_ref()?;
-        let position = layout.position_for_index(offset.min(self.content.len()))?;
+        let position =
+            layout.position_for_index(self.layout_index(offset.min(self.content.len())))?;
         Some((position, layout.line_height()))
     }
 
@@ -1677,6 +1722,9 @@ impl TextInput {
     }
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.password {
+            return;
+        }
         if self.mode == FieldMode::MultiLine && !self.submit_on_enter {
             self.replace_text_in_range(None, "\n", window, cx);
             return;
@@ -1739,6 +1787,9 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.masks_content() {
+            return;
+        }
         if self.selected_range.is_empty() {
             // Nothing here to copy. The composer holds focus almost all the
             // time, so propagating lets an outer handler — the transcript's
@@ -1752,6 +1803,9 @@ impl TextInput {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.masks_content() {
+            return;
+        }
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
@@ -1927,10 +1981,11 @@ impl TextInput {
         let Some(layout) = self.last_layout.as_ref() else {
             return 0;
         };
-        layout
-            .index_for_position(position)
-            .unwrap_or_else(|index| index)
-            .min(self.content.len())
+        self.content_index(
+            layout
+                .index_for_position(position)
+                .unwrap_or_else(|index| index),
+        )
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -2057,6 +2112,9 @@ impl EntityInputHandler for TextInput {
     ) -> Option<String> {
         let range = self.range_from_utf16(&range_utf16);
         actual_range.replace(self.range_to_utf16(&range));
+        if self.masks_content() {
+            return Some("•".repeat(self.content[range].encode_utf16().count()));
+        }
         Some(self.content[range].to_string())
     }
 
@@ -2184,8 +2242,8 @@ impl EntityInputHandler for TextInput {
     ) -> Option<Bounds<Pixels>> {
         let layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
-        let start = layout.position_for_index(range.start)?;
-        let end = layout.position_for_index(range.end)?;
+        let start = layout.position_for_index(self.layout_index(range.start))?;
+        let end = layout.position_for_index(self.layout_index(range.end))?;
         let line_height = layout.line_height();
         if start.y == end.y {
             Some(Bounds::from_corners(
@@ -2207,10 +2265,11 @@ impl EntityInputHandler for TextInput {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         let layout = self.last_layout.as_ref()?;
-        let utf8_index = layout
-            .index_for_position(point)
-            .unwrap_or_else(|index| index)
-            .min(self.content.len());
+        let utf8_index = self.content_index(
+            layout
+                .index_for_position(point)
+                .unwrap_or_else(|index| index),
+        );
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -2368,9 +2427,9 @@ impl InputElement {
             (
                 input.is_visually_focused(window),
                 (
-                    input.selected_range.start,
-                    input.cursor_offset(),
-                    input.selected_range.end,
+                    input.layout_index(input.selected_range.start),
+                    input.layout_index(input.cursor_offset()),
+                    input.layout_index(input.selected_range.end),
                 ),
                 !input.content.is_empty() && input.selected_range == (0..input.content.len()),
                 input.scroll_offset,
@@ -2567,14 +2626,20 @@ impl Element for InputElement {
         let style = window.text_style();
         let theme = Theme::current(cx);
         let content_is_empty = content.is_empty();
+        let map_range =
+            |range: &Range<usize>| input.layout_index(range.start)..input.layout_index(range.end);
         let (display_text, text_color, selected_range, marked_range) = if content_is_empty {
             (input.placeholder.clone(), theme.text_ghost, None, None)
         } else {
             (
-                content,
+                if input.masks_content() {
+                    "•".repeat(content.chars().count()).into()
+                } else {
+                    content
+                },
                 style.color,
-                Some(&input.selected_range),
-                input.marked_range.as_ref(),
+                Some(map_range(&input.selected_range)),
+                input.marked_range.as_ref().map(map_range),
             )
         };
         let base_run = TextRun {
@@ -2601,8 +2666,8 @@ impl Element for InputElement {
         let runs = input_text_runs(
             display_text.len(),
             base_run,
-            selected_range,
-            marked_range,
+            selected_range.as_ref(),
+            marked_range.as_ref(),
             theme.inverse.opacity(0.18),
             if content_is_empty {
                 &[]
@@ -2669,7 +2734,7 @@ impl Element for InputElement {
                         layout.bounds().top() + layout.line_height() * navigation.visual_row as f32,
                     )
                 })
-                .or_else(|| layout.position_for_index(cursor));
+                .or_else(|| layout.position_for_index(input.layout_index(cursor)));
             let quad = (input.selected_range.is_empty() && cursor_visible)
                 .then_some(cursor_position)
                 .flatten()
@@ -2844,14 +2909,19 @@ impl Render for TextInput {
             "composer-context-menu",
             &self.context_menu,
             move |cx| {
-                let (has_selection, has_content, all_selected) = {
+                let (has_selection, has_content, all_selected, copy_allowed) = {
                     let input = context_menu_input.read(cx);
                     let has_selection = !input.selected_range.is_empty();
                     let has_content = !input.content.is_empty();
                     let all_selected = has_content
                         && input.selected_range.start == 0
                         && input.selected_range.end == input.content.len();
-                    (has_selection, has_content, all_selected)
+                    (
+                        has_selection,
+                        has_content,
+                        all_selected,
+                        !input.masks_content(),
+                    )
                 };
                 let can_paste = cx
                     .read_from_clipboard()
@@ -2882,14 +2952,14 @@ impl Render for TextInput {
                             input.cut(&Cut, window, cx)
                         }),
                     )
-                    .disabled(!has_selection),
+                    .disabled(!has_selection || !copy_allowed),
                     MenuItem::new(
                         tr!("menu.copy"),
                         run(&context_menu_input, |input, window, cx| {
                             input.copy(&Copy, window, cx)
                         }),
                     )
-                    .disabled(!has_selection),
+                    .disabled(!has_selection || !copy_allowed),
                     MenuItem::new(
                         tr!("menu.paste"),
                         run(&context_menu_input, |input, window, cx| {
@@ -3168,6 +3238,51 @@ mod tests {
         cx.update(|window, cx| window.focus(&composer.read(cx).focus(), cx));
         cx.run_until_parked();
         (composer, cx)
+    }
+
+    #[gpui::test]
+    fn model_service_password_retains_edits_when_toggling_visibility(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler as _;
+
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| {
+                let mut input = TextInput::new(window, cx).password();
+                input.set_content("abc123", cx);
+                input
+            });
+            InputHarness {
+                input,
+                width: px(240.0),
+            }
+        });
+        let input = cx.read_entity(&harness, |harness, _| harness.input.clone());
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                let mut actual = None;
+                assert_eq!(
+                    input
+                        .text_for_range(0..6, &mut actual, window, cx)
+                        .as_deref(),
+                    Some("••••••")
+                );
+                input.select_range(3..6, cx);
+                input.replace_text_in_range(None, "xyz", window, cx);
+                input.set_password_revealed(true, cx);
+                assert_eq!(
+                    input
+                        .text_for_range(0..6, &mut actual, window, cx)
+                        .as_deref(),
+                    Some("abcxyz")
+                );
+                input.set_password_revealed(false, cx);
+                assert_eq!(
+                    input
+                        .text_for_range(0..6, &mut actual, window, cx)
+                        .as_deref(),
+                    Some("••••••")
+                );
+            })
+        });
     }
 
     #[gpui::test]

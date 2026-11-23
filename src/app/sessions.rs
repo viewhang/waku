@@ -194,17 +194,19 @@ impl Waku {
             )
         }) {
             self.state.selected_project = Some(project_id);
-            self.state.last_provider = provider;
-            self.state.last_runtime_mode = runtime_mode;
-            self.state.last_model = model;
-            self.state.last_reasoning_effort = reasoning_effort;
-            self.state.last_service_tier = service_tier;
-            self.state.last_context_window = context_window;
+            // Native profiles have their own model settings and never replace the CLI defaults
+            if provider != ProviderKind::Assistant {
+                self.state.last_provider = provider;
+                self.state.last_runtime_mode = runtime_mode;
+                self.state.last_model = model;
+                self.state.last_reasoning_effort = reasoning_effort;
+                self.state.last_service_tier = service_tier;
+                self.state.last_context_window = context_window;
+            }
         }
-        if self
-            .selected_session()
-            .is_some_and(|session| !session.has_started())
-        {
+        if self.selected_session().is_some_and(|session| {
+            session.provider != ProviderKind::Assistant && !session.has_started()
+        }) {
             self.session_navigation.remember_new_task(session_id);
         }
         if session_changed {
@@ -264,7 +266,11 @@ impl Waku {
             .state
             .sessions
             .iter()
-            .find(|session| session.project_id == project_id && !session.has_started())
+            .find(|session| {
+                session.provider != ProviderKind::Assistant
+                    && session.project_id == project_id
+                    && !session.has_started()
+            })
             .map(|session| session.id)
         {
             self.select_session(draft_id, cx);
@@ -966,21 +972,25 @@ impl Waku {
         if self.settings_page.is_some() {
             return;
         }
-        if !self
-            .selected_session()
-            .is_some_and(|session| session.can_choose_model(session.provider))
-        {
+        let Some(session) = self.selected_session() else {
             return;
-        }
+        };
+        let menu_id = if session.provider == ProviderKind::Assistant && !session.status.is_busy() {
+            super::assistants::ASSISTANT_MODEL_MENU_ID
+        } else if session.can_choose_model(session.provider) {
+            MODEL_PICKER_MENU_ID
+        } else {
+            return;
+        };
         let menus = self.menus.borrow();
-        let Some(handle) = menus.get(MODEL_PICKER_MENU_ID).cloned() else {
+        let Some(handle) = menus.get(menu_id).cloned() else {
             return;
         };
         // A keyboard toggle produces no mouse-down for another open menu's
         // dismiss-on-down-out to see, so close the rest here.
         let other_open: Vec<_> = menus
             .iter()
-            .filter(|(id, other)| id.as_ref() != MODEL_PICKER_MENU_ID && other.is_open())
+            .filter(|(id, other)| id.as_ref() != menu_id && other.is_open())
             .map(|(_, other)| other.clone())
             .collect();
         drop(menus);
@@ -1556,19 +1566,29 @@ impl Waku {
     }
 
     pub(super) fn create_projectless_session(&mut self, cx: &mut Context<Self>) {
-        if let Some(draft_id) = self
-            .state
-            .sessions
-            .iter()
-            .find(|session| {
-                !session.has_started()
-                    && self.state.projects.iter().any(|project| {
-                        project.id == session.project_id
-                            && project.is_projectless()
-                            && !crate::projectless::is_legacy_root_path(&project.path)
-                    })
-            })
-            .map(|session| session.id)
+        self.create_projectless_task(None, cx);
+    }
+
+    pub(super) fn create_projectless_task(
+        &mut self,
+        assistant: Option<waku_protocol::settings::AssistantProfile>,
+        cx: &mut Context<Self>,
+    ) {
+        if assistant.is_none()
+            && let Some(draft_id) = self
+                .state
+                .sessions
+                .iter()
+                .find(|session| {
+                    session.provider != ProviderKind::Assistant
+                        && !session.has_started()
+                        && self.state.projects.iter().any(|project| {
+                            project.id == session.project_id
+                                && project.is_projectless()
+                                && !crate::projectless::is_legacy_root_path(&project.path)
+                        })
+                })
+                .map(|session| session.id)
         {
             self.select_session(draft_id, cx);
             return;
@@ -1595,7 +1615,11 @@ impl Waku {
                     project.name = Project::PROJECTLESS_NAME.to_owned();
                     let project_id = project.id;
                     waku.state.projects.push(project);
-                    waku.create_session_for(project_id, waku.state.last_provider, cx);
+                    if let Some(assistant) = assistant {
+                        waku.create_assistant_task(project_id, assistant, cx);
+                    } else {
+                        waku.create_session_for(project_id, waku.state.last_provider, cx);
+                    }
                 }
                 Err(error) => {
                     waku.show_toast(tr!("errors.create_projectless_task", error = error));

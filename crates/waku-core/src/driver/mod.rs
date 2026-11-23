@@ -3,6 +3,7 @@
 mod acp;
 mod activity;
 mod amp;
+pub(crate) mod assistant;
 mod claude;
 mod codex;
 mod computer_use;
@@ -22,8 +23,8 @@ use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
 
 use crate::computer_use::ComputerToolRequest;
 use crate::model::{
-    BackgroundWorkKey, DriverEvent, GoalOperation, ProviderKind, ProviderResumeCursor, RuntimeMode,
-    UserInputAnswer,
+    BackgroundWorkKey, DriverEvent, GoalOperation, MessageAttachment, ProviderKind,
+    ProviderResumeCursor, RuntimeMode, UserInputAnswer,
 };
 
 /// Provider events remain synchronous to send from reader threads, while the
@@ -90,6 +91,10 @@ impl DriverHandle {
 
     /// Whether this transport can inject a user message into the currently
     /// running turn (steering) instead of starting a new one.
+    pub fn prompt_with_attachments(&self, prompt: String, attachments: Vec<MessageAttachment>) {
+        self.inner.prompt_with_attachments(prompt, attachments);
+    }
+
     pub fn supports_steer(&self) -> bool {
         self.inner.supports_steer()
     }
@@ -151,6 +156,9 @@ impl DriverHandle {
 
 pub trait DriverControl: Send + Sync {
     fn prompt(&self, prompt: String);
+    fn prompt_with_attachments(&self, prompt: String, _attachments: Vec<MessageAttachment>) {
+        self.prompt(prompt);
+    }
     fn supports_steer(&self) -> bool {
         false
     }
@@ -215,6 +223,7 @@ pub(crate) fn start_local(
     options.computer_use_enabled =
         crate::computer_use::resolve_enabled(options.computer_use_enabled);
     let inner: Arc<dyn DriverControl> = match provider {
+        ProviderKind::Assistant => anyhow::bail!("Native assistants require a model configuration"),
         ProviderKind::Codex => Arc::new(codex::CodexDriver::start(options, events)?),
         ProviderKind::Pi => Arc::new(pi::PiDriver::start(pi::PiFlavor::Pi, options, events)?),
         ProviderKind::OhMyPi => {

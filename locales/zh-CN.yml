@@ -1065,3 +1065,81 @@ usage_error.curl_did_not_finish: curl 未能完成请求
 usage_error.curl_failed: "curl 失败：%{error}"
 usage_error.unknown_error: 未知错误
 usage_error.curl_no_status: curl 未返回 HTTP 状态行
+
+assistant.settings: 助手
+assistant.keywords: 助手 智能体 ReAct 模型 API 系统提示词
+assistant.name: 名称
+assistant.model: 模型 ID
+assistant.prompt: 系统提示词
+assistant.save: 保存助手
+assistant.new: 新建助手
+assistant.edit: 编辑
+assistant.start: 新建任务
+assistant.fields_required: 请输入助手名称
+assistant.current_project: "已选项目：%{project}"
+assistant.text_only: 此助手支持文本输入，请先移除附件
+assistant.test_ok: 模型连接正常
+assistant.invalid_response: Daemon 返回了意外响应
+assistant.default_model: 默认模型
+assistant.choose_model: 选择模型
+assistant.switch_history: 发送下一条消息时，对话上下文将发送给选中的供应商
+model_services.settings: 模型服务
+model_services.keywords: 模型 服务商 供应商 接口 地址 密钥 同步 OpenAI
+model_services.add: 添加供应商
+model_services.save: 保存供应商
+model_services.manage: 管理模型服务
+model_services.endpoint: API 地址
+model_services.enabled: 在模型选择器中启用
+model_services.sync: 同步模型
+model_services.synced: 模型列表已更新
+model_services.add_model: 添加模型
+model_services.edit_model: 编辑模型
+model_services.save_model: 保存模型
+model_services.remove_model: 移除
+model_services.test: 检测
+model_services.working: 正在处理…
+model_services.no_models: 请从已启用的供应商添加或同步模型
+model_services.model_required: 请输入模型 ID
+model_services.name_required: 请输入供应商名称
+model_services.invalid_url: 请输入 HTTPS 地址或本机 HTTP 地址
+model_services.api_key: API 密钥
+model_services.show_key: 显示 API 密钥
+model_services.hide_key: 隐藏 API 密钥
+model_services.reading_key: 正在读取已保存的密钥…
+model_services.key_read_failed: 无法读取已保存的密钥，可输入新密钥替换
+model_services.edit: 编辑供应商
+model_services.cancel: 取消
+model_services.add_and_use: 添加并使用
+model_services.models: 模型
+model_services.model_name: 模型名称（可选）
+model_services.duplicate_model: 列表中已有此模型 ID
+model_services.sync_empty: 供应商未返回模型，请手动输入模型 ID
+model_services.connection_ok: API 连接正常
+model_services.change_when_idle: 供应商已添加，请在当前回复结束后切换模型
+model_services.search_models: 搜索模型
+model_services.key_rejected: 供应商拒绝请求，请检查 API 密钥及其权限
+service_model.group: 分组名称
+service_model.purpose: 模型用途
+service_model.chat: 对话
+service_model.generate: 图像生成
+service_model.edit_image: 图像编辑
+service_model.kind: 模型类型
+service_model.text: 文本
+service_model.image: 图片
+service_model.embedding: 嵌入
+service_model.rerank: 重排
+service_model.protocol: 对话协议
+service_model.capabilities: 模型能力
+service_model.reasoning: 推理
+service_model.tools: 工具
+service_model.inputs: 输入模态
+service_model.vision: 视觉
+service_model.audio: 音频
+service_model.video: 视频
+service_model.context: 上下文窗口
+service_model.max_input: 最大输入 Token
+service_model.max_output: 最大输出 Token
+service_model.token_hint: 发送前检查输入 Token 估算值。输出上限由对话接口执行
+service_model.invalid_tokens: 请输入正整数，输入和输出的上限须在上下文窗口内
+service_model.edit_needs_image: 在会话中添加图片并描述要做的修改
+service_model.rerank_format: 第一行填写查询内容，之后每行填写一条待排序文本

@@ -219,6 +219,7 @@ fn agent_arguments(
         args.push(OsString::from(value));
     }
     match provider {
+        ProviderKind::Assistant => {}
         ProviderKind::Amp => {
             push(&mut args, "--execute");
             push(&mut args, "--no-color");
@@ -743,6 +744,7 @@ mod tests {
             );
             assert!(has(&args, prompt));
             match provider {
+                ProviderKind::Assistant => unreachable!("Only CLI providers are enumerated"),
                 ProviderKind::Amp => {
                     assert!(has(&args, "--execute"));
                     assert!(has_pair(&args, "--settings-file", "/tmp/amp.json"));

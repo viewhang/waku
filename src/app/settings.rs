@@ -19,7 +19,7 @@ const SETTINGS_SEARCH_CONTEXT: &str = "SettingsSidebar > TextInput";
 
 /// The sidebar's rows in display order, each with the keyword haystack the
 /// search field filters against.
-const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 7] = [
+const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 9] = [
     (
         SettingsPage::General,
         "settings.general",
@@ -37,6 +37,18 @@ const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 7] = [
         "settings.providers",
         "icons/bot.svg",
         "settings.providers_keywords",
+    ),
+    (
+        SettingsPage::ModelServices,
+        "model_services.settings",
+        "icons/server.svg",
+        "model_services.keywords",
+    ),
+    (
+        SettingsPage::Assistants,
+        "assistant.settings",
+        "icons/bot.svg",
+        "assistant.keywords",
     ),
     (
         SettingsPage::Skills,
@@ -66,6 +78,7 @@ const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 7] = [
 
 /// Bind the search field's list-navigation keys. Called once at startup.
 pub fn init(cx: &mut App) {
+    super::model_services::init(cx);
     use gpui::KeyBinding;
     cx.bind_keys([
         KeyBinding::new("down", SelectNextEntry, Some(SETTINGS_SEARCH_CONTEXT)),
@@ -356,6 +369,8 @@ impl Waku {
                     .text_color(theme.text)
                     .child(match page {
                         SettingsPage::General => tr!("settings.general"),
+                        SettingsPage::Assistants => tr!("assistant.settings"),
+                        SettingsPage::ModelServices => tr!("model_services.settings"),
                         SettingsPage::Providers => tr!("settings.providers"),
                         SettingsPage::Skills => tr!("settings.skills"),
                         SettingsPage::Usage => tr!("settings.usage"),
@@ -366,6 +381,8 @@ impl Waku {
             )
             .child(match page {
                 SettingsPage::General => self.render_general_settings(cx),
+                SettingsPage::Assistants => self.render_assistants_settings(cx),
+                SettingsPage::ModelServices => self.render_model_services_settings(cx),
                 SettingsPage::Providers => self.render_providers_settings(cx),
                 SettingsPage::Skills => self.render_skills_settings(cx),
                 SettingsPage::Usage => self.render_usage_settings(cx),

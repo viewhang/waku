@@ -22,6 +22,7 @@ pub struct TextField {
     base: Stateful<Div>,
     input: gpui::Entity<TextInput>,
     icon: Option<(&'static str, f32)>,
+    trailing: Option<AnyElement>,
 }
 
 impl TextField {
@@ -30,12 +31,19 @@ impl TextField {
             base: div().id(id),
             input,
             icon: None,
+            trailing: None,
         }
     }
 
     /// Leading icon, tinted tertiary like the address bar's lock.
     pub fn icon(mut self, path: &'static str, size: f32) -> Self {
         self.icon = Some((path, size));
+        self
+    }
+
+    /// A trailing button shares the field shell without covering the editable text
+    pub fn trailing(mut self, element: impl IntoElement) -> Self {
+        self.trailing = Some(element.into_any_element());
         self
     }
 }
@@ -82,5 +90,6 @@ impl RenderOnce for TextField {
                 element.child(icon(path, size, theme.text_tertiary))
             })
             .child(div().min_w_0().flex_1().child(self.input))
+            .children(self.trailing)
     }
 }

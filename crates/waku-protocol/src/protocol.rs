@@ -8,8 +8,8 @@ use uuid::Uuid;
 use crate::attachments::{AttachmentUpload, StoredAttachment};
 use crate::computer_use::ComputerPermissions;
 use crate::model::{
-    AgentSession, GoalOperation, Project, ProviderKind, ProviderProbe, ProviderResumeCursor,
-    ProviderSessionHistory, ProviderSessionSummary, UserInputAnswer,
+    AgentSession, GoalOperation, MessageAttachment, Project, ProviderKind, ProviderProbe,
+    ProviderResumeCursor, ProviderSessionHistory, ProviderSessionSummary, UserInputAnswer,
 };
 use crate::persistence::{ComposerDraftChange, ComposerDrafts, SessionMessageMatch};
 use crate::provider_session::{ProviderSessionFork, ProviderSessionForkRequest};
@@ -19,7 +19,7 @@ use crate::usage::PlanUsage;
 use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
@@ -88,6 +88,8 @@ pub enum Command {
     },
     Prompt {
         prompt: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<MessageAttachment>,
         /// The ids the submitting client already gave this turn and its user
         /// message. The daemon republishes them with the submission so every
         /// other client attached to the runtime mirrors the same rows instead
@@ -138,6 +140,24 @@ pub enum Command {
         turns_to_remove: usize,
     },
     GetSettings,
+    /// Persist a provider and its optional credential change together
+    SaveModelService {
+        service: crate::settings::ModelService,
+        api_key: Option<String>,
+    },
+    /// Test connectivity with a synthetic request for the configured model
+    TestModelService {
+        base_url: String,
+        api_key: String,
+        model: crate::settings::ServiceModel,
+    },
+    /// Fetch model IDs for an explicit catalog sync
+    ListModelServiceModels {
+        base_url: String,
+        api_key: String,
+        #[serde(default)]
+        protocol: crate::settings::ModelProtocol,
+    },
     UpdateSettings {
         settings: DaemonSettings,
     },
@@ -269,6 +289,8 @@ pub enum Command {
 #[serde(rename_all = "camelCase")]
 pub struct WireDriverStartOptions {
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant: Option<crate::settings::AssistantProfile>,
     pub binary: PathBuf,
     pub cwd: PathBuf,
     pub mode: String,
@@ -390,6 +412,12 @@ pub enum ResponsePayload {
     },
     Settings {
         settings: DaemonSettings,
+    },
+    ModelServiceModels {
+        models: Vec<String>,
+    },
+    ModelServiceSaved {
+        service: crate::settings::ModelService,
     },
     ProviderProbe {
         probe: ProviderProbe,
@@ -530,7 +558,7 @@ mod tests {
 
         assert_eq!(json["type"], "forkSessionFromResponse");
         assert_eq!(json["turnCount"], 7);
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 11);
     }
 
     #[test]
@@ -539,7 +567,7 @@ mod tests {
 
         assert_eq!(json["type"], "rewindSessionToMessage");
         assert_eq!(json["turnCount"], 4);
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 11);
     }
 
     #[test]

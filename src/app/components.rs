@@ -828,6 +828,17 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                 .gap(px(3.0))
                 .group(group_name.clone())
                 .child(body);
+            if let Some(attachments) = render_sent_message_attachments(
+                message_id,
+                &message.attachments,
+                &attachment_menus,
+                &attachment_images,
+                attachments_can_reveal,
+                &waku,
+                theme,
+            ) {
+                column = column.child(attachments);
+            }
             // Turn-backed responses render one footer after every ordered row
             // in the turn. Only legacy/unkeyed assistant messages retain an
             // inline footer because they have no turn boundary to target.
