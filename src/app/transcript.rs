@@ -1166,6 +1166,8 @@ pub(super) fn turn_fold_label(session: &AgentSession, turn_id: Uuid) -> String {
     let duration = format_worked_duration(seconds);
     if turn.status == TurnStatus::Interrupted {
         tr!("transcript.you_stopped_after", duration = duration)
+    } else if session.provider == ProviderKind::Assistant {
+        tr!("transcript.assistant_activity", duration = duration)
     } else {
         tr!("transcript.worked_for", duration = duration)
     }

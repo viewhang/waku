@@ -234,15 +234,18 @@ impl Waku {
         let Some(selection) = selection else {
             return tr!("assistant.choose_model");
         };
-        self.model_service(selection.service_id).map_or_else(
-            || selection.model.clone(),
-            |service| {
-                let name = service
-                    .model(&selection.model)
-                    .map_or(selection.model.as_str(), |model| model.display_name());
-                format!("{} · {name}", service.name)
-            },
-        )
+        if let Some(service) = self
+            .model_service(selection.service_id)
+            .filter(|service| service.enabled)
+            && let Some(model) = service.model(&selection.model)
+        {
+            format!("{} · {}", service.name, model.display_name())
+        } else {
+            tr!(
+                "assistant.model_unavailable",
+                model = selection.model.as_str()
+            )
+        }
     }
 
     /// Reuse the composer's search state, popover keys and highlighted-row navigation

@@ -1875,26 +1875,32 @@ impl Waku {
         // the next tool after the previous result. The group leaves the live
         // tail only when answer text is appended (so `after_message` falls
         // behind) or when the turn itself settles.
-        let live_group = self.selected_session().is_some_and(|session| {
-            session
-                .transcript_blocks
-                .get(block_index)
-                .is_some_and(|block| {
+        let (live_group, assistant_details_open) = self
+            .selected_session()
+            .and_then(|session| {
+                let block = session.transcript_blocks.get(block_index)?;
+                let active_turn = session.active_turn_id();
+                Some((
                     activity_group_is_live(
-                        session
-                            .active_turn_id()
-                            .is_some_and(|turn_id| block.turn_id == Some(turn_id)),
+                        active_turn.is_some_and(|id| block.turn_id == Some(id)),
                         block_index + 1 == session.transcript_blocks.len(),
                         block.after_message,
                         session.messages.len(),
-                    )
-                })
-        });
+                    ),
+                    assistant_activity_details_open(
+                        session.provider,
+                        block.turn_id,
+                        active_turn,
+                        &self.expanded_turns,
+                    ),
+                ))
+            })
+            .unwrap_or_default();
         let expanded = self
             .activities_expanded
             .get(&block_index)
             .copied()
-            .unwrap_or(live_group);
+            .unwrap_or(live_group || assistant_details_open);
         let live_reasoning_id = (self
             .selected_runtime()
             .is_some_and(|runtime| runtime.stream_phase == Some(StreamPhase::Reasoning))
@@ -2061,12 +2067,11 @@ impl Waku {
                 .is_some_and(|reasoning| !reasoning.content.trim().is_empty())
                 || !sections.is_empty()
                 || shows_diff;
-            let item_expanded = has_detail
-                && self
-                    .expanded_activity_items
-                    .get(&id)
-                    .copied()
-                    .unwrap_or(reasoning_live);
+            let item_expanded =
+                has_detail
+                    && self.expanded_activity_items.get(&id).copied().unwrap_or(
+                        reasoning_live || (assistant_details_open && reasoning.is_some()),
+                    );
             let item_focus = self.transcript_control_focus(format!("activity-item-{id}"), cx);
             let mut item = div()
                 .w_full()
@@ -2735,6 +2740,17 @@ fn activity_scroll_follow_state(
     }
 }
 
+/// Keep assistant history open when answer text arrives in the same turn
+fn assistant_activity_details_open(
+    provider: ProviderKind,
+    block_turn: Option<Uuid>,
+    active_turn: Option<Uuid>,
+    expanded_turns: &HashSet<Uuid>,
+) -> bool {
+    provider == ProviderKind::Assistant
+        && block_turn.is_some_and(|id| Some(id) == active_turn || expanded_turns.contains(&id))
+}
+
 /// Pure window arithmetic behind [`Waku::live_reasoning_window_start`]:
 /// given the cached start and the current content, the byte offset the
 /// window should render from. Every returned offset is a character boundary
@@ -3042,6 +3058,37 @@ mod activity_scroll_tests {
 #[cfg(test)]
 mod live_reasoning_window_tests {
     use super::*;
+
+    #[test]
+    fn assistant_activity_stays_expanded_through_answer_streaming() {
+        let turn = Uuid::new_v4();
+        let closed = HashSet::new();
+        let open = HashSet::from([turn]);
+        assert!(assistant_activity_details_open(
+            ProviderKind::Assistant,
+            Some(turn),
+            Some(turn),
+            &closed
+        ));
+        assert!(!assistant_activity_details_open(
+            ProviderKind::Assistant,
+            Some(turn),
+            None,
+            &closed
+        ));
+        assert!(assistant_activity_details_open(
+            ProviderKind::Assistant,
+            Some(turn),
+            None,
+            &open
+        ));
+        assert!(!assistant_activity_details_open(
+            ProviderKind::Codex,
+            Some(turn),
+            Some(turn),
+            &open
+        ));
+    }
 
     #[test]
     fn slide_lands_on_a_character_boundary_in_multibyte_content() {

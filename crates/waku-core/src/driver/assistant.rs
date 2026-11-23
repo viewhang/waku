@@ -1,6 +1,7 @@
 //! Direct model sessions stream replies through Rig
 
 mod request;
+mod transport;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,9 +33,9 @@ pub(crate) fn service_url(base_url: &str) -> anyhow::Result<Url> {
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || !(url.scheme() == "https" || (url.scheme() == "http" && is_loopback(&url)))
+        || !matches!(url.scheme(), "http" | "https")
     {
-        bail!("Use an HTTPS model service URL or a local HTTP address, without credentials");
+        bail!("Use an HTTP or HTTPS model service URL without credentials, a query, or a fragment");
     }
     let path = url.path().trim_end_matches('/').to_owned();
     url.set_path(&path);
@@ -45,51 +46,80 @@ fn is_loopback(url: &Url) -> bool {
     matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
 }
 
-/// Roll back the credential if persisting the corresponding settings fails
-pub(crate) fn commit_api_key(
-    service: &ModelService,
-    key: Option<&str>,
-    commit: impl FnOnce() -> std::io::Result<()>,
-) -> anyhow::Result<()> {
-    let url = service_url(&service.base_url)?;
-    let Some(key) = key else {
-        return Ok(commit()?);
-    };
-    if !key.is_empty() && !key.bytes().all(|byte| byte.is_ascii_graphic()) {
-        bail!("The API key must be a single token");
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let account = service.keychain_account(url.as_str());
-        let previous = read_keychain(&account)?;
-        let write = |key: Option<&[u8]>| -> anyhow::Result<()> {
-            use security_framework::passwords::{delete_generic_password, set_generic_password};
-            match key {
-                Some(key) => set_generic_password(MODEL_SERVICE_KEYCHAIN, &account, key)
-                    .context("Could not save the API key in macOS Keychain"),
-                None => match delete_generic_password(MODEL_SERVICE_KEYCHAIN, &account) {
-                    Ok(()) => Ok(()),
-                    Err(error) if error.code() == -25300 => Ok(()),
-                    Err(error) => {
-                        Err(error).context("Could not remove the API key from macOS Keychain")
-                    }
-                },
-            }
-        };
-        write((!key.is_empty()).then_some(key.as_bytes()))?;
-        if let Err(error) = commit() {
-            write(previous.as_deref()).context("Could not restore the previous API key")?;
-            return Err(error.into());
+/// Share a successful Keychain lookup across the daemon's assistant sessions
+#[derive(Default)]
+pub(crate) struct ModelServiceKeys {
+    #[cfg(any(target_os = "macos", test))]
+    entries: parking_lot::Mutex<std::collections::HashMap<String, Option<String>>>,
+}
+
+impl ModelServiceKeys {
+    #[cfg(any(target_os = "macos", test))]
+    fn read(
+        &self,
+        account: String,
+        lookup: impl FnOnce(&str) -> anyhow::Result<Option<String>>,
+    ) -> anyhow::Result<Option<String>> {
+        let mut entries = self.entries.lock();
+        if let Some(key) = entries.get(&account) {
+            return Ok(key.clone());
         }
-        Ok(())
+        let key = lookup(&account)?;
+        entries.insert(account, key.clone());
+        Ok(key)
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = url;
-        if key.is_empty() {
+
+    /// Roll back the credential if persisting the corresponding settings fails
+    pub(crate) fn commit(
+        &self,
+        service: &ModelService,
+        key: Option<&str>,
+        commit: impl FnOnce() -> std::io::Result<()>,
+    ) -> anyhow::Result<()> {
+        let url = service_url(&service.base_url)?;
+        let Some(key) = key else {
             return Ok(commit()?);
+        };
+        if !key.is_empty() && !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+            bail!("The API key must be a single token");
         }
-        bail!("Keychain storage currently requires a macOS daemon");
+        #[cfg(target_os = "macos")]
+        {
+            let mut entries = self.entries.lock();
+            let account = service.keychain_account(url.as_str());
+            let previous = read_keychain(&account)?;
+            let write = |key: Option<&[u8]>| -> anyhow::Result<()> {
+                use security_framework::passwords::{
+                    delete_generic_password, set_generic_password,
+                };
+                match key {
+                    Some(key) => set_generic_password(MODEL_SERVICE_KEYCHAIN, &account, key)
+                        .context("Could not save the API key in macOS Keychain"),
+                    None => match delete_generic_password(MODEL_SERVICE_KEYCHAIN, &account) {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.code() == -25300 => Ok(()),
+                        Err(error) => {
+                            Err(error).context("Could not remove the API key from macOS Keychain")
+                        }
+                    },
+                }
+            };
+            write((!key.is_empty()).then_some(key.as_bytes()))?;
+            if let Err(error) = commit() {
+                write(previous.as_deref()).context("Could not restore the previous API key")?;
+                return Err(error.into());
+            }
+            entries.insert(account, (!key.is_empty()).then(|| key.to_owned()));
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = url;
+            if key.is_empty() {
+                return Ok(commit()?);
+            }
+            bail!("Keychain storage currently requires a macOS daemon");
+        }
     }
 }
 
@@ -102,21 +132,30 @@ fn read_keychain(account: &str) -> anyhow::Result<Option<Vec<u8>>> {
     }
 }
 
-fn api_key(url: &Url, service: Option<&ModelService>) -> anyhow::Result<String> {
+fn api_key(
+    url: &Url,
+    service: Option<&ModelService>,
+    keys: &ModelServiceKeys,
+) -> anyhow::Result<String> {
     #[cfg(target_os = "macos")]
     {
         let account = service.map(|service| service.keychain_account(url.as_str()));
         let legacy = service
             .is_none_or(|service| service.legacy_key)
-            .then_some(url.as_str());
-        for account in [account.as_deref(), legacy].into_iter().flatten() {
-            if let Some(bytes) = read_keychain(account)? {
-                return String::from_utf8(bytes).context("Invalid Keychain API key");
+            .then(|| url.as_str().to_owned());
+        for account in [account, legacy].into_iter().flatten() {
+            if let Some(key) = keys.read(account, |account| {
+                read_keychain(account)?
+                    .map(String::from_utf8)
+                    .transpose()
+                    .context("Invalid Keychain API key")
+            })? {
+                return Ok(key);
             }
         }
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = service;
+    let _ = (service, keys);
 
     default_api_key(url)
 }
@@ -132,16 +171,26 @@ fn draft_api_key(url: &Url, key: &str) -> anyhow::Result<String> {
 }
 
 fn default_api_key(url: &Url) -> anyhow::Result<String> {
-    if is_loopback(url) {
-        return Ok("local".into());
+    if url.scheme() == "http" || is_loopback(url) {
+        return Ok(String::new());
     }
-    if url.host_str() == Some("api.openai.com")
+    // Only send the environment's OpenAI key over HTTPS to its official host
+    if url.scheme() == "https"
+        && url.host_str() == Some("api.openai.com")
         && let Ok(key) = std::env::var("OPENAI_API_KEY")
         && !key.trim().is_empty()
     {
         return Ok(key);
     }
     bail!("Set an API key for this model service in Settings → Model Services");
+}
+
+fn bearer_auth(request: reqwest::RequestBuilder, key: &str) -> reqwest::RequestBuilder {
+    if key.is_empty() {
+        request
+    } else {
+        request.bearer_auth(key)
+    }
 }
 
 pub(crate) fn test_model(base_url: &str, key: &str, model: &ServiceModel) -> anyhow::Result<()> {
@@ -166,7 +215,7 @@ pub(crate) fn test_model(base_url: &str, key: &str, model: &ServiceModel) -> any
                     url: &url, key: &key, model: &model.id, options: &model.options,
                     preamble: "", history: &[],
                 }.send(&http, RigMessage::user("Reply with OK"), &events).await?;
-                if response.response().trim().is_empty() { bail!("The model returned no text"); }
+                if response.trim().is_empty() { bail!("The model returned no text"); }
             } else {
                 let (prompt, media) = match model.options.purpose {
                     ModelPurpose::ImageGeneration => ("A red square on a white background", Vec::new()),
@@ -227,25 +276,29 @@ pub(crate) fn list_models(
         tokio::time::timeout(Duration::from_secs(15), async {
             let client = http_client()?;
             let base = url.as_str().trim_end_matches('/');
-            let (request, cursor_param) = match protocol {
+            let (mut request, cursor_param) = match protocol {
                 ModelProtocol::AnthropicMessages => (
                     client
                         .get(format!("{}/v1/models", base.trim_end_matches("/v1")))
-                        .header("x-api-key", &key)
                         .header("anthropic-version", "2023-06-01"),
                     "after_id",
                 ),
                 ModelProtocol::Gemini => (
-                    client
-                        .get(format!(
-                            "{}/v1beta/models",
-                            base.trim_end_matches("/v1beta").trim_end_matches("/v1")
-                        ))
-                        .header("x-goog-api-key", &key),
+                    client.get(format!(
+                        "{}/v1beta/models",
+                        base.trim_end_matches("/v1beta").trim_end_matches("/v1")
+                    )),
                     "pageToken",
                 ),
-                _ => (client.get(format!("{base}/models")).bearer_auth(&key), ""),
+                _ => (client.get(format!("{base}/models")), ""),
             };
+            if !key.is_empty() {
+                request = match protocol {
+                    ModelProtocol::AnthropicMessages => request.header("x-api-key", &key),
+                    ModelProtocol::Gemini => request.header("x-goog-api-key", &key),
+                    _ => request.bearer_auth(&key),
+                };
+            }
             let mut models = Vec::new();
             let mut page = None::<String>;
             loop {
@@ -308,12 +361,13 @@ pub(crate) fn list_models(
 }
 
 fn redacted_error(error: anyhow::Error, key: &str) -> String {
-    error
-        .to_string()
-        .replace(key, "[redacted]")
-        .chars()
-        .take(500)
-        .collect()
+    let message = error.to_string();
+    let message = if key.is_empty() {
+        message
+    } else {
+        message.replace(key, "[redacted]")
+    };
+    message.chars().take(500).collect()
 }
 
 enum Control {
@@ -428,17 +482,23 @@ fn run(
             let _ = events.send(DriverEvent::TurnStarted);
             let request = async {
                 let (url, service) = connection_settings(&profile, &settings)?;
-                let key = api_key(&url, service.as_ref())?;
-                let (model, options) = service
-                    .as_ref()
-                    .and_then(|service| service.model(&profile.model))
-                    .map_or((profile.model.as_str(), &legacy_options), |model| {
-                        (model.id.as_str(), &model.options)
-                    });
+                let (model, options) = if let Some(service) = &service {
+                    let model = service.model(&profile.model).with_context(|| {
+                        tr!(
+                            "assistant.model_unavailable",
+                            model = profile.model.as_str()
+                        )
+                    })?;
+                    (model.id.as_str(), &model.options)
+                } else {
+                    (profile.model.as_str(), &legacy_options)
+                };
+                let key = api_key(&url, service.as_ref(), &settings.model_service_keys)?;
                 let result = async {
                     let media = request::read_media(&attachments, input, options)?;
                     if options.dialogue() {
-                        let response = request::Chat {
+                        let prompt = request::message(prompt, media)?;
+                        let answer = request::Chat {
                             url: &url,
                             key: &key,
                             model,
@@ -446,12 +506,13 @@ fn run(
                             preamble: &profile.system_prompt,
                             history: &history,
                         }
-                        .send(&http, request::message(prompt, media)?, events)
+                        .send(&http, prompt.clone(), events)
                         .await?;
-                        Ok::<_, anyhow::Error>((
-                            response.response().to_owned(),
-                            response.history().unwrap_or_default().to_vec(),
-                        ))
+                        let mut messages = vec![prompt];
+                        if !answer.is_empty() {
+                            messages.push(RigMessage::assistant(&answer));
+                        }
+                        Ok::<_, anyhow::Error>((answer, messages))
                     } else {
                         let summary = request::Operation {
                             url: &url,
@@ -510,6 +571,39 @@ mod tests {
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
     use std::net::TcpListener;
     use std::path::Path;
+
+    #[test]
+    fn model_service_accepts_http_on_the_network() {
+        let domain = service_url("http://models.test:8080/v1/").unwrap();
+        assert_eq!(domain.as_str(), "http://models.test:8080/v1");
+        assert_eq!(draft_api_key(&domain, "").unwrap(), "");
+        let endpoint = service_url("http://192.168.1.50:8080/v1/").unwrap();
+        assert_eq!(endpoint.as_str(), "http://192.168.1.50:8080/v1");
+        assert!(!is_loopback(&endpoint));
+        assert!(service_url("http://user:pass@192.168.1.50:8080/v1").is_err());
+        assert!(service_url("ftp://192.168.1.50/v1").is_err());
+    }
+
+    #[test]
+    fn model_service_key_is_read_once_per_account() {
+        let keys = ModelServiceKeys::default();
+        for (account, key) in [("a", "first-key"), ("b", "second-key")] {
+            assert_eq!(
+                keys.read(account.into(), |_| Ok(Some(key.into())))
+                    .unwrap()
+                    .as_deref(),
+                Some(key)
+            );
+            assert_eq!(
+                keys.read(account.into(), |_| panic!(
+                    "A cached account must never be looked up again"
+                ))
+                .unwrap()
+                .as_deref(),
+                Some(key)
+            );
+        }
+    }
 
     /// Verify discovery, conversations without built-in tools and history at a different endpoint
     #[test]

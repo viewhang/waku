@@ -3,12 +3,13 @@
 use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use reqwest::multipart::{Form, Part};
-use rig::agent::{AgentBuilder, FinalResponse, MultiTurnStreamItem, NoToolConfig};
 use rig::client::CompletionClient as _;
 use rig::completion::CompletionModel;
-use rig::message::{self, DocumentSourceKind, Message, MimeType as _, UserContent};
+use rig::message::{
+    self, DocumentSourceKind, Message, MimeType as _, ReasoningContent, UserContent,
+};
 use rig::providers::{anthropic, gemini, openai};
-use rig::streaming::{StreamedAssistantContent, StreamingPrompt as _};
+use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 use serde_json::{Value, json};
 use smol::stream::StreamExt as _;
 use url::Url;
@@ -16,9 +17,10 @@ use waku_protocol::settings::{
     ModelKind, ModelModality, ModelProtocol, ModelPurpose, ServiceModelOptions,
 };
 
+use super::{bearer_auth, transport::AssistantHttp};
 use crate::attachments::{AttachmentStore, AttachmentUpload, MAX_ATTACHMENT_BYTES};
 use crate::driver::DriverEventSender;
-use crate::model::{DriverEvent, MessageAttachment};
+use crate::model::{ActivityItem, ActivityKind, DriverEvent, MessageAttachment};
 
 pub(super) struct Media {
     pub(super) mime: &'static str,
@@ -172,33 +174,41 @@ impl Chat<'_> {
         http: &reqwest::Client,
         prompt: Message,
         events: &DriverEventSender,
-    ) -> Result<FinalResponse> {
+    ) -> Result<String> {
         let base = self.url.as_str().trim_end_matches('/');
         let model = self.model;
+        let http = AssistantHttp::new(
+            http.clone(),
+            self.key.is_empty(),
+            self.options.protocol == ModelProtocol::OpenAiChat,
+        );
         match self.options.protocol {
             ModelProtocol::OpenAiChat => {
                 let client = openai::CompletionsClient::builder()
                     .api_key(self.key)
                     .base_url(base)
-                    .http_client(http.clone())
+                    .http_client(http)
                     .build()?;
-                self.stream(client.agent(model), prompt, events).await
+                self.stream(client.completion_model(model), prompt, events)
+                    .await
             }
             ModelProtocol::OpenAiResponses => {
                 let client = openai::Client::builder()
                     .api_key(self.key)
                     .base_url(base)
-                    .http_client(http.clone())
+                    .http_client(http)
                     .build()?;
-                self.stream(client.agent(model), prompt, events).await
+                self.stream(client.completion_model(model), prompt, events)
+                    .await
             }
             ModelProtocol::AnthropicMessages => {
                 let client = anthropic::Client::builder()
                     .api_key(self.key)
                     .base_url(base.trim_end_matches("/v1"))
-                    .http_client(http.clone())
+                    .http_client(http)
                     .build()?;
-                self.stream(client.agent(model), prompt, events).await
+                self.stream(client.completion_model(model), prompt, events)
+                    .await
             }
             ModelProtocol::Gemini => {
                 let model = self.model.strip_prefix("models/").unwrap_or(self.model);
@@ -211,19 +221,20 @@ impl Chat<'_> {
                 let client = gemini::Client::builder()
                     .api_key(self.key)
                     .base_url(base.trim_end_matches("/v1beta").trim_end_matches("/v1"))
-                    .http_client(http.clone())
+                    .http_client(http)
                     .build()?;
-                self.stream(client.agent(model), prompt, events).await
+                self.stream(client.completion_model(model), prompt, events)
+                    .await
             }
         }
     }
 
-    async fn stream<M: CompletionModel + 'static>(
+    async fn stream(
         self,
-        mut builder: AgentBuilder<M, (), NoToolConfig>,
+        model: impl CompletionModel,
         prompt: Message,
         events: &DriverEventSender,
-    ) -> Result<FinalResponse> {
+    ) -> Result<String> {
         let window = self.options.context_window.map(|value| value as usize);
         let limit = [self.options.max_input_tokens, self.options.context_window]
             .into_iter()
@@ -250,33 +261,90 @@ impl Chat<'_> {
         let completion_limit = self.options.protocol == ModelProtocol::OpenAiChat
             && (self.options.reasoning || self.url.host_str() == Some("api.openai.com"));
         let params = protocol_parameters(self.options, self.model, output, completion_limit)?;
-        if let Some(output) = output.filter(|_| !completion_limit) {
-            builder = builder.max_tokens(output as u64);
-        }
-        let agent = builder
-            .preamble(self.preamble)
+        let mut request = model
+            .completion_request(prompt)
+            .messages(self.history.iter().cloned())
             .additional_params(params)
-            .build();
-        let mut stream = agent
-            .stream_prompt(prompt)
-            .with_history(self.history.iter().cloned())
-            .await;
+            .max_tokens_opt(
+                output
+                    .filter(|_| !completion_limit)
+                    .map(|value| value as u64),
+            );
+        if !self.preamble.is_empty() {
+            request = request.preamble(self.preamble.to_owned());
+        }
+        // Consume provider events directly since this session has no local tool executor
+        let mut stream = model.stream(request.build()).await?;
+        let mut answer = String::new();
+        let mut streamed_reasoning = String::new();
         while let Some(item) = stream.next().await {
             match item? {
-                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) => {
+                StreamedAssistantContent::Text(text) => {
+                    answer.push_str(&text.text);
+                    streamed_reasoning.clear();
                     let _ = events.send(DriverEvent::TextDelta(text.text));
                 }
-                MultiTurnStreamItem::StreamAssistantItem(
-                    StreamedAssistantContent::ReasoningDelta { reasoning, .. },
-                ) if self.options.reasoning => {
+                StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                    streamed_reasoning.push_str(&reasoning);
                     let _ = events.send(DriverEvent::ReasoningDelta(reasoning));
                 }
-                MultiTurnStreamItem::FinalResponse(response) => return Ok(response),
+                StreamedAssistantContent::Reasoning(block) => {
+                    // Only forward displayable text and skip bytes already sent as deltas
+                    let text = block
+                        .content
+                        .into_iter()
+                        .filter_map(|part| match part {
+                            ReasoningContent::Text { text, .. }
+                            | ReasoningContent::Summary(text) => Some(text),
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    if streamed_reasoning.starts_with(text.as_str()) {
+                        streamed_reasoning.drain(..text.len());
+                    } else {
+                        let unseen = text
+                            .strip_prefix(streamed_reasoning.as_str())
+                            .unwrap_or(&text);
+                        let _ = events.send(DriverEvent::ReasoningDelta(unseen.to_owned()));
+                        streamed_reasoning.clear();
+                    }
+                }
+                StreamedAssistantContent::ToolCallDelta {
+                    internal_call_id,
+                    content: ToolCallDeltaContent::Name(name),
+                    ..
+                } if !name.is_empty() => report_tool_request(events, internal_call_id, &name, None),
+                StreamedAssistantContent::ToolCall {
+                    tool_call,
+                    internal_call_id,
+                } => {
+                    report_tool_request(
+                        events,
+                        internal_call_id,
+                        &tool_call.function.name,
+                        Some(tool_call.function.arguments.to_string()),
+                    );
+                }
+                StreamedAssistantContent::Final(_) => return Ok(answer),
                 _ => {}
             }
         }
         bail!("The model stream ended before completing its response")
     }
+}
+
+fn report_tool_request(
+    events: &DriverEventSender,
+    id: String,
+    name: &str,
+    arguments: Option<String>,
+) {
+    let item = ActivityItem::new(Some(id), ActivityKind::Tool, name, None, true)
+        .with_tool_name(Some(name))
+        .with_arguments(arguments)
+        .with_failed(true)
+        .with_output(Some(tr!("assistant.tool_unavailable")));
+    let _ = events.send(DriverEvent::RichActivity(item));
 }
 
 fn protocol_parameters(
@@ -306,13 +374,16 @@ fn protocol_parameters(
                 "opus-4-7",
                 "sonnet-4-6",
                 "opus-4-8",
+                "opus-5",
+                "sonnet-5",
+                "haiku-5",
                 "fable",
                 "mythos",
             ]
             .iter()
             .any(|family| model.contains(family))
             {
-                json!({"thinking": {"type":"adaptive"}})
+                json!({"thinking": {"type":"adaptive","display":"summarized"}})
             } else {
                 let output = output.unwrap_or(2048);
                 if output <= 1024 {
@@ -383,9 +454,7 @@ impl Operation<'_> {
                             .mime_str(media.mime)?,
                     );
                 }
-                let response = http
-                    .post(format!("{base}/images/edits"))
-                    .bearer_auth(self.key)
+                let response = bearer_auth(http.post(format!("{base}/images/edits")), self.key)
                     .multipart(form)
                     .send()
                     .await?;
@@ -419,9 +488,7 @@ impl Operation<'_> {
                 _ => bail!("Invalid model operation"),
             },
         };
-        let response = http
-            .post(format!("{base}{endpoint}"))
-            .bearer_auth(self.key)
+        let response = bearer_auth(http.post(format!("{base}{endpoint}")), self.key)
             .json(&payload)
             .send()
             .await?;
@@ -539,6 +606,16 @@ mod tests {
     }
 
     fn reply(mime: &'static str, body: String) -> (Url, std::thread::JoinHandle<Received>) {
+        reply_with(mime, body.len(), move |socket| {
+            socket.write_all(body.as_bytes()).unwrap()
+        })
+    }
+
+    fn reply_with(
+        mime: &'static str,
+        response_length: usize,
+        send_body: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
+    ) -> (Url, std::thread::JoinHandle<Received>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = Url::parse(&format!("http://{}/v1", listener.local_addr().unwrap())).unwrap();
         let handle = std::thread::spawn(move || {
@@ -564,7 +641,8 @@ mod tests {
             }
             let mut input = vec![0; length];
             reader.read_exact(&mut input).unwrap();
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nConnection: close\r\nContent-Length: {response_length}\r\n\r\n").unwrap();
+            send_body(&mut socket);
             Received {
                 path: request.split_whitespace().nth(1).unwrap().to_owned(),
                 headers,
@@ -624,8 +702,11 @@ mod tests {
             }
             ModelProtocol::OpenAiResponses => sse(vec![
                 json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_test","output_index":0,"delta":"Plan","summary_index":0,"sequence_number":1}),
-                json!({"type":"response.output_text.delta","item_id":"msg_test","output_index":1,"delta":"OK","content_index":0,"sequence_number":2}),
-                json!({"type":"response.completed","sequence_number":3,"response":{
+                json!({"type":"response.output_item.done","output_index":0,"sequence_number":2,"item":{
+                    "type":"reasoning","id":"rs_test","summary":[{"type":"summary_text","text":"Plan"}],"encrypted_content":"opaque"
+                }}),
+                json!({"type":"response.output_text.delta","item_id":"msg_test","output_index":1,"delta":"OK","content_index":0,"sequence_number":3}),
+                json!({"type":"response.completed","sequence_number":4,"response":{
                     "id":"resp_test","object":"response","created_at":0,"status":"completed","model":"demo","output":[]
                 }}),
             ]),
@@ -658,6 +739,11 @@ mod tests {
         ] {
             let (events, received_events) = crate::driver::test_event_channel();
             let (url, server) = reply("text/event-stream", receive_chat(protocol));
+            let model = if protocol == ModelProtocol::AnthropicMessages {
+                "claude-opus-4-8"
+            } else {
+                "demo"
+            };
             let options = ServiceModelOptions {
                 protocol,
                 reasoning: true,
@@ -694,7 +780,7 @@ mod tests {
             let response = Chat {
                 url: &url,
                 key: "example-key",
-                model: "demo",
+                model,
                 options: &options,
                 preamble: "system instruction",
                 history: &[],
@@ -706,13 +792,14 @@ mod tests {
             )
             .await
             .unwrap_or_else(|error| panic!("{protocol:?}: {error:#}"));
-            assert_eq!(response.response(), "OK", "{protocol:?}");
-            assert!(
-                std::iter::from_fn(|| received_events.try_recv().ok()).any(|event| {
-                    matches!(event, DriverEvent::ReasoningDelta(text) if text == "Plan")
-                }),
-                "{protocol:?}"
-            );
+            assert_eq!(response, "OK", "{protocol:?}");
+            let reasoning = std::iter::from_fn(|| received_events.try_recv().ok())
+                .filter_map(|event| match event {
+                    DriverEvent::ReasoningDelta(text) => Some(text),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(reasoning, "Plan", "{protocol:?}");
             let received = server.join().unwrap();
             let body: Value = serde_json::from_slice(&received.body).unwrap();
             let payload = body.to_string();
@@ -739,7 +826,8 @@ mod tests {
                 ModelProtocol::AnthropicMessages => {
                     assert_eq!(received.path, "/v1/messages");
                     assert_eq!(body["max_tokens"], 2048);
-                    assert_eq!(body["thinking"]["type"], "enabled");
+                    assert_eq!(body["thinking"]["type"], "adaptive");
+                    assert_eq!(body["thinking"]["display"], "summarized");
                     assert!(
                         received
                             .headers
@@ -763,6 +851,149 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn shows_complete_reasoning_and_unavailable_tool_requests_in_order() {
+        let function = json!({"type":"function_call","id":"fc_test","call_id":"call_test",
+            "name":"get_status","status":"in_progress","arguments":""});
+        let mut completed = function.clone();
+        completed["status"] = json!("completed");
+        completed["arguments"] = json!(r#"{"job":"example"}"#);
+        let before_answer = sse(vec![
+            json!({"type":"response.output_item.done","output_index":0,"sequence_number":1,"item":{
+                "type":"reasoning","id":"rs_test","summary":[{"type":"summary_text","text":"Check status"}],"encrypted_content":"opaque"
+            }}),
+            json!({"type":"response.output_item.added","output_index":1,"sequence_number":2,"item":function}),
+        ]);
+        let answer = sse(vec![
+            json!({"type":"response.output_item.done","output_index":1,"sequence_number":3,"item":completed}),
+            json!({"type":"response.output_text.delta","item_id":"msg_test","output_index":2,"delta":"OK","content_index":0,"sequence_number":4}),
+            json!({"type":"response.completed","sequence_number":5,"response":{
+                "id":"resp_test","object":"response","created_at":0,"status":"completed","model":"demo","output":[]
+            }}),
+        ]);
+        let timeout = std::time::Duration::from_secs(5);
+        let (release, wait) = std::sync::mpsc::channel();
+        let (url, server) = reply_with(
+            "text/event-stream",
+            before_answer.len() + answer.len(),
+            move |socket| {
+                socket.write_all(before_answer.as_bytes()).unwrap();
+                // The server withholds the answer until the earlier events are delivered
+                wait.recv_timeout(timeout).unwrap();
+                socket.write_all(answer.as_bytes()).unwrap();
+            },
+        );
+        let http = super::super::http_client().unwrap();
+        let (events, received) = crate::driver::test_event_channel();
+        let observed = std::thread::spawn(move || {
+            assert!(
+                matches!(received.recv_timeout(timeout).unwrap(), DriverEvent::ReasoningDelta(text) if text == "Check status")
+            );
+            let DriverEvent::RichActivity(requested) = received.recv_timeout(timeout).unwrap()
+            else {
+                panic!("Expected a tool request before the answer");
+            };
+            assert_eq!(requested.tool_name.as_deref(), Some("get_status"));
+            assert!(requested.failed && requested.complete);
+            assert!(received.try_recv().is_err());
+            release.send(()).unwrap();
+            (requested, received)
+        });
+        let options = ServiceModelOptions {
+            protocol: ModelProtocol::OpenAiResponses,
+            ..Default::default()
+        };
+        let response = Chat {
+            url: &url,
+            key: "test-key",
+            model: "demo",
+            options: &options,
+            preamble: "",
+            history: &[],
+        }
+        .send(&http, Message::user("Check the job"), &events)
+        .await
+        .unwrap();
+        assert_eq!(response, "OK");
+        let (requested, received) = observed.join().unwrap();
+        assert!(
+            matches!(received.try_recv().unwrap(), DriverEvent::TextDelta(text) if text == "OK")
+        );
+        let DriverEvent::RichActivity(with_arguments) = received.try_recv().unwrap() else {
+            panic!("Expected complete tool arguments");
+        };
+        assert_eq!(with_arguments.source_id, requested.source_id);
+        assert_eq!(
+            with_arguments.arguments.as_deref(),
+            Some(r#"{"job":"example"}"#)
+        );
+        assert_eq!(
+            with_arguments.output,
+            Some(tr!("assistant.tool_unavailable"))
+        );
+        assert!(received.try_recv().is_err());
+        let wire: Value = serde_json::from_slice(&server.join().unwrap().body).unwrap();
+        assert_ne!(wire["reasoning"]["summary"], "auto");
+    }
+
+    #[tokio::test]
+    async fn streams_reasoning_from_an_http_hostname_without_credentials() {
+        let first = sse(vec![
+            json!({"choices":[{"delta":{"reasoning":"Plan"},"finish_reason":null}]}),
+        ]);
+        let rest = sse(vec![
+            json!({"choices":[{"delta":{"content":"OK"},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ]) + "data: [DONE]\n\n";
+        let (release, wait) = std::sync::mpsc::channel();
+        let timeout = std::time::Duration::from_secs(5);
+        let (local_url, server) = reply_with(
+            "text/event-stream",
+            first.len() + rest.len(),
+            move |socket| {
+                socket.write_all(first.as_bytes()).unwrap();
+                wait.recv_timeout(timeout).unwrap();
+                socket.write_all(rest.as_bytes()).unwrap();
+            },
+        );
+        let address = local_url.socket_addrs(|| None).unwrap()[0];
+        let mut url = local_url;
+        url.set_host(Some("models.test")).unwrap();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("models.test", address)
+            .build()
+            .unwrap();
+        let (events, received) = crate::driver::test_event_channel();
+        let observed = std::thread::spawn(move || {
+            assert!(
+                matches!(received.recv_timeout(timeout).unwrap(), DriverEvent::ReasoningDelta(text) if text == "Plan")
+            );
+            release.send(()).unwrap();
+        });
+        let options = ServiceModelOptions {
+            reasoning: true,
+            ..Default::default()
+        };
+        let answer = Chat {
+            url: &url,
+            key: "",
+            model: "Qwen3.8-27B",
+            options: &options,
+            preamble: "",
+            history: &[],
+        }
+        .send(&http, Message::user("Test reasoning"), &events)
+        .await
+        .unwrap();
+        observed.join().unwrap();
+        assert_eq!(answer, "OK");
+        let received = server.join().unwrap();
+        let headers = received.headers.to_ascii_lowercase();
+        assert!(headers.contains(&format!("host: models.test:{}", address.port())));
+        assert!(!headers.contains("authorization:"));
     }
 
     #[tokio::test]

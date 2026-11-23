@@ -12,6 +12,7 @@ use waku_protocol::settings::{ModelService, ServiceModel};
 pub struct DaemonSettingsStore {
     path: PathBuf,
     settings: Mutex<DaemonSettings>,
+    pub(crate) model_service_keys: crate::driver::assistant::ModelServiceKeys,
 }
 
 impl DaemonSettingsStore {
@@ -67,6 +68,7 @@ impl DaemonSettingsStore {
         Ok(Self {
             path,
             settings: Mutex::new(settings),
+            model_service_keys: Default::default(),
         })
     }
 
@@ -151,9 +153,8 @@ impl DaemonSettingsStore {
         } else {
             next.model_services.push(service.clone());
         }
-        crate::driver::assistant::commit_api_key(&service, key, || {
-            write_atomic(&self.path, &next)
-        })?;
+        self.model_service_keys
+            .commit(&service, key, || write_atomic(&self.path, &next))?;
         *current = next;
         Ok(service)
     }

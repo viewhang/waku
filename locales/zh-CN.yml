@@ -912,6 +912,7 @@ attachments.preview_unavailable: 无法显示图片
 common.copy_named: 复制%{name}
 transcript.worked: 已完成
 transcript.worked_for: 用时 %{duration}
+transcript.assistant_activity: 过程记录 · %{duration}
 transcript.you_stopped_after: 你在工作 %{duration} 后停止了
 transcript.working_for: 工作中 · %{duration}
 transcript.thinking: 正在思考
@@ -1079,6 +1080,8 @@ assistant.fields_required: 请输入助手名称
 assistant.current_project: "已选项目：%{project}"
 assistant.text_only: 此助手支持文本输入，请先移除附件
 assistant.test_ok: 模型连接正常
+assistant.tool_unavailable: 此助手会话未配置该工具，未执行
+assistant.model_unavailable: "%{model} 已不可用，请重新选择模型"
 assistant.invalid_response: Daemon 返回了意外响应
 assistant.default_model: 默认模型
 assistant.choose_model: 选择模型
@@ -1101,8 +1104,9 @@ model_services.working: 正在处理…
 model_services.no_models: 请从已启用的供应商添加或同步模型
 model_services.model_required: 请输入模型 ID
 model_services.name_required: 请输入供应商名称
-model_services.invalid_url: 请输入 HTTPS 地址或本机 HTTP 地址
+model_services.invalid_url: 请输入有效的 HTTP 或 HTTPS 地址
 model_services.api_key: API 密钥
+model_services.api_key_optional: API 密钥（按需填写）
 model_services.show_key: 显示 API 密钥
 model_services.hide_key: 隐藏 API 密钥
 model_services.reading_key: 正在读取已保存的密钥…

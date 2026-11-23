@@ -281,6 +281,18 @@ impl Waku {
         let key_field = form.key.clone();
         let can_request = form.work.is_none();
         let can_save = can_request && (form.session.is_none() || form.selected.is_some());
+        let api_key_label = if form
+            .url
+            .read(cx)
+            .content()
+            .trim_start()
+            .get(..7)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
+        {
+            tr!("model_services.api_key_optional")
+        } else {
+            tr!("model_services.api_key")
+        };
         let mut key_row = div().flex().items_center().gap(px(6.0));
         if form.work == Some(Work::LoadKey) {
             key_row = key_row.child(tr!("model_services.reading_key"));
@@ -358,11 +370,7 @@ impl Waku {
                 theme,
             ))
             .children(form.notice(NoticeAt::Address, theme))
-            .child(assistant_field(
-                tr!("model_services.api_key"),
-                key_row,
-                theme,
-            ))
+            .child(assistant_field(api_key_label, key_row, theme))
             .children(form.notice(NoticeAt::Key, theme))
             .when(form.session.is_none(), |body| {
                 body.child(
@@ -1485,13 +1493,12 @@ fn merge_service_models(
 /// Accept an API root or a complete request endpoint
 fn model_service_base_url(input: &str) -> Option<String> {
     let mut url = url::Url::parse(input).ok()?;
-    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if url.host().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || !(url.scheme() == "https" || (url.scheme() == "http" && local))
+        || !matches!(url.scheme(), "http" | "https")
     {
         return None;
     }
@@ -1549,6 +1556,18 @@ fn read_local_key(_: &ModelService) -> anyhow::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_service_accepts_http_endpoint_on_the_network() {
+        assert_eq!(
+            model_service_base_url("http://192.168.1.50:8080/v1/chat/completions").as_deref(),
+            Some("http://192.168.1.50:8080/v1")
+        );
+        assert_eq!(
+            model_service_base_url("http://models.test:8080/v1/chat/completions").as_deref(),
+            Some("http://models.test:8080/v1")
+        );
+    }
 
     #[test]
     fn model_service_save_button_builds_with_and_without_a_selection() {

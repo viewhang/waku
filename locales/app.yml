@@ -1875,6 +1875,8 @@ transcript.worked:
   en: Worked
 transcript.worked_for:
   en: Worked for %{duration}
+transcript.assistant_activity:
+  en: Activity · %{duration}
 transcript.you_stopped_after:
   en: You stopped after %{duration}
 transcript.working_for:
@@ -2212,6 +2214,10 @@ assistant.text_only:
   en: This assistant accepts text. Remove attachments to continue
 assistant.test_ok:
   en: The model connection works
+assistant.tool_unavailable:
+  en: This tool is unavailable in this assistant session
+assistant.model_unavailable:
+  en: "%{model} is unavailable. Choose another model."
 assistant.invalid_response:
   en: The daemon returned an unexpected response
 assistant.default_model:
@@ -2257,9 +2263,11 @@ model_services.model_required:
 model_services.name_required:
   en: Enter a provider name
 model_services.invalid_url:
-  en: Enter an HTTPS address or a local HTTP address
+  en: Enter a valid HTTP or HTTPS address
 model_services.api_key:
   en: API key
+model_services.api_key_optional:
+  en: API key (if required)
 model_services.show_key:
   en: Show API key
 model_services.hide_key:
