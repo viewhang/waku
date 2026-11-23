@@ -249,6 +249,15 @@ impl Backend for WakuBackend {
                     .save_model_service(service, api_key.as_deref())?;
                 Ok(ResponsePayload::ModelServiceSaved { service })
             }
+            Command::SetModelServiceEnabled {
+                service_id,
+                enabled,
+            } => {
+                let service = self
+                    .settings
+                    .set_model_service_enabled(service_id, enabled)?;
+                Ok(ResponsePayload::ModelServiceSaved { service })
+            }
             Command::TestModelService {
                 base_url,
                 api_key,
@@ -280,6 +289,15 @@ impl Backend for WakuBackend {
                     source_language,
                     target_language,
                 )?;
+                Ok(ResponsePayload::Translation { text })
+            }
+            Command::TranslateWithGoogle {
+                text,
+                source_language,
+                target_language,
+            } => {
+                let text =
+                    crate::google_translation::translate(&text, source_language, target_language)?;
                 Ok(ResponsePayload::Translation { text })
             }
             Command::UpdateSettings { settings } => {
@@ -1916,9 +1934,11 @@ fn handle_driver_command(
         Command::AttachSession
         | Command::Start { .. }
         | Command::SaveModelService { .. }
+        | Command::SetModelServiceEnabled { .. }
         | Command::TestModelService { .. }
         | Command::ListModelServiceModels { .. }
         | Command::TranslateText { .. }
+        | Command::TranslateWithGoogle { .. }
         | Command::GetSettings
         | Command::UpdateSettings { .. }
         | Command::ProbeProvider { .. }

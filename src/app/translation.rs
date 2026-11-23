@@ -1,10 +1,10 @@
-//! Standalone text translation using the configured model services
+//! Compare a configured model and Google Translate on the same text
 
 use super::assistants::{ModelSelection, assistant_button_base};
 use super::*;
 use crate::ui::ActivationExt as _;
 use waku_client::{Command, ResponsePayload};
-use waku_protocol::TranslationLanguage;
+use waku_protocol::{GOOGLE_TRANSLATION_MAX_CHARACTERS, TranslationLanguage};
 
 const PAGE_CONTEXT: &str = "TranslationPage";
 gpui::actions!(translation, [CloseTranslation]);
@@ -20,12 +20,44 @@ pub(super) fn init(cx: &mut App) {
 pub(super) struct TranslationPage {
     open: bool,
     source: Entity<TextInput>,
-    output: Entity<TextInput>,
+    source_characters: usize,
+    model_output: TranslationOutput,
+    google_output: TranslationOutput,
     source_language: Option<TranslationLanguage>,
     target_language: TranslationLanguage,
     pub(super) model: Option<ModelSelection>,
-    pub(super) busy: bool,
+}
+
+#[derive(Clone, Copy)]
+enum TranslationEngine {
+    Model,
+    Google,
+}
+
+struct TranslationOutput {
+    input: Entity<TextInput>,
+    busy: bool,
     error: Option<String>,
+}
+
+impl TranslationOutput {
+    fn new(window: &mut Window, cx: &mut App) -> Self {
+        Self {
+            input: cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .multi_line()
+                    .tab_stop()
+                    .read_only(true)
+            }),
+            busy: false,
+            error: None,
+        }
+    }
+
+    fn clear(&mut self, cx: &mut App) {
+        self.input.update(cx, |input, cx| input.clear(cx));
+        self.error = None;
+    }
 }
 
 impl TranslationPage {
@@ -49,23 +81,44 @@ impl TranslationPage {
                     .tab_stop()
                     .placeholder(tr!("translation.input"))
             }),
-            output: cx.new(|cx| {
-                TextInput::new(window, cx)
-                    .multi_line()
-                    .tab_stop()
-                    .read_only(true)
-            }),
+            source_characters: 0,
+            model_output: TranslationOutput::new(window, cx),
+            google_output: TranslationOutput::new(window, cx),
             source_language: None,
             target_language,
             model,
-            busy: false,
-            error: None,
         }
     }
 
-    pub(super) fn clear_result(&mut self, cx: &mut App) {
-        self.output.update(cx, |input, cx| input.clear(cx));
-        self.error = None;
+    pub(super) fn busy(&self) -> bool {
+        self.model_output.busy || self.google_output.busy
+    }
+
+    pub(super) fn clear_model_result(&mut self, cx: &mut App) {
+        self.model_output.clear(cx);
+    }
+
+    fn clear_results(&mut self, cx: &mut App) {
+        self.clear_model_result(cx);
+        self.google_output.clear(cx);
+    }
+
+    fn output(&self, engine: TranslationEngine) -> &TranslationOutput {
+        match engine {
+            TranslationEngine::Model => &self.model_output,
+            TranslationEngine::Google => &self.google_output,
+        }
+    }
+
+    fn output_mut(&mut self, engine: TranslationEngine) -> &mut TranslationOutput {
+        match engine {
+            TranslationEngine::Model => &mut self.model_output,
+            TranslationEngine::Google => &mut self.google_output,
+        }
+    }
+
+    fn google_available(&self) -> bool {
+        self.source_characters <= GOOGLE_TRANSLATION_MAX_CHARACTERS
     }
 }
 
@@ -100,12 +153,13 @@ impl Waku {
                 });
             let page =
                 TranslationPage::new(window, self.state.language.locale(), default_model, cx);
-            cx.subscribe(&page.source, |this, _, event: &InputEvent, cx| {
+            cx.subscribe(&page.source, |this, input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Edited)
                     && let Some(page) = this.translation.as_mut()
-                    && !page.busy
+                    && !page.busy()
                 {
-                    page.clear_result(cx);
+                    page.source_characters = input.read(cx).content().chars().count();
+                    page.clear_results(cx);
                     cx.notify();
                 }
             })
@@ -142,70 +196,97 @@ impl Waku {
     }
 
     fn translate(&mut self, cx: &mut Context<Self>) {
-        let Some(page) = self.translation.as_ref().filter(|page| !page.busy) else {
-            return;
-        };
-        let Some(model) = page
-            .model
-            .as_ref()
-            .filter(|model| self.translation_model_available(model))
-        else {
+        let Some(page) = self.translation.as_ref().filter(|page| !page.busy()) else {
             return;
         };
         let text = page.source.read(cx).content();
         if text.trim().is_empty() || page.source_language == Some(page.target_language) {
             return;
         }
-        let command = Command::TranslateText {
-            service_id: model.service_id,
-            model: model.model.clone(),
-            text: text.to_owned(),
-            source_language: page.source_language,
-            target_language: page.target_language,
-        };
+        let model = page
+            .model
+            .as_ref()
+            .filter(|model| self.translation_model_available(model))
+            .map(|model| Command::TranslateText {
+                service_id: model.service_id,
+                model: model.model.clone(),
+                text: text.to_owned(),
+                source_language: page.source_language,
+                target_language: page.target_language,
+            });
+        let google = page
+            .google_available()
+            .then(|| Command::TranslateWithGoogle {
+                text: text.to_owned(),
+                source_language: page.source_language,
+                target_language: page.target_language,
+            });
+        if model.is_none() && google.is_none() {
+            return;
+        }
         let page = self
             .translation
             .as_mut()
             .expect("translation page remains present");
-        page.busy = true;
-        page.clear_result(cx);
+        page.clear_results(cx);
+        page.model_output.busy = model.is_some();
+        page.google_output.busy = google.is_some();
         page.source.update(cx, |input, cx| {
             input.set_read_only(true);
             cx.notify();
         });
+        for (engine, command) in [
+            (TranslationEngine::Model, model),
+            (TranslationEngine::Google, google),
+        ] {
+            if let Some(command) = command {
+                self.request_translation(engine, command, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn request_translation(
+        &self,
+        engine: TranslationEngine,
+        command: Command,
+        cx: &mut Context<Self>,
+    ) {
         let client = self.daemon.client();
         cx.spawn(async move |view, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    // Give the model call its own mailbox so settings requests can run concurrently
+                    // Each engine has its own mailbox and can finish independently
                     client.request(Uuid::new_v4(), Uuid::nil(), command)
                 })
                 .await;
             let _ = view.update(cx, |this, cx| {
                 if let Some(page) = this.translation.as_mut() {
-                    page.busy = false;
-                    page.source.update(cx, |input, cx| {
-                        input.set_read_only(false);
-                        cx.notify();
-                    });
+                    let output = page.output_mut(engine);
+                    output.busy = false;
                     match result {
-                        Ok(ResponsePayload::Translation { text }) => page
-                            .output
+                        Ok(ResponsePayload::Translation { text }) => output
+                            .input
                             .update(cx, |input, cx| input.set_content(text, cx)),
-                        Ok(_) => page.error = Some(tr!("assistant.invalid_response")),
-                        Err(error) => page.error = Some(tr!("translation.failed", error = error)),
+                        Ok(_) => output.error = Some(tr!("assistant.invalid_response")),
+                        Err(error) => output.error = Some(tr!("translation.failed", error = error)),
+                    }
+                    if !page.busy() {
+                        page.source.update(cx, |input, cx| {
+                            input.set_read_only(false);
+                            cx.notify();
+                        });
                     }
                     cx.notify();
                 }
             });
         })
         .detach();
-        cx.notify();
     }
 
     fn swap_translation_languages(&mut self, cx: &mut Context<Self>) {
-        let Some(page) = self.translation.as_mut().filter(|page| !page.busy) else {
+        let Some(page) = self.translation.as_mut().filter(|page| !page.busy()) else {
             return;
         };
         let Some(source) = page.source_language else {
@@ -213,12 +294,15 @@ impl Waku {
         };
         page.source_language = Some(page.target_language);
         page.target_language = source;
-        let result = page.output.read(cx).content().to_owned();
-        if !result.is_empty() {
+        let result = [&page.model_output, &page.google_output]
+            .into_iter()
+            .map(|output| output.input.read(cx).content())
+            .find(|text| !text.is_empty());
+        if let Some(result) = result.map(str::to_owned) {
             page.source
                 .update(cx, |input, cx| input.set_content(result, cx));
         }
-        page.clear_result(cx);
+        page.clear_results(cx);
         cx.notify();
     }
 
@@ -240,9 +324,13 @@ impl Waku {
         let handle = self.menu_handle(id, cx);
         let trigger = MenuChip::new(id)
             .label(label)
+            .outlined()
+            .flex_1()
+            .min_w_0()
+            .justify_between()
             .selected(handle.is_open())
-            .disabled(page.busy);
-        if page.busy {
+            .disabled(page.busy());
+        if page.busy() {
             return trigger.into_any_element();
         }
         let weak = cx.weak_entity();
@@ -251,7 +339,8 @@ impl Waku {
                 let weak = weak.clone();
                 MenuItem::new(label, move |_, cx| {
                     let _ = weak.update(cx, |this, cx| {
-                        let Some(page) = this.translation.as_mut().filter(|page| !page.busy) else {
+                        let Some(page) = this.translation.as_mut().filter(|page| !page.busy())
+                        else {
                             return;
                         };
                         if source {
@@ -259,7 +348,7 @@ impl Waku {
                         } else if let Some(language) = language {
                             page.target_language = language;
                         }
-                        page.clear_result(cx);
+                        page.clear_results(cx);
                         cx.notify();
                     });
                 })
@@ -284,19 +373,19 @@ impl Waku {
     ) -> Stateful<Div> {
         let page = self.translation.as_ref().expect("translation is open");
         let theme = Theme::current(cx);
+        let busy = page.busy();
         let same_language = page.source_language == Some(page.target_language);
-        let can_translate = !page.busy
+        let can_translate = !busy
             && !same_language
             && !page.source.read(cx).content().trim().is_empty()
-            && page
-                .model
-                .as_ref()
-                .is_some_and(|model| self.translation_model_available(model));
-        let can_copy = !page.output.read(cx).content().is_empty();
-        let source = self.translation_language_menu(page, true, cx);
-        let target = self.translation_language_menu(page, false, cx);
-        let model = self.render_translation_model_picker(page.model.as_ref(), page.busy, cx);
-        let stacked = window.viewport_size().width - px(self.sidebar_rendered_width) < px(580.0);
+            && (page.google_available()
+                || page
+                    .model
+                    .as_ref()
+                    .is_some_and(|model| self.translation_model_available(model)));
+        let stacked = window.viewport_size().width - px(self.sidebar_rendered_width) < px(650.0);
+        let source_height =
+            px((f32::from(window.viewport_size().height) * 0.31).clamp(154.0, 304.0));
 
         let back = self.translation_button(
             "translation-back",
@@ -305,36 +394,21 @@ impl Waku {
             cx,
             Self::close_translation,
         );
-        let copy = self.translation_button(
-            "translation-copy",
-            tr!("translation.copy"),
-            can_copy,
-            cx,
-            |this, _, cx| {
-                if let Some(page) = this.translation.as_ref() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(
-                        page.output.read(cx).content().to_owned(),
-                    ));
-                    this.show_success_toast(tr!("translation.copied"));
-                    cx.notify();
-                }
-            },
-        );
+        let source = self.translation_language_menu(page, true, cx);
+        let target = self.translation_language_menu(page, false, cx);
         let swap = self
             .translation_button(
                 "translation-swap",
                 "⇄".into(),
-                !page.busy && !same_language && page.source_language.is_some(),
+                !busy && !same_language && page.source_language.is_some(),
                 cx,
-                |this, _, cx| {
-                    this.swap_translation_languages(cx);
-                },
+                |this, _, cx| this.swap_translation_languages(cx),
             )
             .tooltip(Tooltip::text(tr!("translation.swap")));
         let translate = self
             .translation_button(
                 "translation-submit",
-                if page.busy {
+                if busy {
                     tr!("translation.translating")
                 } else {
                     tr!("translation.title")
@@ -347,6 +421,43 @@ impl Waku {
                 button.bg(theme.inverse).text_color(theme.on_inverse)
             });
 
+        let original = translation_card(theme)
+            .flex_none()
+            .h(source_height)
+            .child(translation_heading(tr!("translation.source")))
+            .child(translation_text_field(
+                "translation-source-pane",
+                page.source.clone(),
+                theme,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(sp(12.0))
+                            .text_color(if same_language {
+                                theme.warning
+                            } else {
+                                theme.text_secondary
+                            })
+                            .child(if same_language {
+                                tr!("translation.same_language")
+                            } else {
+                                format!(
+                                    "{} / {GOOGLE_TRANSLATION_MAX_CHARACTERS}",
+                                    page.source_characters
+                                )
+                            }),
+                    )
+                    .child(translate),
+            );
+
         div()
             .id("translation-page")
             .key_context(PAGE_CONTEXT)
@@ -358,67 +469,132 @@ impl Waku {
             .tab_stop(false)
             .flex_1()
             .min_h_0()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap(px(12.0))
             .p(px(20.0))
             .when(!self.sidebar_visible, |page| page.pt(px(38.0)))
             .child(
-                div().flex().items_center().gap(px(12.0)).child(back).child(
-                    div()
-                        .text_size(sp(18.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(tr!("translation.title")),
-                ),
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(back)
+                    .child(
+                        div()
+                            .text_size(sp(18.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(tr!("translation.title")),
+                    ),
             )
             .child(
                 div()
+                    .flex_none()
                     .flex()
-                    .flex_wrap()
                     .items_center()
-                    .gap(px(6.0))
+                    .gap(px(8.0))
                     .child(source)
                     .child(swap)
-                    .child(target)
-                    .child(div().flex_1())
-                    .child(model)
-                    .child(translate),
+                    .child(target),
             )
+            .child(original)
             .child(
                 div()
                     .flex()
                     .flex_1()
-                    .min_h_0()
+                    .min_h(px(if stacked { 340.0 } else { 190.0 }))
                     .gap(px(12.0))
                     .when(stacked, |panes| panes.flex_col())
-                    .child(translation_text_pane(
-                        "translation-source-pane",
-                        tr!("translation.source"),
-                        page.source.clone(),
-                        None,
-                        theme,
-                        cx,
-                    ))
-                    .child(translation_text_pane(
-                        "translation-output-pane",
-                        tr!("translation.output"),
-                        page.output.clone(),
-                        Some(copy),
-                        theme,
-                        cx,
-                    )),
+                    .child(self.render_translation_result(page, TranslationEngine::Model, cx))
+                    .child(self.render_translation_result(page, TranslationEngine::Google, cx)),
             )
-            .children(
-                page.error
-                    .clone()
-                    .or_else(|| same_language.then(|| tr!("translation.same_language")))
-                    .map(|error| {
-                        div()
-                            .text_size(sp(12.0))
-                            .text_color(theme.warning)
-                            .child(error)
-                    }),
+    }
+
+    fn render_translation_result(
+        &self,
+        page: &TranslationPage,
+        engine: TranslationEngine,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = Theme::current(cx);
+        let output = page.output(engine);
+        let (title, pane_id, copy_id, control) = match engine {
+            TranslationEngine::Model => (
+                tr!("translation.model_output"),
+                "translation-model-result",
+                "translation-copy-model",
+                Some(self.render_translation_model_picker(page.model.as_ref(), page.busy(), cx)),
+            ),
+            TranslationEngine::Google => (
+                tr!("translation.google_output"),
+                "translation-google-result",
+                "translation-copy-google",
+                None,
+            ),
+        };
+        let copy = self.translation_button(
+            copy_id,
+            tr!("common.copy"),
+            !output.input.read(cx).content().is_empty(),
+            cx,
+            move |this, _, cx| {
+                if let Some(page) = this.translation.as_ref() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(
+                        page.output(engine).input.read(cx).content().to_owned(),
+                    ));
+                    this.show_success_toast(tr!("translation.copied"));
+                    cx.notify();
+                }
+            },
+        );
+
+        let is_google = matches!(engine, TranslationEngine::Google);
+        let error = output.error.clone().or_else(|| {
+            (is_google && !page.google_available()).then(|| {
+                tr!(
+                    "translation.google_limit",
+                    limit = GOOGLE_TRANSLATION_MAX_CHARACTERS
+                )
+            })
+        });
+
+        translation_card(theme)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.0))
+                    .child(translation_heading(title))
+                    .children(control),
             )
+            .when(output.busy, |card| {
+                card.child(
+                    div()
+                        .flex_none()
+                        .text_size(sp(12.0))
+                        .text_color(theme.text_secondary)
+                        .child(tr!("translation.translating")),
+                )
+            })
+            .children(error.map(|error| {
+                div()
+                    .flex_none()
+                    .text_size(sp(12.0))
+                    .text_color(theme.warning)
+                    .child(error)
+            }))
+            .child(translation_text_field(
+                pane_id,
+                output.input.clone(),
+                theme,
+                cx,
+            ))
+            .child(div().flex_none().flex().justify_end().child(copy))
     }
 
     fn translation_button(
@@ -441,53 +617,52 @@ impl Waku {
     }
 }
 
-fn translation_text_pane(
-    id: &'static str,
-    label: String,
-    input: Entity<TextInput>,
-    button: Option<Stateful<Div>>,
-    theme: Theme,
-    cx: &App,
-) -> Div {
-    let focus = input.read(cx).focus_handle(cx);
+fn translation_card(theme: Theme) -> Div {
     div()
         .flex_1()
         .min_w_0()
         .min_h_0()
         .flex()
         .flex_col()
-        .gap(px(6.0))
-        .child(
-            div()
-                .h(px(28.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_between()
-                .text_size(sp(12.0))
-                .text_color(theme.text_secondary)
-                .child(label)
-                .children(button),
-        )
-        .child(
-            div()
-                .id(id)
-                .tab_index(0)
-                .tab_stop(false)
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(theme.border_strong)
-                .in_focus(|style| style.border_color(theme.accent))
-                .bg(theme.composer)
-                .p(px(10.0))
-                .text_size(sp(14.0))
-                .line_height(sp(22.0))
-                .child(input)
-                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                    window.focus(&focus, cx);
-                }),
-        )
+        .gap(px(8.0))
+        .p(px(12.0))
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(theme.border_strong)
+        .bg(theme.composer)
+}
+
+fn translation_heading(label: String) -> Div {
+    div()
+        .flex_none()
+        .text_size(sp(14.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(label)
+}
+
+fn translation_text_field(
+    id: &'static str,
+    input: Entity<TextInput>,
+    theme: Theme,
+    cx: &App,
+) -> Stateful<Div> {
+    let focus = input.read(cx).focus_handle(cx);
+    div()
+        .id(id)
+        .tab_index(0)
+        .tab_stop(false)
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .rounded(px(5.0))
+        .border_1()
+        .border_color(gpui::transparent_black())
+        .in_focus(|style| style.border_color(theme.accent))
+        .p(px(5.0))
+        .text_size(sp(14.0))
+        .line_height(sp(22.0))
+        .child(input)
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            window.focus(&focus, cx)
+        })
 }

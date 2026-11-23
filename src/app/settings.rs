@@ -79,6 +79,7 @@ const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 9] = [
 /// Bind the search field's list-navigation keys. Called once at startup.
 pub fn init(cx: &mut App) {
     super::model_services::init(cx);
+    super::model_services_page::init(cx);
     super::translation::init(cx);
     use gpui::KeyBinding;
     cx.bind_keys([
@@ -313,10 +314,8 @@ impl Waku {
             window,
             cx,
         );
-        // The Skills page is a mail-style split that owns the whole content
-        // column — no page title, no titlebar strip, no width cap, no card.
-        // Window dragging stays with the sidebar's own titlebar region.
-        if page == SettingsPage::Skills {
+        // List and detail views fill the settings column and own their own scroll positions
+        if matches!(page, SettingsPage::Skills | SettingsPage::ModelServices) {
             return div()
                 .flex_1()
                 .h_full()
@@ -327,18 +326,16 @@ impl Waku {
                 .border_color(theme.sidebar_border)
                 .bg(theme.surface)
                 .children(right_window_controls.map(|controls| {
-                    self.render_settings_drag_region("settings-skills-titlebar", cx)
+                    self.render_settings_drag_region("settings-split-titlebar", cx)
                         .flex()
                         .items_center()
                         .justify_end()
                         .child(controls)
                 }))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .child(self.render_skills_settings(cx)),
-                );
+                .child(div().flex_1().min_h_0().child(match page {
+                    SettingsPage::Skills => self.render_skills_settings(cx),
+                    _ => self.render_model_services_settings(cx),
+                }));
         }
         // The Monthly and Projects list views own their own scrolling, so
         // their pages fill the viewport instead of riding the shared scroll
@@ -385,9 +382,8 @@ impl Waku {
             .child(match page {
                 SettingsPage::General => self.render_general_settings(cx),
                 SettingsPage::Assistants => self.render_assistants_settings(cx),
-                SettingsPage::ModelServices => self.render_model_services_settings(cx),
+                SettingsPage::ModelServices | SettingsPage::Skills => unreachable!(),
                 SettingsPage::Providers => self.render_providers_settings(cx),
-                SettingsPage::Skills => self.render_skills_settings(cx),
                 SettingsPage::Usage => self.render_usage_settings(cx),
                 SettingsPage::Daemon => self.render_daemon_settings(cx),
                 SettingsPage::ComputerUse => self.render_computer_use_settings(cx),
@@ -2452,6 +2448,7 @@ impl Waku {
         self.skills_search.update(cx, |input, cx| {
             input.set_placeholder(tr!("skills.search"), cx)
         });
+        self.model_services_page.refresh_localized_text(cx);
         self.provider_path_input.update(cx, |input, cx| {
             input.set_placeholder(tr!("input.detected_automatically"), cx)
         });

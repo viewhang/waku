@@ -997,7 +997,7 @@ impl Waku {
             return;
         }
         let (menu_id, align) = if self.translation_is_open() {
-            if self.translation.as_ref().is_some_and(|page| page.busy) {
+            if self.translation.as_ref().is_some_and(|page| page.busy()) {
                 return;
             }
             (

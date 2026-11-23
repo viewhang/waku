@@ -247,8 +247,9 @@ translation.back: チャットに戻る
 translation.auto: 言語を自動検出
 translation.input: 翻訳するテキストを入力または貼り付け
 translation.source: 原文
-translation.output: 訳文
-translation.copy: 訳文をコピー
+translation.model_output: AI 翻訳
+translation.google_output: Google 翻訳
+translation.google_limit: Google 翻訳は最大 %{limit} 文字まで対応しています
 translation.copied: 訳文をコピーしました
 translation.swap: 言語を入れ替え
 translation.translating: 翻訳中…

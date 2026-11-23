@@ -24,6 +24,8 @@ pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
 pub const APP_EXECUTABLE_ENV: &str = "WAKU_APP_EXECUTABLE";
+/// Maximum number of Unicode code points Waku sends to Google per translation
+pub const GOOGLE_TRANSLATION_MAX_CHARACTERS: usize = 5_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -193,6 +195,11 @@ pub enum Command {
         service: crate::settings::ModelService,
         api_key: Option<String>,
     },
+    /// Update only the provider's availability in current daemon settings
+    SetModelServiceEnabled {
+        service_id: Uuid,
+        enabled: bool,
+    },
     /// Test connectivity with a synthetic request for the configured model
     TestModelService {
         base_url: String,
@@ -210,6 +217,11 @@ pub enum Command {
     TranslateText {
         service_id: Uuid,
         model: String,
+        text: String,
+        source_language: Option<TranslationLanguage>,
+        target_language: TranslationLanguage,
+    },
+    TranslateWithGoogle {
         text: String,
         source_language: Option<TranslationLanguage>,
         target_language: TranslationLanguage,

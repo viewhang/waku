@@ -192,6 +192,29 @@ impl DaemonSettingsStore {
         Ok(service)
     }
 
+    /// Update the stored flag without replacing the catalog or touching its credential
+    pub(crate) fn set_model_service_enabled(
+        &self,
+        id: Uuid,
+        enabled: bool,
+    ) -> anyhow::Result<ModelService> {
+        let mut current = self.settings.lock();
+        let mut next = current.clone();
+        let service = next
+            .model_services
+            .iter_mut()
+            .find(|service| service.id == id)
+            .context("Model service is missing")?;
+        if service.enabled == enabled {
+            return Ok(service.clone());
+        }
+        service.enabled = enabled;
+        let saved = service.clone();
+        write_atomic(&self.path, &next)?;
+        *current = next;
+        Ok(saved)
+    }
+
     /// Read only the credential saved for the service's current endpoint
     pub(crate) fn model_service_key(
         &self,
@@ -340,7 +363,7 @@ mod tests {
             name: "Test service".into(),
             base_url: "https://models.example/v1/".into(),
             enabled: true,
-            models: Vec::new(),
+            models: vec![ServiceModel::new("fixture-model".into())],
             legacy_key: false,
         };
         let initial_endpoint = "https://models.example/v1";
@@ -356,15 +379,28 @@ mod tests {
         store
             .save_model_service(service.clone(), Some("fixture-model-key"))
             .unwrap();
+
+        // The settings-page switch must persist the flag without changing the catalog or key
+        let mut disabled = service.clone();
+        disabled.enabled = false;
+        assert_eq!(
+            store.set_model_service_enabled(service.id, false).unwrap(),
+            disabled
+        );
         drop(store);
 
         let store = DaemonSettingsStore::open(path.clone()).unwrap();
+        assert_eq!(store.model_service(service.id), Some(disabled));
         assert_eq!(
             store
                 .model_service_key(service.id, initial_endpoint)
                 .unwrap()
                 .as_deref(),
             Some("fixture-model-key"),
+        );
+        assert_eq!(
+            store.set_model_service_enabled(service.id, true).unwrap(),
+            service
         );
         assert_eq!(
             store
@@ -405,6 +441,8 @@ mod tests {
         // Force a settings write failure after the credential transaction has started
         let blocked_write = path.with_extension("json.tmp");
         fs::create_dir(&blocked_write).unwrap();
+        assert!(store.set_model_service_enabled(service.id, false).is_err());
+        assert_eq!(store.model_service(service.id), Some(service.clone()));
         assert!(
             store
                 .save_model_service(service.clone(), Some("unsaved-key"))

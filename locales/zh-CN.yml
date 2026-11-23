@@ -232,11 +232,12 @@ sidebar.today: 今天
 sidebar.search: 搜索
 translation.title: 翻译
 translation.back: 返回会话
-translation.auto: 自动检测
+translation.auto: 自动识别
 translation.input: 输入或粘贴要翻译的文本
 translation.source: 原文
-translation.output: 译文
-translation.copy: 复制译文
+translation.model_output: 大模型翻译
+translation.google_output: Google 翻译
+translation.google_limit: Google 翻译最多接收 %{limit} 个字符
 translation.copied: 已复制译文
 translation.swap: 互换语言
 translation.translating: 正在翻译…
@@ -1109,6 +1110,14 @@ model_services.save: 保存供应商
 model_services.manage: 管理模型服务
 model_services.endpoint: API 地址
 model_services.enabled: 在模型选择器中启用
+model_services.search_services: 搜索供应商…
+model_services.all_services: 全部供应商
+model_services.enabled_status: 已启用
+model_services.disabled_status: 已停用
+model_services.empty_services: 暂无模型供应商
+model_services.no_matching_services: 没有匹配的供应商
+model_services.select_placeholder: 选择供应商查看详情
+model_services.empty_catalog: 此供应商暂无模型
 model_services.sync: 同步模型
 model_services.synced: 模型列表已更新
 model_services.add_model: 添加模型

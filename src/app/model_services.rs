@@ -79,53 +79,6 @@ pub(super) struct ModelServiceForm {
 }
 
 impl Waku {
-    pub(super) fn render_model_services_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::current(cx);
-        let mut services = div().mt(px(16.0)).flex().flex_col().gap(px(10.0));
-        for service in &self.state.model_services {
-            let id = service.id;
-            services = services.child(
-                div()
-                    .px(px(12.0))
-                    .py(px(9.0))
-                    .rounded(px(8.0))
-                    .bg(theme.inset)
-                    .flex()
-                    .items_center()
-                    .gap(px(12.0))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .child(div().truncate().child(service.name.clone()))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(sp(12.0))
-                                    .text_color(theme.text_secondary)
-                                    .child(service.base_url.clone()),
-                            ),
-                    )
-                    .child(assistant_button(
-                        SharedString::from(format!("edit-service-{id}")),
-                        tr!("assistant.edit"),
-                        cx,
-                        move |this, window, cx| {
-                            this.open_model_service_editor(Some(id), None, window, cx)
-                        },
-                    )),
-            );
-        }
-        services
-            .child(assistant_button(
-                "add-model-service",
-                tr!("model_services.add"),
-                cx,
-                |this, window, cx| this.open_model_service_editor(None, None, window, cx),
-            ))
-            .into_any_element()
-    }
-
     pub(super) fn model_service(&self, id: Uuid) -> Option<&ModelService> {
         self.state
             .model_services
@@ -140,6 +93,9 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if service_id.is_some_and(|id| self.model_services_page.is_saving(id)) {
+            return;
+        }
         let saved = service_id.and_then(|id| self.model_service(id)).cloned();
         let generation = Uuid::new_v4();
         let name = cx.new(|cx| {
@@ -1063,6 +1019,7 @@ impl Waku {
             return;
         }
         let generation = form.generation;
+        let creating = form.original.is_none();
         let id = form.original.as_ref().map_or(generation, |(id, _)| *id);
         let key = form.key.read(cx).content().trim().to_owned();
         let same_endpoint = form.same_endpoint(cx);
@@ -1104,15 +1061,11 @@ impl Waku {
                     form.work = None;
                     match result {
                         Ok(ResponsePayload::ModelServiceSaved { service }) => {
-                            if let Some(saved) = this
-                                .state
-                                .model_services
-                                .iter_mut()
-                                .find(|saved| saved.id == id)
+                            this.apply_saved_model_service(service);
+                            if session.is_none()
+                                && this.settings_page == Some(SettingsPage::ModelServices)
                             {
-                                *saved = service;
-                            } else {
-                                this.state.model_services.push(service);
+                                this.model_services_page.show_saved(id, creating, cx);
                             }
                             this.model_service_form = None;
                             if let (Some(session), Some(model)) = (session, selected) {

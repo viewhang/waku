@@ -600,11 +600,11 @@ impl Waku {
         match target {
             ModelPickerTarget::Default => self.assistant_form.default_model = Some(selection),
             ModelPickerTarget::Translation => {
-                let Some(page) = self.translation.as_mut().filter(|page| !page.busy) else {
+                let Some(page) = self.translation.as_mut().filter(|page| !page.busy()) else {
                     return false;
                 };
                 page.model = Some(selection);
-                page.clear_result(cx);
+                page.clear_model_result(cx);
             }
             ModelPickerTarget::Session(id) => {
                 if self.state.selected_session != Some(id) {

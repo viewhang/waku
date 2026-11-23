@@ -1071,6 +1071,7 @@ pub struct Waku {
     model_search: Entity<TextInput>,
     settings_search: Entity<TextInput>,
     assistant_form: assistants::AssistantForm,
+    model_services_page: model_services_page::ModelServicesPage,
     model_service_form: Option<model_services::ModelServiceForm>,
     assistant_model_scroll: gpui::UniformListScrollHandle,
     daemon_port_input: Entity<TextInput>,
@@ -1635,6 +1636,7 @@ mod file_search;
 mod goal_dialog;
 mod image_preview;
 mod model_services;
+mod model_services_page;
 mod project_picker;
 mod render;
 mod right_panel;
@@ -2011,6 +2013,7 @@ impl Waku {
                 .placeholder(tr!("settings.search"))
         });
         let assistant_form = assistants::AssistantForm::new(window, cx);
+        let model_services_page = model_services_page::ModelServicesPage::new(window, cx);
         let assistant_model_scroll = gpui::UniformListScrollHandle::new();
         let daemon_port = state.daemon_exposure.port.to_string();
         let daemon_origins = state.daemon_exposure.allowed_origins_text();
@@ -2600,6 +2603,7 @@ impl Waku {
                 }
             })
             .detach();
+            model_services_page.subscribe(cx);
             cx.subscribe(
                 &session_rename_input,
                 |this: &mut Self, _, event: &InputEvent, cx| match event {
@@ -2763,6 +2767,7 @@ impl Waku {
                 project_search,
                 settings_search,
                 assistant_form,
+                model_services_page,
                 model_service_form: None,
                 assistant_model_scroll,
                 daemon_port_input,

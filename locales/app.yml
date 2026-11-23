@@ -482,10 +482,12 @@ translation.input:
   en: Enter or paste text to translate
 translation.source:
   en: Original
-translation.output:
-  en: Translation
-translation.copy:
-  en: Copy translation
+translation.model_output:
+  en: AI translation
+translation.google_output:
+  en: Google Translate
+translation.google_limit:
+  en: "Google Translate accepts up to %{limit} characters"
 translation.copied:
   en: Translation copied
 translation.swap:
@@ -2272,6 +2274,22 @@ model_services.endpoint:
   en: API Base URL
 model_services.enabled:
   en: Available in model picker
+model_services.search_services:
+  en: Search providers…
+model_services.all_services:
+  en: All providers
+model_services.enabled_status:
+  en: Enabled
+model_services.disabled_status:
+  en: Disabled
+model_services.empty_services:
+  en: No model providers yet
+model_services.no_matching_services:
+  en: No matching providers
+model_services.select_placeholder:
+  en: Select a provider to view its details
+model_services.empty_catalog:
+  en: This provider has no models yet
 model_services.sync:
   en: Sync models
 model_services.synced:
