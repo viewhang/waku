@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,8 +8,6 @@ use uuid::Uuid;
 
 use crate::computer_use::ComputerAppGrant;
 use crate::model::ProviderKind;
-
-pub const MODEL_SERVICE_KEYCHAIN: &str = "Waku Assistant API";
 
 /// Reusable direct-model configuration saved by the daemon without credentials
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -34,17 +32,12 @@ pub struct ModelService {
     pub enabled: bool,
     #[serde(deserialize_with = "deserialize_service_models")]
     pub models: Vec<ServiceModel>,
-    /// Migrated services may still use the old endpoint-based Keychain entry
+    /// Older assistant sessions can resolve this migrated service by endpoint
     #[serde(default)]
     pub legacy_key: bool,
 }
 
 impl ModelService {
-    /// Scope credentials to the supplier and its endpoint
-    pub fn keychain_account(&self, canonical_url: &str) -> String {
-        format!("{}@{canonical_url}", self.id)
-    }
-
     pub fn model(&self, id: &str) -> Option<&ServiceModel> {
         self.models.iter().find(|model| model.matches(id))
     }
@@ -270,6 +263,13 @@ impl DaemonSettings {
             .unwrap_or_else(std::env::temp_dir)
             .join(".waku")
             .join("settings.json")
+    }
+
+    /// Keep local credentials separate from the settings document and task database
+    pub fn model_service_key_db_path(settings_path: &Path) -> PathBuf {
+        settings_path
+            .with_file_name("credentials")
+            .join("model-services.sqlite3")
     }
 
     pub fn discard_legacy_app_keys(&mut self) {

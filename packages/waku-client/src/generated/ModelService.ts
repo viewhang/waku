@@ -6,6 +6,6 @@ import type { ServiceModel } from "./ServiceModel";
  */
 export type ModelService = { id: string, name: string, base_url: string, enabled: boolean, models: Array<ServiceModel>,
 /**
- * Migrated services may still use the old endpoint-based Keychain entry
+ * Older assistant sessions can resolve this migrated service by endpoint
  */
 legacy_key: boolean, };

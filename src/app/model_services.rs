@@ -4,10 +4,11 @@ use super::assistants::{assistant_button, assistant_button_base, assistant_field
 use super::*;
 use crate::ui::ActivationExt as _;
 use anyhow::Context as _;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use waku_client::{Command, ResponsePayload};
 use waku_protocol::settings::{
-    ModelKind, ModelModality, ModelProtocol, ModelPurpose, ModelService, ServiceModel,
-    ServiceModelOptions,
+    DaemonSettings, ModelKind, ModelModality, ModelProtocol, ModelPurpose, ModelService,
+    ServiceModel, ServiceModelOptions,
 };
 
 const PRESETS: [(&str, &str); 6] = [
@@ -160,7 +161,23 @@ impl Waku {
             );
             input
         });
-        let load_key = cfg!(target_os = "macos") && !self.daemon.is_remote() && saved.is_some();
+        let load_key = !self.daemon.is_remote() && saved.is_some();
+        cx.subscribe(&url, move |this: &mut Self, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Edited)
+                && let Some(form) = this
+                    .model_service_form
+                    .as_mut()
+                    .filter(|form| form.generation == generation)
+                && let Some(key) = form.original_key.as_ref()
+                && form.key.read(cx).content().trim() == key.as_str()
+                && !form.same_endpoint(cx)
+            {
+                // A saved key belongs to the original address until the user enters it again
+                form.original_key = None;
+                form.key.update(cx, |input, cx| input.clear(cx));
+            }
+        })
+        .detach();
         let model_search = cx
             .new(|cx| TextInput::new(window, cx).placeholder(tr!("model_services.search_models")));
         cx.subscribe(
@@ -228,12 +245,12 @@ impl Waku {
                     };
                     form.work = None;
                     match result {
-                        Ok(Some(key)) => {
+                        Ok(Some(key)) if form.same_endpoint(cx) => {
                             let key = SharedString::from(key);
                             form.original_key = Some(key.clone());
                             form.key.update(cx, |input, cx| input.set_content(key, cx));
                         }
-                        Ok(None) => {}
+                        Ok(_) => {}
                         Err(_) => {
                             form.status =
                                 Some((NoticeAt::Key, true, tr!("model_services.key_read_failed")))
@@ -1048,10 +1065,7 @@ impl Waku {
         let generation = form.generation;
         let id = form.original.as_ref().map_or(generation, |(id, _)| *id);
         let key = form.key.read(cx).content().trim().to_owned();
-        let same_endpoint = form
-            .original
-            .as_ref()
-            .is_some_and(|(_, url)| url == &base_url);
+        let same_endpoint = form.same_endpoint(cx);
         let api_key = match form.original_key.as_ref() {
             Some(original) if same_endpoint && original.as_str() == key => None,
             Some(_) => Some(key),
@@ -1398,6 +1412,20 @@ fn model_service_dialog_layer(card: Stateful<Div>) -> AnyElement {
 }
 
 impl ModelServiceForm {
+    /// Only prefill a credential while the form still points to its saved endpoint
+    fn same_endpoint(&self, cx: &App) -> bool {
+        let Some(saved) = self
+            .original
+            .as_ref()
+            .and_then(|(_, endpoint)| key_endpoint(endpoint).ok())
+        else {
+            return false;
+        };
+        self.base_url(cx)
+            .and_then(|endpoint| key_endpoint(&endpoint).ok())
+            == Some(saved)
+    }
+
     fn model_options_from_fields(&self, cx: &App) -> Option<ServiceModelOptions> {
         let mut options = self.model_options.clone();
         options.group = self.model_group.read(cx).content().trim().to_owned();
@@ -1524,33 +1552,37 @@ fn model_service_base_url(input: &str) -> Option<String> {
     )
 }
 
-/// Read saved credentials through the local keychain rather than exporting them over daemon RPC
-#[cfg(target_os = "macos")]
+/// Read from the local database so opening the editor never exports a saved key over RPC
 fn read_local_key(service: &ModelService) -> anyhow::Result<Option<String>> {
-    use waku_protocol::settings::MODEL_SERVICE_KEYCHAIN;
-    let mut url = url::Url::parse(service.base_url.trim())?;
-    let path = url.path().trim_end_matches('/').to_owned();
-    url.set_path(&path);
-    let account = service.keychain_account(url.as_str());
-    for name in [
-        Some(account.as_str()),
-        service.legacy_key.then_some(url.as_str()),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        match security_framework::passwords::get_generic_password(MODEL_SERVICE_KEYCHAIN, name) {
-            Ok(key) => return Ok(Some(String::from_utf8(key)?)),
-            Err(error) if error.code() == -25300 => {}
-            Err(error) => return Err(error).context("Could not read the saved API key"),
-        }
+    let endpoint = key_endpoint(&service.base_url)?;
+    let path = DaemonSettings::model_service_key_db_path(&DaemonSettings::default_path());
+    if !path.try_exists()? {
+        return Ok(None);
     }
-    Ok(None)
+    let parent = path.parent().context("Missing API key directory")?;
+    let name = path
+        .file_name()
+        .context("Missing API key database filename")?;
+    let database = Connection::open_with_flags(
+        parent.canonicalize()?.join(name),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    database
+        .query_row(
+            "SELECT api_key FROM model_service_keys WHERE service_id = ?1 AND endpoint = ?2",
+            params![service.id.to_string(), endpoint.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("Could not read the saved API key")
 }
 
-#[cfg(not(target_os = "macos"))]
-fn read_local_key(_: &ModelService) -> anyhow::Result<Option<String>> {
-    Ok(None)
+/// Match the daemon's credential lookup for endpoints with trailing slashes
+fn key_endpoint(base_url: &str) -> Result<url::Url, url::ParseError> {
+    let mut endpoint = url::Url::parse(base_url.trim())?;
+    let path = endpoint.path().trim_end_matches('/').to_owned();
+    endpoint.set_path(&path);
+    Ok(endpoint)
 }
 
 #[cfg(test)]

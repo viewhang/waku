@@ -23,8 +23,6 @@ use crate::model::{DriverEvent, Message, MessageAttachment, MessageRole, Provide
 use crate::settings::DaemonSettingsStore;
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(120);
-#[cfg(target_os = "macos")]
-use waku_protocol::settings::MODEL_SERVICE_KEYCHAIN;
 
 /// Use a canonical service URL both for requests and for credential lookup
 pub(crate) fn service_url(base_url: &str) -> anyhow::Result<Url> {
@@ -47,116 +45,16 @@ fn is_loopback(url: &Url) -> bool {
     matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
 }
 
-/// Share a successful Keychain lookup across the daemon's assistant sessions
-#[derive(Default)]
-pub(crate) struct ModelServiceKeys {
-    #[cfg(any(target_os = "macos", test))]
-    entries: parking_lot::Mutex<std::collections::HashMap<String, Option<String>>>,
-}
-
-impl ModelServiceKeys {
-    #[cfg(any(target_os = "macos", test))]
-    fn read(
-        &self,
-        account: String,
-        lookup: impl FnOnce(&str) -> anyhow::Result<Option<String>>,
-    ) -> anyhow::Result<Option<String>> {
-        let mut entries = self.entries.lock();
-        if let Some(key) = entries.get(&account) {
-            return Ok(key.clone());
-        }
-        let key = lookup(&account)?;
-        entries.insert(account, key.clone());
-        Ok(key)
-    }
-
-    /// Roll back the credential if persisting the corresponding settings fails
-    pub(crate) fn commit(
-        &self,
-        service: &ModelService,
-        key: Option<&str>,
-        commit: impl FnOnce() -> std::io::Result<()>,
-    ) -> anyhow::Result<()> {
-        let url = service_url(&service.base_url)?;
-        let Some(key) = key else {
-            return Ok(commit()?);
-        };
-        if !key.is_empty() && !key.bytes().all(|byte| byte.is_ascii_graphic()) {
-            bail!("The API key must be a single token");
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let mut entries = self.entries.lock();
-            let account = service.keychain_account(url.as_str());
-            let previous = read_keychain(&account)?;
-            let write = |key: Option<&[u8]>| -> anyhow::Result<()> {
-                use security_framework::passwords::{
-                    delete_generic_password, set_generic_password,
-                };
-                match key {
-                    Some(key) => set_generic_password(MODEL_SERVICE_KEYCHAIN, &account, key)
-                        .context("Could not save the API key in macOS Keychain"),
-                    None => match delete_generic_password(MODEL_SERVICE_KEYCHAIN, &account) {
-                        Ok(()) => Ok(()),
-                        Err(error) if error.code() == -25300 => Ok(()),
-                        Err(error) => {
-                            Err(error).context("Could not remove the API key from macOS Keychain")
-                        }
-                    },
-                }
-            };
-            write((!key.is_empty()).then_some(key.as_bytes()))?;
-            if let Err(error) = commit() {
-                write(previous.as_deref()).context("Could not restore the previous API key")?;
-                return Err(error.into());
-            }
-            entries.insert(account, (!key.is_empty()).then(|| key.to_owned()));
-            Ok(())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = url;
-            if key.is_empty() {
-                return Ok(commit()?);
-            }
-            bail!("Keychain storage currently requires a macOS daemon");
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn read_keychain(account: &str) -> anyhow::Result<Option<Vec<u8>>> {
-    match security_framework::passwords::get_generic_password(MODEL_SERVICE_KEYCHAIN, account) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.code() == -25300 => Ok(None),
-        Err(error) => Err(error).context("Could not read the API key from macOS Keychain"),
-    }
-}
-
 fn api_key(
     url: &Url,
     service: Option<&ModelService>,
-    keys: &ModelServiceKeys,
+    settings: &DaemonSettingsStore,
 ) -> anyhow::Result<String> {
-    #[cfg(target_os = "macos")]
+    if let Some(service) = service
+        && let Some(key) = settings.model_service_key(service.id, url.as_str())?
     {
-        let account = service.map(|service| service.keychain_account(url.as_str()));
-        let legacy = service
-            .is_none_or(|service| service.legacy_key)
-            .then(|| url.as_str().to_owned());
-        for account in [account, legacy].into_iter().flatten() {
-            if let Some(key) = keys.read(account, |account| {
-                read_keychain(account)?
-                    .map(String::from_utf8)
-                    .transpose()
-                    .context("Invalid Keychain API key")
-            })? {
-                return Ok(key);
-            }
-        }
+        return Ok(key);
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = (service, keys);
 
     default_api_key(url)
 }
@@ -527,7 +425,7 @@ fn run(
                 } else {
                     (profile.model.as_str(), &legacy_options)
                 };
-                let key = api_key(&url, service.as_ref(), &settings.model_service_keys)?;
+                let key = api_key(&url, service.as_ref(), &settings)?;
                 let result = async {
                     let media = request::read_media(&attachments, input, options)?;
                     if options.dialogue() {
@@ -620,27 +518,6 @@ pub(crate) mod tests {
         assert!(service_url("ftp://192.168.1.50/v1").is_err());
     }
 
-    #[test]
-    fn model_service_key_is_read_once_per_account() {
-        let keys = ModelServiceKeys::default();
-        for (account, key) in [("a", "first-key"), ("b", "second-key")] {
-            assert_eq!(
-                keys.read(account.into(), |_| Ok(Some(key.into())))
-                    .unwrap()
-                    .as_deref(),
-                Some(key)
-            );
-            assert_eq!(
-                keys.read(account.into(), |_| panic!(
-                    "A cached account must never be looked up again"
-                ))
-                .unwrap()
-                .as_deref(),
-                Some(key)
-            );
-        }
-    }
-
     /// Verify discovery, conversations without built-in tools and history at a different endpoint
     #[test]
     fn switches_services_and_keeps_conversation_history() {
@@ -660,7 +537,8 @@ pub(crate) mod tests {
             assert_eq!(auth.as_deref(), Some("Bearer modified-key"));
             assert_eq!(body["model"], "first-model");
             stream(socket, json!({"content": "OK"}), "stop");
-            let (socket, method, body, _) = request(&first);
+            let (socket, method, body, auth) = request(&first);
+            assert_eq!(auth.as_deref(), Some("Bearer first-saved-key"));
             assert_eq!(method, "POST /v1/chat/completions");
             assert_eq!(body["model"], "first-model");
             assert_eq!(
@@ -675,7 +553,8 @@ pub(crate) mod tests {
             );
         });
         let second_server = std::thread::spawn(move || {
-            let (socket, method, body, _) = request(&second);
+            let (socket, method, body, auth) = request(&second);
+            assert_eq!(auth.as_deref(), Some("Bearer second-saved-key"));
             assert_eq!(method, "POST /v1/chat/completions");
             assert_eq!(body["model"], "second-model");
             assert_eq!(
@@ -700,7 +579,8 @@ pub(crate) mod tests {
 
         let project = std::env::temp_dir().join(format!("waku-assistant-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&project).unwrap();
-        let settings = Arc::new(DaemonSettingsStore::open(project.join("settings.json")).unwrap());
+        let settings_path = project.join("settings.json");
+        let settings = DaemonSettingsStore::open(settings_path.clone()).unwrap();
         assert_eq!(
             list_models(
                 &first_service.base_url,
@@ -718,18 +598,20 @@ pub(crate) mod tests {
         .unwrap();
         assert!(settings.get().model_services.is_empty());
         settings
-            .save_model_service(first_service.clone(), None)
+            .save_model_service(first_service.clone(), Some("first-saved-key"))
             .unwrap();
         let mut second_service = second_service;
         second_service.models[0]
             .aliases
             .push("second-original".into());
         settings
-            .save_model_service(second_service.clone(), None)
+            .save_model_service(second_service.clone(), Some("second-saved-key"))
             .unwrap();
         settings
             .replace_preferences(crate::DaemonSettings::default())
             .unwrap();
+        drop(settings);
+        let settings = Arc::new(DaemonSettingsStore::open(settings_path).unwrap());
 
         let mut profile = AssistantProfile {
             id: uuid::Uuid::new_v4(),

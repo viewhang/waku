@@ -4,7 +4,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context as _, bail};
 use parking_lot::Mutex;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 pub use waku_protocol::settings::DaemonSettings;
 use waku_protocol::settings::{ModelService, ServiceModel};
@@ -12,7 +14,6 @@ use waku_protocol::settings::{ModelService, ServiceModel};
 pub struct DaemonSettingsStore {
     path: PathBuf,
     settings: Mutex<DaemonSettings>,
-    pub(crate) model_service_keys: crate::driver::assistant::ModelServiceKeys,
 }
 
 impl DaemonSettingsStore {
@@ -68,7 +69,6 @@ impl DaemonSettingsStore {
         Ok(Self {
             path,
             settings: Mutex::new(settings),
-            model_service_keys: Default::default(),
         })
     }
 
@@ -85,7 +85,7 @@ impl DaemonSettingsStore {
             .cloned()
     }
 
-    /// Older sessions still refer to the shared endpoint credential by URL
+    /// Older sessions still refer to a model service by URL
     pub fn legacy_model_service(&self, assistant: Uuid, base_url: &str) -> Option<ModelService> {
         let base_url = base_url.trim().trim_end_matches('/');
         let settings = self.settings.lock();
@@ -138,26 +138,130 @@ impl DaemonSettingsStore {
         {
             anyhow::bail!("Invalid token limits for {}", model.id);
         }
+        let endpoint = crate::driver::assistant::service_url(&service.base_url)?;
+        let key = key.map(str::trim);
+        if key.is_some_and(|key| !key.bytes().all(|byte| byte.is_ascii_graphic())) {
+            bail!("The API key must be a single token");
+        }
         let mut current = self.settings.lock();
         let mut next = current.clone();
         let saved = next
             .model_services
             .iter_mut()
             .find(|item| item.id == service.id);
-        service.legacy_key = key != Some("")
-            && saved
-                .as_ref()
-                .is_some_and(|item| item.legacy_key && item.base_url == service.base_url);
+        let endpoint_changed = saved.as_ref().is_some_and(|item| {
+            crate::driver::assistant::service_url(&item.base_url)
+                .map_or(true, |previous| previous != endpoint)
+        });
+        service.legacy_key = saved
+            .as_ref()
+            .is_some_and(|item| item.legacy_key && !endpoint_changed);
         if let Some(saved) = saved {
             *saved = service.clone();
         } else {
             next.model_services.push(service.clone());
         }
-        self.model_service_keys
-            .commit(&service, key, || write_atomic(&self.path, &next))?;
+        if let Some(key) = key.or(endpoint_changed.then_some("")) {
+            let mut database = open_model_service_key_db(&self.path)
+                .context("Could not open the local API key store")?;
+            let transaction = database.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if key.is_empty() {
+                transaction.execute(
+                    "DELETE FROM model_service_keys WHERE service_id = ?1",
+                    [service.id.to_string()],
+                )?;
+            } else {
+                transaction.execute(
+                    "INSERT INTO model_service_keys (service_id, endpoint, api_key)
+                     VALUES (?1, ?2, ?3) ON CONFLICT(service_id) DO UPDATE SET
+                     endpoint = excluded.endpoint, api_key = excluded.api_key",
+                    params![service.id.to_string(), endpoint.as_str(), key],
+                )?;
+            }
+            // Settings write failure rolls the credential back with the SQLite transaction
+            write_atomic(&self.path, &next)?;
+            if let Err(error) = transaction.commit() {
+                write_atomic(&self.path, &current)
+                    .context("Could not restore the model service settings")?;
+                return Err(error.into());
+            }
+        } else {
+            write_atomic(&self.path, &next)?;
+        }
         *current = next;
         Ok(service)
     }
+
+    /// Read only the credential saved for the service's current endpoint
+    pub(crate) fn model_service_key(
+        &self,
+        id: Uuid,
+        endpoint: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let path = DaemonSettings::model_service_key_db_path(&self.path);
+        if !path.try_exists()? {
+            return Ok(None);
+        }
+        let database = Connection::open_with_flags(
+            resolved_key_db_path(&path)?,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        database
+            .query_row(
+                "SELECT api_key FROM model_service_keys WHERE service_id = ?1 AND endpoint = ?2",
+                params![id.to_string(), endpoint],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Could not read the saved API key")
+    }
+}
+
+/// Resolve system directory aliases before SQLite rejects symlinks in the database path
+fn resolved_key_db_path(path: &Path) -> io::Result<PathBuf> {
+    let parent = path.parent().expect("credential database has a parent");
+    Ok(parent.canonicalize()?.join(
+        path.file_name()
+            .expect("credential database has a filename"),
+    ))
+}
+
+/// Create the plaintext credential file with owner-only permissions before SQLite writes to it
+fn open_model_service_key_db(settings_path: &Path) -> anyhow::Result<Connection> {
+    let path = DaemonSettings::model_service_key_db_path(settings_path);
+    let directory = path.parent().expect("credential database has a parent");
+    crate::fs_ext::create_private_dir_all(directory)?;
+    if !fs::symlink_metadata(directory)?.is_dir() {
+        bail!("The model service credentials directory must be a local directory");
+    }
+    crate::fs_ext::restrict_to_owner(directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    let database = Connection::open_with_flags(
+        resolved_key_db_path(&path)?,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    database.execute_batch(
+        "PRAGMA secure_delete = ON;
+         CREATE TABLE IF NOT EXISTS model_service_keys (
+             service_id TEXT PRIMARY KEY NOT NULL,
+             endpoint TEXT NOT NULL,
+             api_key TEXT NOT NULL
+         );",
+    )?;
+    Ok(database)
 }
 
 /// Move legacy endpoint and model pairs into shared services on first load
@@ -226,6 +330,128 @@ fn to_io_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stores_model_keys_locally_and_scopes_them_to_the_exact_endpoint() {
+        let directory = std::env::temp_dir().join(format!("waku-model-keys-{}", Uuid::new_v4()));
+        let path = directory.join("settings.json");
+        let mut service = ModelService {
+            id: Uuid::new_v4(),
+            name: "Test service".into(),
+            base_url: "https://models.example/v1/".into(),
+            enabled: true,
+            models: Vec::new(),
+            legacy_key: false,
+        };
+        let initial_endpoint = "https://models.example/v1";
+        let replacement_endpoint = "https://other.example/v1";
+
+        let store = DaemonSettingsStore::open(path.clone()).unwrap();
+        assert_eq!(
+            store
+                .model_service_key(service.id, initial_endpoint)
+                .unwrap(),
+            None
+        );
+        store
+            .save_model_service(service.clone(), Some("fixture-model-key"))
+            .unwrap();
+        drop(store);
+
+        let store = DaemonSettingsStore::open(path.clone()).unwrap();
+        assert_eq!(
+            store
+                .model_service_key(service.id, initial_endpoint)
+                .unwrap()
+                .as_deref(),
+            Some("fixture-model-key"),
+        );
+        assert_eq!(
+            store
+                .model_service_key(service.id, replacement_endpoint)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .model_service_key(Uuid::new_v4(), initial_endpoint)
+                .unwrap(),
+            None
+        );
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("fixture-model-key")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let db = DaemonSettings::model_service_key_db_path(&path);
+            assert_eq!(
+                fs::metadata(&db).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(db.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+
+        // Force a settings write failure after the credential transaction has started
+        let blocked_write = path.with_extension("json.tmp");
+        fs::create_dir(&blocked_write).unwrap();
+        assert!(
+            store
+                .save_model_service(service.clone(), Some("unsaved-key"))
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .model_service_key(service.id, initial_endpoint)
+                .unwrap()
+                .as_deref(),
+            Some("fixture-model-key"),
+        );
+        fs::remove_dir(blocked_write).unwrap();
+
+        service.base_url = replacement_endpoint.into();
+        store.save_model_service(service.clone(), None).unwrap();
+        assert_eq!(
+            store
+                .model_service_key(service.id, initial_endpoint)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .model_service_key(service.id, replacement_endpoint)
+                .unwrap(),
+            None
+        );
+        store
+            .save_model_service(service.clone(), Some("rotated-key"))
+            .unwrap();
+        assert_eq!(
+            store
+                .model_service_key(service.id, replacement_endpoint)
+                .unwrap()
+                .as_deref(),
+            Some("rotated-key"),
+        );
+        store.save_model_service(service.clone(), Some("")).unwrap();
+        assert_eq!(
+            store
+                .model_service_key(service.id, replacement_endpoint)
+                .unwrap(),
+            None
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn migrates_assistants_to_one_service_per_legacy_endpoint() {
