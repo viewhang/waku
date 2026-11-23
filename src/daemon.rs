@@ -70,6 +70,24 @@ fn daemon_executable_path() -> anyhow::Result<PathBuf> {
     let executable = format!("waku-daemon{}", std::env::consts::EXE_SUFFIX);
     let current = std::env::current_exe().context("could not locate the Waku executable")?;
 
+    // Finder launches the debug bundle without the development script's environment
+    // Keep it on the same signed daemon so the supervisor can hot-reload it
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    if let Some(directory) = current
+        .ancestors()
+        .find(|path| path.extension().is_some_and(|extension| extension == "app"))
+        .and_then(std::path::Path::parent)
+    {
+        let daemon = directory.join("signed-daemon/waku-debug-daemon");
+        if !daemon.is_file() {
+            bail!(
+                "Signed Waku debug daemon is missing at {}. Run bun ./scripts/dev.ts to rebuild it",
+                daemon.display()
+            );
+        }
+        return Ok(daemon);
+    }
+
     // Development keeps the daemon beside Cargo's debug artifacts rather than
     // inside Waku Debug.app. The supervisor watches this file and swaps only
     // the daemon when the development watcher relinks it.

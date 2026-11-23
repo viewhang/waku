@@ -15,9 +15,7 @@ const appPath = isMacOS
   : join(targetDir, `debug/waku${executableSuffix}`);
 const daemonPath = join(
   targetDir,
-  isMacOS
-    ? "debug/signed-daemon/waku-debug-daemon"
-    : `debug/waku-debug-daemon${executableSuffix}`,
+  `debug/waku-debug-daemon${executableSuffix}`,
 );
 const watchedDirectories = [
   "src",
@@ -372,7 +370,8 @@ function launchApp(): ReturnType<typeof Bun.spawn> {
   const command = isMacOS ? ["open", "-n", "-W", appPath] : [appPath];
   const launchedApp = Bun.spawn(command, {
     cwd: root,
-    env: { ...process.env, WAKU_DAEMON_PATH: daemonPath },
+    // The macOS bundle resolves the signed daemon beside itself, as in Finder
+    env: isMacOS ? process.env : { ...process.env, WAKU_DAEMON_PATH: daemonPath },
     stdout: "inherit",
     stderr: "inherit",
   });
