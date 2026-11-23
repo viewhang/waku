@@ -4,6 +4,7 @@ mod request;
 mod transport;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::attachments::AttachmentStore;
@@ -373,10 +374,15 @@ fn redacted_error(error: anyhow::Error, key: &str) -> String {
 enum Control {
     Prompt(String, Vec<MessageAttachment>),
     Cancel,
+    ClearContext,
 }
 
 /// Closing the last handle drops the channel and cancels any active model stream
-struct AssistantDriver(mpsc::UnboundedSender<Control>);
+struct AssistantDriver {
+    commands: mpsc::UnboundedSender<Control>,
+    /// Counts a queued prompt as busy before the worker starts its request
+    busy: Arc<AtomicBool>,
+}
 
 impl DriverControl for AssistantDriver {
     fn prompt(&self, prompt: String) {
@@ -384,11 +390,20 @@ impl DriverControl for AssistantDriver {
     }
 
     fn prompt_with_attachments(&self, prompt: String, attachments: Vec<MessageAttachment>) {
-        let _ = self.0.send(Control::Prompt(prompt, attachments));
+        self.busy.store(true, Ordering::Release);
+        let _ = self.commands.send(Control::Prompt(prompt, attachments));
     }
 
     fn cancel(&self) {
-        let _ = self.0.send(Control::Cancel);
+        let _ = self.commands.send(Control::Cancel);
+    }
+
+    fn assistant_context_is_idle(&self) -> bool {
+        self.commands.is_closed() || !self.busy.load(Ordering::Acquire)
+    }
+
+    fn clear_assistant_context(&self) {
+        let _ = self.commands.send(Control::ClearContext);
     }
 
     fn respond(&self, _: String, _: String) {}
@@ -425,16 +440,29 @@ pub(crate) fn start(
         })
         .collect();
     let (tx, rx) = mpsc::unbounded_channel();
+    let busy = Arc::new(AtomicBool::new(false));
+    let worker_busy = busy.clone();
     std::thread::Builder::new()
         .name("waku-assistant".into())
         .spawn(move || {
-            if let Err(error) = run(profile, settings, attachments, history, rx, &events) {
+            if let Err(error) = run(
+                profile,
+                settings,
+                attachments,
+                history,
+                rx,
+                &worker_busy,
+                &events,
+            ) {
                 let _ = events.send(DriverEvent::Error(error.to_string()));
                 let _ = events.send(DriverEvent::ProcessExited);
             }
         })
         .context("Could not start the assistant worker")?;
-    Ok(DriverHandle::from_control(Arc::new(AssistantDriver(tx))))
+    Ok(DriverHandle::from_control(Arc::new(AssistantDriver {
+        commands: tx,
+        busy,
+    })))
 }
 
 /// Resolve each turn against current settings so disabling a service also stops reuse
@@ -467,6 +495,7 @@ fn run(
     attachments: AttachmentStore,
     mut history: Vec<RigMessage>,
     mut commands: mpsc::UnboundedReceiver<Control>,
+    busy: &AtomicBool,
     events: &DriverEventSender,
 ) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -476,8 +505,13 @@ fn run(
         let http = http_client()?;
         let legacy_options = ServiceModelOptions::default();
         while let Some(command) = commands.recv().await {
-            let Control::Prompt(prompt, input) = command else {
-                continue;
+            let (prompt, input) = match command {
+                Control::Prompt(prompt, input) => (prompt, input),
+                Control::ClearContext => {
+                    history.clear();
+                    continue;
+                }
+                Control::Cancel => continue,
             };
             let _ = events.send(DriverEvent::TurnStarted);
             let request = async {
@@ -533,12 +567,14 @@ fn run(
             let result = tokio::select! {
                 result = tokio::time::timeout(TURN_TIMEOUT, request) => result,
                 command = commands.recv() => {
+                    busy.store(false, Ordering::Release);
                     if command.is_none() {
                         break;
                     }
                     continue;
                 }
             };
+            busy.store(false, Ordering::Release);
             match result {
                 Ok(Ok((summary, messages))) => {
                     history.extend(messages);
@@ -565,7 +601,7 @@ fn run(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -730,7 +766,7 @@ mod tests {
         std::fs::remove_dir_all(project).unwrap();
     }
 
-    fn mock_service(name: &str, model: &str) -> (TcpListener, ModelService) {
+    pub(crate) fn mock_service(name: &str, model: &str) -> (TcpListener, ModelService) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let service = ModelService {
             id: uuid::Uuid::new_v4(),
@@ -743,7 +779,7 @@ mod tests {
         (listener, service)
     }
 
-    fn request(
+    pub(crate) fn request(
         listener: &TcpListener,
     ) -> (
         std::net::TcpStream,
@@ -793,7 +829,7 @@ mod tests {
         ).unwrap();
     }
 
-    fn stream(socket: std::net::TcpStream, delta: serde_json::Value, finish: &str) {
+    pub(crate) fn stream(socket: std::net::TcpStream, delta: serde_json::Value, finish: &str) {
         send(
             socket,
             "text/event-stream",

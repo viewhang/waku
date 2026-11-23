@@ -968,6 +968,9 @@ pub struct AgentSession {
     /// Native sessions retain the configuration chosen when they were created
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant: Option<crate::settings::AssistantProfile>,
+    /// Completed assistant chat boundaries retained as transcript dividers
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assistant_context_resets: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub runtime_mode: RuntimeMode,
@@ -1053,6 +1056,7 @@ impl AgentSession {
             provider,
             assistant_id: None,
             assistant: None,
+            assistant_context_resets: Vec::new(),
             model: None,
             runtime_mode: RuntimeMode::FullAccess,
             reasoning_effort: None,
@@ -1092,6 +1096,7 @@ impl AgentSession {
             provider: self.provider,
             assistant_id: self.assistant_profile_id(),
             assistant: None,
+            assistant_context_resets: self.assistant_context_resets.clone(),
             model: self.model.clone(),
             runtime_mode: RuntimeMode::default(),
             reasoning_effort: None,
@@ -1125,6 +1130,17 @@ impl AgentSession {
             .as_ref()
             .map(|profile| profile.id)
             .or(self.assistant_id)
+    }
+
+    /// Clear only at a settled turn with no follow-up already queued
+    pub fn assistant_context_clear_target(&self) -> Option<Uuid> {
+        let turn = self.turns.last()?;
+        (self.provider == ProviderKind::Assistant
+            && !self.is_busy()
+            && self.queued_messages.is_empty()
+            && turn.status != TurnStatus::Running
+            && self.assistant_context_resets.last() != Some(&turn.id))
+        .then_some(turn.id)
     }
 
     /// Derives [`Self::last_reply_at`] from the turn history when it is not
@@ -1583,6 +1599,8 @@ impl AgentSession {
             .map(|turn| turn.id)
             .collect::<std::collections::HashSet<_>>();
         self.turns.truncate(turn_count);
+        self.assistant_context_resets
+            .retain(|turn_id| retained.contains(turn_id));
         self.messages.retain(|message| {
             message
                 .turn_id
@@ -1621,6 +1639,9 @@ impl AgentSession {
 
         for turn in &mut fork.turns {
             turn.id = turn_ids[&turn.id];
+        }
+        for turn_id in &mut fork.assistant_context_resets {
+            *turn_id = turn_ids[turn_id];
         }
         for message in &mut fork.messages {
             message.id = Uuid::new_v4();

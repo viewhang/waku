@@ -1246,6 +1246,7 @@ impl StateStore {
         session.queued_messages = stored.queued_messages;
         session.workspace = stored.workspace;
         session.assistant = stored.assistant;
+        session.assistant_context_resets = stored.assistant_context_resets;
         session.provider_cursor = stored.provider_cursor;
         session.runtime_mode = stored.runtime_mode;
         session.reasoning_effort = stored.reasoning_effort;
@@ -1532,6 +1533,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         provider: serde_json::from_value(serde_json::Value::String(provider)).ok()?,
         assistant_id: assistant_id.and_then(|id| Uuid::parse_str(&id).ok()),
         assistant: None,
+        assistant_context_resets: Vec::new(),
         model,
         // Hydration replaces these; the list never reads them.
         runtime_mode: RuntimeMode::default(),

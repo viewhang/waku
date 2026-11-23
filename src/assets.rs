@@ -41,6 +41,7 @@ const ICONS: &[(&str, &[u8])] = icons![
     "cursor-spark",
     "download",
     "ellipsis",
+    "eraser",
     "eye",
     "eye-off",
     "external-link",

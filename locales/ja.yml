@@ -610,6 +610,9 @@ user_input.submit: 送信
 user_input.progress: "%{current} / %{total}"
 composer.preparing_task: タスクを準備中…
 composer.queue_followup: フォローアップとしてキューに追加（⏎）
+composer.clear_context: コンテキストをクリア
+composer.clear_context_failed: "コンテキストをクリアできませんでした：%{error}"
+transcript.context_cleared: コンテキストをクリアしました
 composer.message: メッセージ
 composer.queue_placeholder: フォローアップを追加…
 composer.prompt_placeholder: Waku に作業を依頼…

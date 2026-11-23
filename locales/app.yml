@@ -1191,6 +1191,10 @@ composer.preparing_task:
   en: Preparing task…
 composer.queue_followup:
   en: Queue as follow-up (⏎)
+composer.clear_context:
+  en: Clear context
+composer.clear_context_failed:
+  en: "Could not clear context: %{error}"
 composer.message:
   en: Message
 composer.queue_placeholder:
@@ -1877,6 +1881,8 @@ transcript.worked_for:
   en: Worked for %{duration}
 transcript.assistant_activity:
   en: Activity · %{duration}
+transcript.context_cleared:
+  en: Context cleared
 transcript.you_stopped_after:
   en: You stopped after %{duration}
 transcript.working_for:

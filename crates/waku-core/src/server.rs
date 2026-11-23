@@ -793,6 +793,7 @@ fn command_targets_runtime(command: &Command) -> bool {
             | Command::Fork { .. }
             | Command::ForkSessionFromResponse { .. }
             | Command::RewindSessionToMessage { .. }
+            | Command::ClearAssistantContext { .. }
             | Command::OpenTerminal { .. }
             | Command::WriteTerminal { .. }
             | Command::ResizeTerminal { .. }
@@ -861,6 +862,7 @@ fn run_runtime_mailbox(
                     active_runtime_id = None;
                 }
             } else if active_runtime_id.is_none()
+                && !runtime_id.is_nil()
                 && !matches!(
                     &handled.outcome,
                     ResponseOutcome::Ok {
@@ -1002,7 +1004,8 @@ fn task_catalog_action(command: &Command) -> TaskCatalogAction {
         },
         Command::RemoveSession
         | Command::ForkSessionFromResponse { .. }
-        | Command::RewindSessionToMessage { .. } => TaskCatalogAction::Changed,
+        | Command::RewindSessionToMessage { .. }
+        | Command::ClearAssistantContext { .. } => TaskCatalogAction::Changed,
         _ => TaskCatalogAction::None,
     }
 }
@@ -1365,6 +1368,179 @@ mod tests {
 
         stale_client.shutdown();
         server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn assistant_context_reset_survives_reopen_and_excludes_old_model_history() {
+        use crate::driver::assistant::tests::{mock_service, request, stream};
+        use crate::model::{MessageRole, TurnStatus};
+        use waku_protocol::settings::AssistantProfile;
+
+        let root = std::env::temp_dir().join(format!("waku-clear-context-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let open_backend = || {
+            WakuBackend::new(
+                DaemonSettingsStore::open(root.join("settings.json")).unwrap(),
+                StateStore::daemon(root.join("app.db")),
+            )
+            .unwrap()
+        };
+        let (listener, service) = mock_service("Test provider", "test-chat");
+        let mock_provider = std::thread::spawn(move || {
+            for expected in [
+                vec!["Test preamble", "first new prompt"],
+                vec![
+                    "Test preamble",
+                    "first new prompt",
+                    "reply",
+                    "second new prompt",
+                ],
+            ] {
+                let (socket, _, body, _) = request(&listener);
+                let text = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|message| {
+                        let content = &message["content"];
+                        content
+                            .as_str()
+                            .or_else(|| content[0]["text"].as_str())
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(text, expected);
+                stream(socket, json!({"content": "reply"}), "stop");
+            }
+        });
+
+        let project = Project::from_path(root.clone());
+        let mut session = AgentSession::new(project.id, ProviderKind::Assistant);
+        let session_id = session.id;
+        let turn_id = session.begin_turn("old context");
+        session.push_message(MessageRole::Assistant, "old answer");
+        session.finish_active_turn(TurnStatus::Completed);
+        let profile = AssistantProfile {
+            id: Uuid::new_v4(),
+            name: "Test assistant".into(),
+            system_prompt: "Test preamble".into(),
+            model: "test-chat".into(),
+            model_service_id: None,
+            base_url: service.base_url,
+        };
+        session.assistant = Some(profile.clone());
+
+        let hub = Arc::new(Hub::default());
+        let (outgoing, events) = unbounded();
+        hub.subscribe(&[], Subscriber::new(outgoing).0);
+        let call = |backend: &WakuBackend, runtime_id, command| {
+            backend
+                .handle(
+                    Request {
+                        request_id: Uuid::new_v4(),
+                        session_id,
+                        runtime_id,
+                        command,
+                    },
+                    hub.event_sink(session_id, runtime_id),
+                )
+                .unwrap()
+        };
+        let save = |backend: &WakuBackend, session: &AgentSession| {
+            call(
+                backend,
+                Uuid::nil(),
+                Command::SaveTaskState {
+                    projects: vec![project.clone()],
+                    live_session_ids: vec![session_id],
+                    sessions: vec![session.clone()],
+                },
+            )
+        };
+        let start = |backend: &WakuBackend, runtime_id| {
+            hub.begin_runtime(session_id, runtime_id);
+            call(
+                backend,
+                runtime_id,
+                Command::Start {
+                    options: WireDriverStartOptions {
+                        assistant: Some(profile.clone()),
+                        provider: "assistant".into(),
+                        binary: PathBuf::new(),
+                        cwd: root.clone(),
+                        mode: "fullAccess".into(),
+                        model: None,
+                        reasoning_effort: None,
+                        service_tier: None,
+                        context_window: None,
+                        agent_preset: None,
+                        computer_use_enabled: false,
+                        provider_cursor: None,
+                    },
+                },
+            )
+        };
+        let prompt = |backend: &WakuBackend, runtime_id, prompt: &str| {
+            call(
+                backend,
+                runtime_id,
+                Command::Prompt {
+                    prompt: prompt.into(),
+                    turn_id: None,
+                    message_id: None,
+                    attachments: Vec::new(),
+                },
+            );
+            loop {
+                if let ServerMessage::Event(event) =
+                    events.recv_timeout(Duration::from_secs(5)).unwrap()
+                    && event.event.kind == "turnFinished"
+                {
+                    assert_eq!(event.event.payload["success"], true);
+                    break;
+                }
+            }
+        };
+
+        let backend = open_backend();
+        let runtime_id = Uuid::new_v4();
+        save(&backend, &session);
+        start(&backend, runtime_id);
+        for _ in 0..2 {
+            call(
+                &backend,
+                Uuid::nil(),
+                Command::ClearAssistantContext { turn_id },
+            );
+        }
+        prompt(&backend, runtime_id, "first new prompt");
+        session.begin_turn("first new prompt");
+        session.push_message(MessageRole::Assistant, "reply");
+        session.finish_active_turn(TurnStatus::Completed);
+        save(&backend, &session);
+        drop(backend);
+
+        let backend = open_backend();
+        let ResponsePayload::Session {
+            session: Some(restored),
+        } = call(
+            &backend,
+            Uuid::nil(),
+            Command::HydrateSession { session_id },
+        )
+        else {
+            panic!("expected saved assistant session");
+        };
+        assert_eq!(restored.assistant_context_resets, vec![turn_id]);
+        assert_eq!(restored.messages.len(), 4);
+        assert_eq!(restored.messages[0].content, "old context");
+        let new_runtime_id = Uuid::new_v4();
+        start(&backend, new_runtime_id);
+        prompt(&backend, new_runtime_id, "second new prompt");
+        mock_provider.join().unwrap();
+        drop(backend);
         std::fs::remove_dir_all(root).unwrap();
     }
 

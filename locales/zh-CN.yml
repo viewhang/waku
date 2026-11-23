@@ -581,6 +581,8 @@ user_input.submit: 提交
 user_input.progress: "%{current} / %{total}"
 composer.preparing_task: 正在准备任务…
 composer.queue_followup: 排队为后续消息（⏎）
+composer.clear_context: 清空上下文
+composer.clear_context_failed: "无法清空上下文：%{error}"
 composer.message: 消息
 composer.queue_placeholder: 添加后续消息…
 composer.prompt_placeholder: 让 Waku 构建些什么…
@@ -913,6 +915,7 @@ common.copy_named: 复制%{name}
 transcript.worked: 已完成
 transcript.worked_for: 用时 %{duration}
 transcript.assistant_activity: 过程记录 · %{duration}
+transcript.context_cleared: 已清空上下文
 transcript.you_stopped_after: 你在工作 %{duration} 后停止了
 transcript.working_for: 工作中 · %{duration}
 transcript.thinking: 正在思考

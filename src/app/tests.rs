@@ -1588,6 +1588,26 @@ fn response_footer_follows_trailing_tool_activity() {
     );
 }
 
+#[test]
+fn assistant_context_divider_follows_the_old_response_and_precedes_the_new_prompt() {
+    let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Assistant);
+    let turn_id = session.begin_turn("Old prompt");
+    session.push_message(MessageRole::Assistant, "Old reply");
+    session.finish_active_turn(TurnStatus::Completed);
+    session.assistant_context_resets.push(turn_id);
+    session.begin_turn("New prompt");
+    assert_eq!(
+        folded_transcript_row_kinds(&session, &HashSet::new()),
+        vec![
+            Message(0),
+            Message(1),
+            ResponseFooter(turn_id, 1),
+            AssistantContextCleared(turn_id),
+            Message(2)
+        ],
+    );
+}
+
 /// A blank part breaks the answer run the same way work does — the fold hides
 /// the text before it, so the copied message must leave that text out too.
 #[test]

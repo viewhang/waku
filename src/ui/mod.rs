@@ -500,6 +500,7 @@ mod tests {
             "icons/check.svg",
             "icons/copy.svg",
             "icons/rewind.svg",
+            "icons/eraser.svg",
             "icons/fork.svg",
             "icons/git-branch.svg",
             "icons/chart-column.svg",

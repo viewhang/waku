@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::ui::ActivationExt;
 use anyhow::Context as _;
 use base64::Engine as _;
 
@@ -2706,6 +2707,62 @@ impl Waku {
         )
     }
 
+    /// The daemon acknowledges the reset before the next prompt can leave the composer
+    fn clear_assistant_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((session_id, turn_id)) = self
+            .selected_session()
+            .and_then(|session| Some((session.id, session.assistant_context_clear_target()?)))
+        else {
+            return;
+        };
+        if !self.assistant_context_resets_pending.insert(session_id) {
+            return;
+        }
+        window.focus(&self.composer_focus(cx), cx);
+        let client = self.daemon.client();
+        cx.spawn(async move |waku, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    client.request(
+                        session_id,
+                        Uuid::nil(),
+                        waku_client::Command::ClearAssistantContext { turn_id },
+                    )
+                })
+                .await;
+            let _ = waku.update(cx, |waku, cx| {
+                waku.assistant_context_resets_pending.remove(&session_id);
+                match result {
+                    Ok(waku_client::ResponsePayload::Ack) => {
+                        if let Some(session) = waku
+                            .state
+                            .sessions
+                            .iter_mut()
+                            .find(|session| session.id == session_id)
+                            && !session.assistant_context_resets.contains(&turn_id)
+                        {
+                            session.assistant_context_resets.push(turn_id);
+                        }
+                        if waku.state.selected_session == Some(session_id) {
+                            waku.scroll_transcript_to_bottom(cx);
+                        }
+                    }
+                    result => {
+                        let error = result.err().map_or_else(
+                            || tr!("assistant.invalid_response"),
+                            |error| error.to_string(),
+                        );
+                        waku.show_toast(tr!("composer.clear_context_failed", error = error));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub(super) fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let theme = Theme::current(cx);
         let session = self.selected_session();
@@ -2724,7 +2781,9 @@ impl Waku {
         // Native sessions use the configured model even if no CLI is installed
         let native = session.is_some_and(|session| session.provider == ProviderKind::Assistant);
         let no_providers = !native && self.model_picker_has_no_providers();
-        let can_send = has_draft && !no_providers;
+        let resetting_context = session
+            .is_some_and(|session| self.assistant_context_resets_pending.contains(&session.id));
+        let can_send = has_draft && !no_providers && !resetting_context;
         let (autocomplete, autocomplete_actionable) =
             match self.render_composer_autocomplete(window, cx) {
                 Some((element, actionable)) => (Some(element), actionable),
@@ -2805,6 +2864,43 @@ impl Waku {
                         .children(self.render_agent_preset_control(cx))
                         .when(!native, |row| row.child(self.render_access_control(cx)))
                         .children(self.render_goal_control(cx))
+                        .when(native, |row| {
+                            let enabled = !resetting_context
+                                && session
+                                    .and_then(AgentSession::assistant_context_clear_target)
+                                    .is_some();
+                            let focus =
+                                self.transcript_control_focus("clear-assistant-context", cx);
+                            row.child(
+                                div()
+                                    .id("clear-assistant-context")
+                                    .size(px(26.0))
+                                    .rounded(px(6.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(icon(
+                                        "icons/eraser.svg",
+                                        14.0,
+                                        if enabled {
+                                            theme.text_secondary
+                                        } else {
+                                            theme.text_tertiary
+                                        },
+                                    ))
+                                    .track_focus(&focus)
+                                    .tab_index(0)
+                                    .tab_stop(true)
+                                    .focus_visible(|style| style.bg(theme.overlay_strong))
+                                    .tooltip(Tooltip::text(tr!("composer.clear_context")))
+                                    .when(enabled, |button| {
+                                        button
+                                            .hover(|element| element.bg(theme.overlay))
+                                            .active(|element| element.bg(theme.overlay_strong))
+                                            .on_activation(cx, Self::clear_assistant_context)
+                                    }),
+                            )
+                        })
                         .child(div().flex_1())
                         .child(match submit_action {
                             ComposerSubmitAction::Preparing => div()

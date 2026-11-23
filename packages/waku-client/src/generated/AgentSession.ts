@@ -36,7 +36,11 @@ assistant_id?: string | null,
 /**
  * Native sessions retain the configuration chosen when they were created
  */
-assistant?: AssistantProfile | null, model?: string | null, runtime_mode: RuntimeMode, reasoning_effort?: string | null, service_tier?: string | null,
+assistant?: AssistantProfile | null,
+/**
+ * Completed assistant chat boundaries retained as transcript dividers
+ */
+assistant_context_resets?: Array<string>, model?: string | null, runtime_mode: RuntimeMode, reasoning_effort?: string | null, service_tier?: string | null,
 /**
  * Selected context window, when the provider exposes more than one.
  */

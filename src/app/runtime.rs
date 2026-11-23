@@ -143,6 +143,11 @@ pub(super) fn merge_remote_session_catalog(
             local.project_id = remote.project_id;
             local.provider = remote.provider;
             local.assistant_id = remote.assistant_id;
+            for turn_id in remote.assistant_context_resets {
+                if !local.assistant_context_resets.contains(&turn_id) {
+                    local.assistant_context_resets.push(turn_id);
+                }
+            }
             local.model = remote.model;
             local.created_at = remote.created_at;
             local.last_reply_at = remote.last_reply_at;
@@ -2901,6 +2906,10 @@ impl Waku {
         let Some(session) = self.selected_session() else {
             return;
         };
+        if self.assistant_context_resets_pending.contains(&session.id) {
+            self.restore_composer_submission(submission, cx);
+            return;
+        }
         if self.response_fork_preparations.contains_key(&session.id) {
             return;
         }

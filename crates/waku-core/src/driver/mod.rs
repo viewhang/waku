@@ -107,6 +107,14 @@ impl DriverHandle {
         self.inner.cancel();
     }
 
+    pub(crate) fn assistant_context_is_idle(&self) -> bool {
+        self.inner.assistant_context_is_idle()
+    }
+
+    pub(crate) fn clear_assistant_context(&self) {
+        self.inner.clear_assistant_context();
+    }
+
     pub fn cancel_computer_use(&self) {
         self.inner.cancel_computer_use();
     }
@@ -167,6 +175,10 @@ pub trait DriverControl: Send + Sync {
     /// `DriverEvent::SteerRejected`.
     fn steer(&self, _prompt: String) {}
     fn cancel(&self);
+    fn assistant_context_is_idle(&self) -> bool {
+        false
+    }
+    fn clear_assistant_context(&self) {}
     fn cancel_computer_use(&self) {}
     fn refresh_background_work(&self) {}
     fn stop_background_work(&self, _key: BackgroundWorkKey, _control_id: String) {}

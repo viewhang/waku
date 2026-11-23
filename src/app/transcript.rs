@@ -421,6 +421,8 @@ pub(super) enum TranscriptRowKind {
     /// checkpoints. Responses with a footer render this inside that row; the
     /// standalone row remains for tool-only turns with nothing to copy.
     ChangedFiles(Uuid),
+    /// A persisted boundary between model contexts in the same assistant chat
+    AssistantContextCleared(Uuid),
     /// The live turn's footer — pulsing dots plus "Working for Ns". Present
     /// from the moment the prompt lands until the turn settles, so a provider
     /// that has not produced a chunk yet still shows visible progress, and a
@@ -633,6 +635,7 @@ pub(super) fn assistant_response_footer(
                 | TranscriptRowKind::TurnFold(_)
                 | TranscriptRowKind::ResponseFooter(_, _)
                 | TranscriptRowKind::ChangedFiles(_)
+                | TranscriptRowKind::AssistantContextCleared(_)
                 | TranscriptRowKind::WorkingIndicator => None,
             })
             .filter(|part| !part.content.trim().is_empty())
@@ -833,6 +836,10 @@ pub(super) fn transcript_rows_fingerprint(
     // driver error can drop the busy status without touching any turn — the
     // turn statuses below would hold still while the rows moved.
     hash = mix(hash, session.status.is_busy() as u64);
+    hash = mix(hash, session.assistant_context_resets.len() as u64);
+    for &turn_id in &session.assistant_context_resets {
+        hash = mix_uuid(hash, turn_id);
+    }
 
     hash = mix(hash, session.messages.len() as u64);
     for message in &session.messages {
@@ -999,32 +1006,38 @@ pub(super) fn folded_transcript_row_kinds(
     // visible row, which may be answer text, tool activity, or a collapsed work
     // disclosure. The message index supplies stable copy/fork identity without
     // deciding the footer's position.
-    if response_footers.is_empty() {
+    let context_resets = session
+        .assistant_context_resets
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    if response_footers.is_empty() && context_resets.is_empty() {
         return rows;
     }
 
     let mut last_row_by_turn = HashMap::new();
     for (index, row) in rows.iter().copied().enumerate() {
         if let Some(turn_id) = row_turn_id(session, row)
-            && response_footers.contains_key(&turn_id)
+            && (response_footers.contains_key(&turn_id) || context_resets.contains(&turn_id))
         {
             last_row_by_turn.insert(turn_id, index);
         }
     }
-    let footer_after_row = last_row_by_turn
+    let turn_after_row = last_row_by_turn
         .into_iter()
-        .filter_map(|(turn_id, index)| {
-            response_footers
-                .get(&turn_id)
-                .copied()
-                .map(|message_index| (index, (turn_id, message_index)))
-        })
+        .map(|(turn_id, index)| (index, turn_id))
         .collect::<HashMap<_, _>>();
-    let mut with_footers = Vec::with_capacity(rows.len() + footer_after_row.len());
+    let mut with_footers =
+        Vec::with_capacity(rows.len() + response_footers.len() + context_resets.len());
     for (index, row) in rows.into_iter().enumerate() {
         with_footers.push(row);
-        if let Some((turn_id, message_index)) = footer_after_row.get(&index).copied() {
-            with_footers.push(TranscriptRowKind::ResponseFooter(turn_id, message_index));
+        if let Some(&turn_id) = turn_after_row.get(&index) {
+            if let Some(&message_index) = response_footers.get(&turn_id) {
+                with_footers.push(TranscriptRowKind::ResponseFooter(turn_id, message_index));
+            }
+            if context_resets.contains(&turn_id) {
+                with_footers.push(TranscriptRowKind::AssistantContextCleared(turn_id));
+            }
         }
     }
     with_footers
@@ -1076,6 +1089,7 @@ fn response_footer_message_index_from_rows(
         | TranscriptRowKind::TurnFold(_)
         | TranscriptRowKind::ResponseFooter(_, _)
         | TranscriptRowKind::ChangedFiles(_)
+        | TranscriptRowKind::AssistantContextCleared(_)
         | TranscriptRowKind::WorkingIndicator => None,
     })?;
     let message = session.messages.get(message_index)?;
@@ -1090,6 +1104,7 @@ fn response_footer_message_index_from_rows(
             | TranscriptRowKind::TurnFold(_)
             | TranscriptRowKind::ResponseFooter(_, _)
             | TranscriptRowKind::ChangedFiles(_)
+            | TranscriptRowKind::AssistantContextCleared(_)
             | TranscriptRowKind::WorkingIndicator => None,
         })
         .any(|message| !message.content.trim().is_empty())
@@ -1112,6 +1127,7 @@ fn turn_answer_start(session: &AgentSession, turn_rows: &[TranscriptRowKind]) ->
         | TranscriptRowKind::TurnFold(_)
         | TranscriptRowKind::ResponseFooter(_, _)
         | TranscriptRowKind::ChangedFiles(_)
+        | TranscriptRowKind::AssistantContextCleared(_)
         | TranscriptRowKind::WorkingIndicator => false,
     };
     let Some(last_part) = turn_rows.iter().rposition(is_answer_part) else {
@@ -1130,7 +1146,7 @@ fn row_turn_id(session: &AgentSession, row: TranscriptRowKind) -> Option<Uuid> {
         TranscriptRowKind::TurnFold(turn_id) => Some(turn_id),
         TranscriptRowKind::ResponseFooter(turn_id, _) => Some(turn_id),
         TranscriptRowKind::ChangedFiles(turn_id) => Some(turn_id),
-        TranscriptRowKind::WorkingIndicator => None,
+        TranscriptRowKind::AssistantContextCleared(_) | TranscriptRowKind::WorkingIndicator => None,
     }
 }
 
@@ -1146,7 +1162,7 @@ pub(super) fn response_row_turn_id(session: &AgentSession, row: TranscriptRowKin
                 .filter(|message| message.role == MessageRole::Assistant)?
                 .turn_id
         }
-        TranscriptRowKind::WorkingIndicator => None,
+        TranscriptRowKind::AssistantContextCleared(_) | TranscriptRowKind::WorkingIndicator => None,
         TranscriptRowKind::TurnBlock(_)
         | TranscriptRowKind::TurnFold(_)
         | TranscriptRowKind::ResponseFooter(_, _)

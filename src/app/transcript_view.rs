@@ -372,7 +372,7 @@ impl Waku {
             .into_any_element()
     }
 
-    fn scroll_transcript_to_bottom(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn scroll_transcript_to_bottom(&mut self, cx: &mut Context<Self>) {
         self.sync_transcript_rows();
         self.pin_transcript_to_tail();
         cx.notify();
@@ -1242,6 +1242,7 @@ impl Waku {
             | TranscriptRowKind::TurnFold(_)
             | TranscriptRowKind::ResponseFooter(_, _)
             | TranscriptRowKind::ChangedFiles(_)
+            | TranscriptRowKind::AssistantContextCleared(_)
             | TranscriptRowKind::WorkingIndicator => false,
         };
         let inner = match kind {
@@ -1381,6 +1382,26 @@ impl Waku {
             TranscriptRowKind::ChangedFiles(turn_id) => self
                 .render_changed_files_row(turn_id, &theme, cx)
                 .unwrap_or_else(|| div().into_any_element()),
+            TranscriptRowKind::AssistantContextCleared(_) => {
+                let rule = || {
+                    div()
+                        .flex_1()
+                        .border_t_1()
+                        .border_dashed()
+                        .border_color(theme.border)
+                };
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .text_size(sp(12.0))
+                    .text_color(theme.text_secondary)
+                    .child(rule())
+                    .child(tr!("transcript.context_cleared"))
+                    .child(rule())
+                    .into_any_element()
+            }
             TranscriptRowKind::WorkingIndicator => self.render_working_indicator_row(&theme),
         };
         let mut row = div()

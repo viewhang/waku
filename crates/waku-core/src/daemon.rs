@@ -418,6 +418,12 @@ impl Backend for WakuBackend {
                         ) {
                             merge_stale_session_metadata(existing, session);
                         } else {
+                            // Only the daemon can change reset boundaries, even if an older client saves last
+                            if existing.provider == ProviderKind::Assistant {
+                                self.task_store.hydrate(existing)?;
+                                session.assistant_context_resets =
+                                    existing.assistant_context_resets.clone();
+                            }
                             preserve_daemon_checkpoints(existing, &mut session);
                             *existing = session;
                         }
@@ -728,6 +734,41 @@ impl Backend for WakuBackend {
                     cleanup_warning,
                 })
             }
+            Command::ClearAssistantContext { turn_id } => {
+                let driver = self
+                    .sessions
+                    .lock()
+                    .get(&session_id)
+                    .map(|(_, driver)| driver.clone());
+                let mut state = self.task_state.lock();
+                let index = state
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == session_id)
+                    .context("Assistant session no longer exists")?;
+                let session = &mut state.sessions[index];
+                self.task_store.hydrate(session)?;
+                if session.assistant_context_resets.contains(&turn_id) {
+                    return Ok(ResponsePayload::Ack);
+                }
+                if session.assistant_context_clear_target() != Some(turn_id)
+                    || driver
+                        .as_ref()
+                        .is_some_and(|driver| !driver.assistant_context_is_idle())
+                {
+                    bail!("The assistant turn must be settled before clearing its context");
+                }
+                session.assistant_context_resets.push(turn_id);
+                state.mark_session_dirty(session_id);
+                if let Err(error) = self.task_store.save(&mut state) {
+                    state.sessions[index].assistant_context_resets.pop();
+                    return Err(error.into());
+                }
+                if let Some(driver) = driver {
+                    driver.clear_assistant_context();
+                }
+                Ok(ResponsePayload::Ack)
+            }
             Command::ForkProviderSession { request } => {
                 Ok(ResponsePayload::ProviderSessionForked {
                     result: fork_provider_session(request)?,
@@ -839,8 +880,15 @@ impl Backend for WakuBackend {
                         self.attachments.clone(),
                         stored
                             .map(|mut session| {
-                                let completed: HashSet<_> = session
-                                    .turns
+                                let first_turn =
+                                    session.assistant_context_resets.last().map_or(0, |id| {
+                                        session
+                                            .turns
+                                            .iter()
+                                            .position(|turn| turn.id == *id)
+                                            .map_or(session.turns.len(), |index| index + 1)
+                                    });
+                                let completed: HashSet<_> = session.turns[first_turn..]
                                     .iter()
                                     .filter(|turn| {
                                         turn.status == crate::model::TurnStatus::Completed
@@ -1880,6 +1928,7 @@ fn handle_driver_command(
         | Command::SweepBlobs
         | Command::ForkSessionFromResponse { .. }
         | Command::RewindSessionToMessage { .. }
+        | Command::ClearAssistantContext { .. }
         | Command::ForkProviderSession { .. }
         | Command::Workspace { .. }
         | Command::OpenTerminal { .. }

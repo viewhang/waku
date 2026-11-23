@@ -260,6 +260,10 @@ pub enum Command {
     RewindSessionToMessage {
         turn_count: usize,
     },
+    /// Reset model history at the last settled assistant turn
+    ClearAssistantContext {
+        turn_id: Uuid,
+    },
     ForkProviderSession {
         request: ProviderSessionForkRequest,
     },
