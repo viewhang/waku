@@ -1337,14 +1337,12 @@ pub struct Waku {
     /// Groups the user has folded in either sidebar view. This is
     /// intentionally runtime-only, like transcript disclosure state.
     sidebar_collapsed_groups: HashSet<SidebarGroup>,
-    /// Number of older sessions revealed inside each project section. This is
-    /// runtime-only so every launch starts with the recent three-day view.
-    sidebar_project_reveal_counts: HashMap<SidebarGroup, usize>,
-    /// Stable keyboard focus for each virtualized sidebar group header and
-    /// its hover-revealed New Task control.
+    /// Extra sessions revealed in each project or assistant group for this launch
+    sidebar_group_reveal_counts: HashMap<SidebarGroup, usize>,
+    /// Stable keyboard focus for each virtualized group header and New Task control
     sidebar_group_header_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
     sidebar_group_compose_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
-    /// Stable keyboard focus for each virtualized project-history reveal row.
+    /// Stable keyboard focus for each virtualized Show More row
     sidebar_show_more_focuses: RefCell<HashMap<SidebarGroup, FocusHandle>>,
     sidebar_visible: bool,
     sidebar_width: f32,
@@ -2895,7 +2893,7 @@ impl Waku {
                 session_rename: None,
                 session_rename_input,
                 sidebar_collapsed_groups: HashSet::new(),
-                sidebar_project_reveal_counts: HashMap::new(),
+                sidebar_group_reveal_counts: HashMap::new(),
                 sidebar_group_header_focuses: RefCell::new(HashMap::new()),
                 sidebar_group_compose_focuses: RefCell::new(HashMap::new()),
                 sidebar_show_more_focuses: RefCell::new(HashMap::new()),

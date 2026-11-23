@@ -1138,7 +1138,7 @@ impl StateStore {
         let mut sessions = connection
             .prepare(
                 "SELECT id, project_id, title, auto_title, provider, model, status,
-                        created_at, updated_at, last_reply_at
+                        created_at, updated_at, last_reply_at, assistant_id
                  FROM sessions ORDER BY updated_at",
             )
             .map_err(to_io_error)?;
@@ -1156,6 +1156,7 @@ impl StateStore {
                     row.get::<_, i64>(7)?,
                     row.get::<_, i64>(8)?,
                     row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             })
             .map_err(to_io_error)?
@@ -1500,6 +1501,7 @@ type SessionColumns = (
     i64,
     i64,
     Option<i64>,
+    Option<String>,
 );
 
 /// Builds a list-only session from its columns. `messages`,
@@ -1519,6 +1521,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         created_at,
         updated_at,
         last_reply_at,
+        assistant_id,
     ) = row;
     Some(AgentSession {
         id: Uuid::parse_str(&id).ok()?,
@@ -1527,6 +1530,7 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         project_id: Uuid::parse_str(&project_id).ok()?,
         workspace: SessionWorkspace::Local,
         provider: serde_json::from_value(serde_json::Value::String(provider)).ok()?,
+        assistant_id: assistant_id.and_then(|id| Uuid::parse_str(&id).ok()),
         assistant: None,
         model,
         // Hydration replaces these; the list never reads them.
@@ -1747,8 +1751,8 @@ fn message_fingerprint(message: &Message, position: usize) -> u64 {
 /// listing sessions never has to deserialize a transcript.
 const UPSERT_SESSION: &str = "INSERT INTO sessions(
          id, project_id, title, auto_title, provider, model, status,
-         created_at, updated_at, last_reply_at
-     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         created_at, updated_at, last_reply_at, assistant_id
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
      ON CONFLICT(id) DO UPDATE SET
          project_id    = excluded.project_id,
          title         = excluded.title,
@@ -1758,7 +1762,8 @@ const UPSERT_SESSION: &str = "INSERT INTO sessions(
          status        = excluded.status,
          created_at    = excluded.created_at,
          updated_at    = excluded.updated_at,
-         last_reply_at = excluded.last_reply_at";
+         last_reply_at = excluded.last_reply_at,
+         assistant_id  = excluded.assistant_id";
 
 const INSERT_PROJECT: &str = "INSERT INTO projects(id, name, path, position, created_at)
      VALUES(?1, ?2, ?3, ?4, ?5)
@@ -1797,6 +1802,9 @@ fn session_params(session: &AgentSession) -> Vec<rusqlite::types::Value> {
         session
             .last_reply_at
             .map_or(Value::Null, |at| Value::Integer(at as i64)),
+        session
+            .assistant_profile_id()
+            .map_or(Value::Null, |id| Value::Text(id.to_string())),
     ]
 }
 
@@ -2879,6 +2887,39 @@ mod tests {
             serde_json::from_slice(&fs::read(directory.join("state.json")).unwrap()).unwrap();
         assert_eq!(app_state["sidebar_width"], 333.0);
         fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn assistant_group_migration_reads_profile_id_from_older_session_details() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATIONS_TABLE).unwrap();
+        let (_, previous) = MIGRATIONS.split_last().unwrap();
+        for (tag, sql) in previous {
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute("INSERT INTO migrations VALUES (?1, 0)", params![tag])
+                .unwrap();
+        }
+        let assistant_id = Uuid::new_v4().to_string();
+        connection.execute_batch(
+            "INSERT INTO sessions (id, project_id, title, provider, status, created_at, updated_at)
+             VALUES ('old', 'project', 'Old assistant chat', 'assistant', 'idle', 0, 0);"
+        ).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_details VALUES ('old', ?1)",
+                params![serde_json::json!({"assistant": {"id": assistant_id}}).to_string()],
+            )
+            .unwrap();
+        assert_eq!(apply_migrations(&connection).unwrap(), 1);
+        let migrated: String = connection
+            .query_row(
+                "SELECT assistant_id FROM sessions WHERE id = 'old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated, assistant_id);
     }
 
     #[test]

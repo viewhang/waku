@@ -225,6 +225,15 @@ impl Waku {
         }
         self.refresh_composer_sources(cx);
         self.reset_transcript_rows(self.transcript_row_count());
+        if session_changed
+            && self.selected_session().is_some_and(|session| {
+                session.provider == ProviderKind::Assistant
+                    || (!session.has_started()
+                        && self.state.sidebar_grouping == SidebarGrouping::Project)
+            })
+        {
+            self.reveal_sidebar_session(session_id);
+        }
         self.save();
         if self
             .selected_session()

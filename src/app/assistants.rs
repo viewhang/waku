@@ -70,6 +70,16 @@ impl AssistantForm {
 }
 
 impl Waku {
+    pub(super) fn open_new_assistant_settings(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings_page(SettingsPage::Assistants, cx);
+        self.assistant_form.load(None, cx);
+        window.focus(&self.assistant_form.name.read(cx).focus_handle(cx), cx);
+    }
+
     pub(super) fn render_assistants_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
         let form = &self.assistant_form;
@@ -621,7 +631,7 @@ impl Waku {
         cx.notify();
     }
 
-    fn start_assistant(
+    pub(super) fn start_assistant(
         &mut self,
         profile: AssistantProfile,
         window: &mut Window,
@@ -649,6 +659,8 @@ impl Waku {
     ) {
         let mut session = AgentSession::new(project_id, ProviderKind::Assistant);
         session.auto_title = Some(profile.name.clone());
+        session.assistant_id = Some(profile.id);
+        self.set_sidebar_group_collapsed(SidebarGroup::Assistant(profile.id), false, cx);
         session.model = Some(profile.model.clone());
         session.runtime_mode = RuntimeMode::Ask;
         session.assistant = Some(profile);

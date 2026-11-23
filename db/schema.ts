@@ -34,6 +34,8 @@ export const sessions = sqliteTable(
     /** Provider-generated title, with the first prompt as a local fallback. */
     autoTitle: text("auto_title"),
     provider: text("provider").notNull(),
+    /** Assistant group identity available before transcript hydration */
+    assistantId: text("assistant_id"),
     model: text("model"),
     status: text("status").notNull(),
     /** Session creation time, unix seconds. */

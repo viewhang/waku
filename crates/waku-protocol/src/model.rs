@@ -962,6 +962,9 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "SessionWorkspace::is_local")]
     pub workspace: SessionWorkspace,
     pub provider: ProviderKind,
+    /// Assistant group identity available before its configuration is hydrated
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<Uuid>,
     /// Native sessions retain the configuration chosen when they were created
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant: Option<crate::settings::AssistantProfile>,
@@ -1048,6 +1051,7 @@ impl AgentSession {
             project_id,
             workspace: SessionWorkspace::Local,
             provider,
+            assistant_id: None,
             assistant: None,
             model: None,
             runtime_mode: RuntimeMode::FullAccess,
@@ -1086,6 +1090,7 @@ impl AgentSession {
             project_id: self.project_id,
             workspace: SessionWorkspace::Local,
             provider: self.provider,
+            assistant_id: self.assistant_profile_id(),
             assistant: None,
             model: self.model.clone(),
             runtime_mode: RuntimeMode::default(),
@@ -1113,6 +1118,13 @@ impl AgentSession {
 
     pub fn is_busy(&self) -> bool {
         self.status.is_busy()
+    }
+
+    pub fn assistant_profile_id(&self) -> Option<Uuid> {
+        self.assistant
+            .as_ref()
+            .map(|profile| profile.id)
+            .or(self.assistant_id)
     }
 
     /// Derives [`Self::last_reply_at`] from the turn history when it is not

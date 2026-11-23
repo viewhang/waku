@@ -1074,6 +1074,7 @@ assistant.model: 模型 ID
 assistant.prompt: 系统提示词
 assistant.save: 保存助手
 assistant.new: 新建助手
+assistant.no_conversations: 暂无会话
 assistant.edit: 编辑
 assistant.start: 新建任务
 assistant.fields_required: 请输入助手名称

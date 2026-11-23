@@ -30,6 +30,10 @@ auto_title?: string | null, project_id: string,
  */
 workspace?: SessionWorkspace, provider: ProviderKind,
 /**
+ * Assistant group identity available before its configuration is hydrated
+ */
+assistant_id?: string | null,
+/**
  * Native sessions retain the configuration chosen when they were created
  */
 assistant?: AssistantProfile | null, model?: string | null, runtime_mode: RuntimeMode, reasoning_effort?: string | null, service_tier?: string | null,
