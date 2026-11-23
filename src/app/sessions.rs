@@ -167,6 +167,7 @@ impl Waku {
     }
 
     fn activate_session(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        self.leave_translation();
         let session_changed = self.state.selected_session != Some(session_id);
         if session_changed {
             self.capture_and_save_current_composer_draft(cx);
@@ -695,9 +696,15 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         if self.settings_page.take().is_some() {
-            let focus_handle = self.composer_focus(cx);
+            let focus_handle = self
+                .translation_source_focus(cx)
+                .unwrap_or_else(|| self.composer_focus(cx));
             window.focus(&focus_handle, cx);
             cx.notify();
+            return;
+        }
+        if self.translation_is_open() {
+            self.close_translation(window, cx);
             return;
         }
 
@@ -763,7 +770,9 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         self.settings_page = None;
-        let focus_handle = self.composer_focus(cx);
+        let focus_handle = self
+            .translation_source_focus(cx)
+            .unwrap_or_else(|| self.composer_focus(cx));
         window.focus(&focus_handle, cx);
         cx.notify();
     }
@@ -782,9 +791,15 @@ impl Waku {
             return;
         }
         if self.settings_page.take().is_some() {
-            let focus_handle = self.composer_focus(cx);
+            let focus_handle = self
+                .translation_source_focus(cx)
+                .unwrap_or_else(|| self.composer_focus(cx));
             window.focus(&focus_handle, cx);
             cx.notify();
+            return;
+        }
+        if self.translation_is_open() {
+            self.close_translation(window, cx);
             return;
         }
         if self.message_edit.is_some() {
@@ -981,15 +996,27 @@ impl Waku {
         if self.settings_page.is_some() {
             return;
         }
-        let Some(session) = self.selected_session() else {
-            return;
-        };
-        let menu_id = if session.provider == ProviderKind::Assistant && !session.status.is_busy() {
-            super::assistants::ASSISTANT_MODEL_MENU_ID
-        } else if session.can_choose_model(session.provider) {
-            MODEL_PICKER_MENU_ID
+        let (menu_id, align) = if self.translation_is_open() {
+            if self.translation.as_ref().is_some_and(|page| page.busy) {
+                return;
+            }
+            (
+                super::assistants::TRANSLATION_MODEL_MENU_ID,
+                MenuAlign::BelowLeft,
+            )
         } else {
-            return;
+            let Some(session) = self.selected_session() else {
+                return;
+            };
+            let menu_id =
+                if session.provider == ProviderKind::Assistant && !session.status.is_busy() {
+                    super::assistants::ASSISTANT_MODEL_MENU_ID
+                } else if session.can_choose_model(session.provider) {
+                    MODEL_PICKER_MENU_ID
+                } else {
+                    return;
+                };
+            (menu_id, MenuAlign::AboveLeft)
         };
         let menus = self.menus.borrow();
         let Some(handle) = menus.get(menu_id).cloned() else {
@@ -1009,7 +1036,7 @@ impl Waku {
             for menu in other_open {
                 menu.close(window, cx);
             }
-            crate::ui::menu::toggle_popover(&handle, MenuAlign::AboveLeft, window, cx);
+            crate::ui::menu::toggle_popover(&handle, align, window, cx);
         });
     }
 

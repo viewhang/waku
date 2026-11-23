@@ -79,6 +79,7 @@ const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 9] = [
 /// Bind the search field's list-navigation keys. Called once at startup.
 pub fn init(cx: &mut App) {
     super::model_services::init(cx);
+    super::translation::init(cx);
     use gpui::KeyBinding;
     cx.bind_keys([
         KeyBinding::new("down", SelectNextEntry, Some(SETTINGS_SEARCH_CONTEXT)),
@@ -213,7 +214,9 @@ impl Waku {
                         .child(tr!("settings.back"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.settings_page = None;
-                            let focus_handle = this.composer_focus(cx);
+                            let focus_handle = this
+                                .translation_source_focus(cx)
+                                .unwrap_or_else(|| this.composer_focus(cx));
                             window.focus(&focus_handle, cx);
                             cx.notify();
                         })),

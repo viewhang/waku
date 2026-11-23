@@ -797,11 +797,17 @@ where
     let open_at = handle.state.borrow().open;
     let toggle_handle = handle.clone();
     let key_handle = handle.clone();
+    // GPUI takes tab eligibility from the tracked handle when one is provided
+    let trigger_focus = handle.trigger_focus.clone();
+    let trigger_focus = if trigger_focus.tab_stop {
+        trigger_focus
+    } else {
+        trigger_focus.tab_stop(true)
+    };
 
     let trigger = trigger
         .relative()
-        .track_focus(&handle.trigger_focus)
-        .tab_index(0)
+        .track_focus(&trigger_focus)
         .child(trigger_bounds_probe(handle))
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             toggle_anchored_surface(&toggle_handle, align, focus_target, window, cx);

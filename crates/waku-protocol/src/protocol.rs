@@ -70,6 +70,54 @@ pub struct ReplayCursor {
     pub sequence: u64,
 }
 
+/// Supported language choices for model-backed text translation
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum TranslationLanguage {
+    SimplifiedChinese,
+    TraditionalChinese,
+    English,
+    Japanese,
+    Korean,
+    French,
+    German,
+    Spanish,
+    Portuguese,
+    Italian,
+    Russian,
+    Arabic,
+    Thai,
+    Vietnamese,
+}
+
+impl TranslationLanguage {
+    /// Autonyms keep the menu usable when the app language is unfamiliar
+    pub const ALL: [(Self, &'static str, &'static str); 14] = [
+        (Self::SimplifiedChinese, "简体中文", "Simplified Chinese"),
+        (Self::TraditionalChinese, "繁體中文", "Traditional Chinese"),
+        (Self::English, "English", "English"),
+        (Self::Japanese, "日本語", "Japanese"),
+        (Self::Korean, "한국어", "Korean"),
+        (Self::French, "Français", "French"),
+        (Self::German, "Deutsch", "German"),
+        (Self::Spanish, "Español", "Spanish"),
+        (Self::Portuguese, "Português", "Portuguese"),
+        (Self::Italian, "Italiano", "Italian"),
+        (Self::Russian, "Русский", "Russian"),
+        (Self::Arabic, "العربية", "Arabic"),
+        (Self::Thai, "ไทย", "Thai"),
+        (Self::Vietnamese, "Tiếng Việt", "Vietnamese"),
+    ];
+
+    pub fn names(self) -> (&'static str, &'static str) {
+        let (_, label, prompt_name) = Self::ALL
+            .into_iter()
+            .find(|(language, _, _)| *language == self)
+            .expect("every translation language has a display and prompt name");
+        (label, prompt_name)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 #[serde(
     tag = "type",
@@ -157,6 +205,14 @@ pub enum Command {
         api_key: String,
         #[serde(default)]
         protocol: crate::settings::ModelProtocol,
+    },
+    /// Translate text with a saved model service independently of any conversation
+    TranslateText {
+        service_id: Uuid,
+        model: String,
+        text: String,
+        source_language: Option<TranslationLanguage>,
+        target_language: TranslationLanguage,
     },
     UpdateSettings {
         settings: DaemonSettings,
@@ -422,6 +478,9 @@ pub enum ResponsePayload {
     },
     ModelServiceSaved {
         service: crate::settings::ModelService,
+    },
+    Translation {
+        text: String,
     },
     ProviderProbe {
         probe: ProviderProbe,

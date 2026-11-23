@@ -252,7 +252,7 @@ const SIDEBAR_SESSION_ROW_GAP: f32 = 1.0;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = SIDEBAR_SESSION_CARD_HEIGHT + SIDEBAR_SESSION_ROW_GAP;
 const SIDEBAR_ASSISTANT_SESSION_ROW_HEIGHT: f32 = 32.0 + SIDEBAR_SESSION_ROW_GAP;
 const SIDEBAR_ACTION_ROW_HEIGHT: f32 = 32.0;
-const SIDEBAR_SHORTCUTS_HEIGHT: f32 = 2.0 * SIDEBAR_ACTION_ROW_HEIGHT + 10.0;
+const SIDEBAR_SHORTCUTS_HEIGHT: f32 = 3.0 * SIDEBAR_ACTION_ROW_HEIGHT + 10.0;
 const SIDEBAR_GROUP_HEADER_HEIGHT: f32 = 28.0;
 const SIDEBAR_GROUP_HEADER_BOTTOM_GAP: f32 = 2.0;
 const SIDEBAR_SHOW_MORE_ROW_HEIGHT: f32 = 30.0;
@@ -379,7 +379,7 @@ pub(super) fn format_time_ago(seconds: u64) -> String {
 /// One row of the virtualized sidebar session history.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SidebarRow {
-    /// Search and assistant creation scroll with history
+    /// Search, translation and assistant creation scroll with history
     Shortcuts,
     /// Header of a group
     Header(SidebarGroup),
@@ -832,6 +832,17 @@ impl Waku {
                     cx.stop_propagation();
                 }
             }));
+        let translate = self
+            .render_sidebar_action_row(
+                "sidebar-translation",
+                "icons/globe.svg",
+                tr!("translation.title"),
+                cx,
+            )
+            .when(self.translation_is_open(), |row| {
+                row.bg(Theme::current(cx).sidebar_item_background)
+            })
+            .on_activation(cx, Self::open_translation);
         let create_focus = self
             .menu_handle("sidebar-add-assistant", cx)
             .trigger_focus_handle()
@@ -855,6 +866,7 @@ impl Waku {
             .flex()
             .flex_col()
             .child(search)
+            .child(translate)
             .child(create_assistant)
     }
 

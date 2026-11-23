@@ -472,6 +472,30 @@ sidebar.today:
   en: Today
 sidebar.search:
   en: Search
+translation.title:
+  en: Translate
+translation.back:
+  en: Back to chat
+translation.auto:
+  en: Detect language
+translation.input:
+  en: Enter or paste text to translate
+translation.source:
+  en: Original
+translation.output:
+  en: Translation
+translation.copy:
+  en: Copy translation
+translation.copied:
+  en: Translation copied
+translation.swap:
+  en: Swap languages
+translation.translating:
+  en: Translating…
+translation.same_language:
+  en: Choose different source and target languages
+translation.failed:
+  en: "Could not translate: %{error}"
 sidebar.options:
   en: Sidebar options
 sidebar.grouping:

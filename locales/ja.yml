@@ -242,6 +242,18 @@ session.new_task: 新規タスク
 
 sidebar.today: 今日
 sidebar.search: 検索
+translation.title: 翻訳
+translation.back: チャットに戻る
+translation.auto: 言語を自動検出
+translation.input: 翻訳するテキストを入力または貼り付け
+translation.source: 原文
+translation.output: 訳文
+translation.copy: 訳文をコピー
+translation.copied: 訳文をコピーしました
+translation.swap: 言語を入れ替え
+translation.translating: 翻訳中…
+translation.same_language: 異なる翻訳元と翻訳先の言語を選択してください
+translation.failed: "翻訳できませんでした：%{error}"
 sidebar.options: サイドバーオプション
 sidebar.grouping: グループ化
 sidebar.grouping_project: プロジェクト

@@ -277,6 +277,7 @@ impl Render for Waku {
         self.schedule_time_label_wake(cx);
 
         let theme = Theme::current(cx);
+        let translating = self.translation_is_open();
         let empty = should_render_empty_state(self.selected_session());
         let permission = self.render_permission(cx);
         let computer_use = self.render_computer_use_overlay(window, cx);
@@ -359,21 +360,29 @@ impl Render for Waku {
                     .when(panels.sidebar > 0.0, |element| {
                         element.border_l_1().border_color(theme.sidebar_border)
                     })
-                    .child(self.render_header(window, cx))
-                    .child(if empty {
-                        self.render_empty_state(cx).into_any_element()
-                    } else {
-                        self.transcript_pane
-                            .clone()
-                            .cached(StyleRefinement::default().flex_1().min_h(px(0.0)).w_full())
-                            .into_any_element()
+                    .when(translating, |element| {
+                        element.child(self.render_translation(window, cx))
                     })
-                    .children(permission)
-                    .when(self.selected_project().is_some(), |element| {
+                    .when(!translating, |element| {
                         element
-                            .children(self.render_queued_messages(cx))
-                            .child(self.render_composer(window, cx))
-                            .child(self.render_workspace_footer(cx))
+                            .child(self.render_header(window, cx))
+                            .child(if empty {
+                                self.render_empty_state(cx).into_any_element()
+                            } else {
+                                self.transcript_pane
+                                    .clone()
+                                    .cached(
+                                        StyleRefinement::default().flex_1().min_h(px(0.0)).w_full(),
+                                    )
+                                    .into_any_element()
+                            })
+                            .children(permission)
+                            .when(self.selected_project().is_some(), |element| {
+                                element
+                                    .children(self.render_queued_messages(cx))
+                                    .child(self.render_composer(window, cx))
+                                    .child(self.render_workspace_footer(cx))
+                            })
                     })
                     .relative()
                     .children(toast)
@@ -385,7 +394,7 @@ impl Render for Waku {
                         ))
                     }),
             )
-            .when(panels.right_panel > 0.0, |root| {
+            .when(!translating && panels.right_panel > 0.0, |root| {
                 root.child(
                     div()
                         .h_full()

@@ -902,6 +902,12 @@ impl TextInput {
         self
     }
 
+    /// Include this field in the window's keyboard focus order
+    pub fn tab_stop(mut self) -> Self {
+        self.focus_handle = self.focus_handle.tab_stop(true);
+        self
+    }
+
     /// Paint-only syntax colouring for `language`, when recognised.
     pub fn syntax(mut self, language: Option<&str>) -> Self {
         self.language = language.and_then(highlight::lang_for_tag);

@@ -3,16 +3,18 @@
 use super::*;
 use crate::ui::{ActivationExt as _, text_field::TextField};
 use gpui::ElementId;
-use waku_protocol::settings::AssistantProfile;
+use waku_protocol::settings::{AssistantProfile, ServiceModel};
 
 pub(super) const ASSISTANT_MODEL_MENU_ID: &str = "assistant-model-picker";
 const ASSISTANT_DEFAULT_MODEL_MENU_ID: &str = "assistant-default-model-picker";
+pub(super) const TRANSLATION_MODEL_MENU_ID: &str = "translation-model-picker";
 
 /// A default belongs to a profile and an override belongs to one conversation
 #[derive(Clone, Copy)]
 enum ModelPickerTarget {
     Default,
     Session(Uuid),
+    Translation,
 }
 
 impl ModelPickerTarget {
@@ -20,14 +22,19 @@ impl ModelPickerTarget {
         match self {
             Self::Default => ASSISTANT_DEFAULT_MODEL_MENU_ID,
             Self::Session(_) => ASSISTANT_MODEL_MENU_ID,
+            Self::Translation => TRANSLATION_MODEL_MENU_ID,
         }
+    }
+
+    fn accepts(self, model: &ServiceModel) -> bool {
+        !matches!(self, Self::Translation) || model.options.dialogue()
     }
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct ModelSelection {
-    service_id: Uuid,
-    model: String,
+pub(super) struct ModelSelection {
+    pub(super) service_id: Uuid,
+    pub(super) model: String,
 }
 
 /// Keep editable text in input entities and keep credentials outside the form
@@ -197,9 +204,13 @@ impl Waku {
 
     pub(super) fn assistant_model_picker_open(&self) -> bool {
         let menus = self.menus.borrow();
-        [ASSISTANT_MODEL_MENU_ID, ASSISTANT_DEFAULT_MODEL_MENU_ID]
-            .into_iter()
-            .any(|id| menus.get(id).is_some_and(ContextMenuHandle::is_open))
+        [
+            ASSISTANT_MODEL_MENU_ID,
+            ASSISTANT_DEFAULT_MODEL_MENU_ID,
+            TRANSLATION_MODEL_MENU_ID,
+        ]
+        .into_iter()
+        .any(|id| menus.get(id).is_some_and(ContextMenuHandle::is_open))
     }
 
     pub(super) fn render_session_assistant_model(
@@ -238,6 +249,22 @@ impl Waku {
             label,
             cx,
         )
+    }
+
+    pub(super) fn render_translation_model_picker(
+        &self,
+        model: Option<&ModelSelection>,
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = self.model_selection_label(model);
+        if busy {
+            return MenuChip::new(TRANSLATION_MODEL_MENU_ID)
+                .label(label)
+                .disabled(true)
+                .into_any_element();
+        }
+        self.render_assistant_model_picker(ModelPickerTarget::Translation, model, label, cx)
     }
 
     fn model_selection_label(&self, selection: Option<&ModelSelection>) -> String {
@@ -285,6 +312,9 @@ impl Waku {
                         let focus = match target {
                             ModelPickerTarget::Default => this.settings_focus.clone(),
                             ModelPickerTarget::Session(_) => this.composer_focus(cx),
+                            ModelPickerTarget::Translation => this
+                                .translation_source_focus(cx)
+                                .unwrap_or_else(|| this.composer_focus(cx)),
                         };
                         window.focus(&focus, cx);
                     }
@@ -309,7 +339,7 @@ impl Waku {
             {
                 let provider_matches =
                     query.is_empty() || service.name.to_lowercase().contains(&query);
-                for model in &service.models {
+                for model in service.models.iter().filter(|model| target.accepts(model)) {
                     if provider_matches
                         || model.id.to_lowercase().contains(&query)
                         || model.name.to_lowercase().contains(&query)
@@ -344,17 +374,15 @@ impl Waku {
             selection
         });
         let highlight = self.model_picker_highlight;
-        let has_catalog = self
-            .state
-            .model_services
-            .iter()
-            .any(|service| service.enabled && !service.models.is_empty());
+        let has_catalog = self.state.model_services.iter().any(|service| {
+            service.enabled && service.models.iter().any(|model| target.accepts(model))
+        });
         let trigger = MenuChip::new(target.menu_id())
             .provider(ProviderKind::Assistant, theme.accent)
             .label(label)
             .selected(handle.is_open());
         let align = match target {
-            ModelPickerTarget::Default => MenuAlign::BelowLeft,
+            ModelPickerTarget::Default | ModelPickerTarget::Translation => MenuAlign::BelowLeft,
             ModelPickerTarget::Session(_) => MenuAlign::AboveLeft,
         };
         popover(trigger, &handle, align, move |popover, _, _| {
@@ -454,7 +482,7 @@ impl Waku {
                         ModelPickerTarget::Session(id) => {
                             this.open_model_service_editor(None, Some(id), window, cx)
                         }
-                        ModelPickerTarget::Default => {
+                        ModelPickerTarget::Default | ModelPickerTarget::Translation => {
                             this.open_settings_page(SettingsPage::ModelServices, cx)
                         }
                     });
@@ -520,7 +548,9 @@ impl Waku {
                         .hover(|row| row.bg(theme.overlay))
                         .child(match target {
                             ModelPickerTarget::Session(_) => tr!("model_services.add"),
-                            ModelPickerTarget::Default => tr!("model_services.manage"),
+                            ModelPickerTarget::Default | ModelPickerTarget::Translation => {
+                                tr!("model_services.manage")
+                            }
                         })
                         .on_key_down(move |event, window, cx| {
                             if !event.keystroke.modifiers.modified()
@@ -558,12 +588,24 @@ impl Waku {
     ) -> bool {
         if self
             .model_service(selection.service_id)
-            .is_none_or(|service| !service.enabled || service.model(&selection.model).is_none())
+            .is_none_or(|service| {
+                !service.enabled
+                    || !service
+                        .model(&selection.model)
+                        .is_some_and(|model| target.accepts(model))
+            })
         {
             return false;
         }
         match target {
             ModelPickerTarget::Default => self.assistant_form.default_model = Some(selection),
+            ModelPickerTarget::Translation => {
+                let Some(page) = self.translation.as_mut().filter(|page| !page.busy) else {
+                    return false;
+                };
+                page.model = Some(selection);
+                page.clear_result(cx);
+            }
             ModelPickerTarget::Session(id) => {
                 if self.state.selected_session != Some(id) {
                     return false;

@@ -265,6 +265,23 @@ impl Backend for WakuBackend {
                 let models = driver::assistant::list_models(&base_url, &api_key, protocol)?;
                 Ok(ResponsePayload::ModelServiceModels { models })
             }
+            Command::TranslateText {
+                service_id,
+                model,
+                text,
+                source_language,
+                target_language,
+            } => {
+                let text = driver::assistant::translate_text(
+                    &self.settings,
+                    service_id,
+                    &model,
+                    text,
+                    source_language,
+                    target_language,
+                )?;
+                Ok(ResponsePayload::Translation { text })
+            }
             Command::UpdateSettings { settings } => {
                 self.settings.replace_preferences(settings)?;
                 Ok(ResponsePayload::Ack)
@@ -1901,6 +1918,7 @@ fn handle_driver_command(
         | Command::SaveModelService { .. }
         | Command::TestModelService { .. }
         | Command::ListModelServiceModels { .. }
+        | Command::TranslateText { .. }
         | Command::GetSettings
         | Command::UpdateSettings { .. }
         | Command::ProbeProvider { .. }
