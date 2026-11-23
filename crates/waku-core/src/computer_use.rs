@@ -133,8 +133,7 @@ struct HelperResponse {
 
 #[cfg(target_os = "macos")]
 pub fn probe_permissions(prompt: bool) -> anyhow::Result<ComputerPermissions> {
-    // A release daemon never installs or launches the helper app, not even to
-    // read permission status, so production never opens its TCC prompts.
+    // Check build availability before installing or launching the permission-owning helper
     if !is_available() {
         bail!("Waku Computer Use is not available in this build");
     }

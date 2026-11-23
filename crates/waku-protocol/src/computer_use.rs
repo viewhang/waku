@@ -2,17 +2,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-/// Whether this build may run Computer Use.
+/// Whether this build may run Computer Use
 ///
-/// The feature is experimental, so only development builds expose it. Release
-/// builds refuse it even when a client asks, which keeps a stale setting, a
-/// hand-edited settings file, or a third-party daemon client from turning it on
-/// in production.
+/// Debug builds and macOS Release builds expose the experimental feature
 pub const fn is_available() -> bool {
-    cfg!(debug_assertions)
+    cfg!(any(debug_assertions, target_os = "macos"))
 }
 
-/// Clamp a requested Computer Use enablement to what this build ships.
+/// Clamp a requested Computer Use enablement to what this build ships
 pub const fn resolve_enabled(requested: bool) -> bool {
     requested && is_available()
 }
@@ -137,8 +134,11 @@ mod tests {
     use super::{is_available, resolve_enabled};
 
     #[test]
-    fn computer_use_is_development_only() {
-        assert_eq!(is_available(), cfg!(debug_assertions));
+    fn computer_use_respects_build_availability_and_settings() {
+        assert_eq!(
+            is_available(),
+            cfg!(target_os = "macos") || cfg!(debug_assertions)
+        );
         assert!(!resolve_enabled(false));
         assert_eq!(resolve_enabled(true), is_available());
     }
