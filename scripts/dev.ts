@@ -15,7 +15,9 @@ const appPath = isMacOS
   : join(targetDir, `debug/waku${executableSuffix}`);
 const daemonPath = join(
   targetDir,
-  `debug/waku-debug-daemon${executableSuffix}`,
+  isMacOS
+    ? "debug/signed-daemon/waku-debug-daemon"
+    : `debug/waku-debug-daemon${executableSuffix}`,
 );
 const watchedDirectories = [
   "src",
@@ -310,7 +312,7 @@ async function build(target: BuildTarget): Promise<boolean> {
   }
 
   console.log(`[waku-dev] Building ${isMacOS ? "app bundle" : "app"}...`);
-  if (!(await buildDaemon())) {
+  if (!isMacOS && !(await buildDaemon())) {
     console.error(
       "[waku-dev] Daemon build failed; keeping the current app open.",
     );
@@ -340,8 +342,9 @@ async function build(target: BuildTarget): Promise<boolean> {
 
 async function buildDaemon(): Promise<boolean> {
   console.log("[waku-dev] Building daemon...");
-  const result =
-    await $`cargo build --package waku-daemon --features dev-binary --bin waku-debug-daemon`.nothrow();
+  const result = isMacOS
+    ? await $`${join(root, "scripts/bundle.sh")} debug --daemon-only`.nothrow()
+    : await $`cargo build --package waku-daemon --features dev-binary --bin waku-debug-daemon`.nothrow();
   if (result.exitCode !== 0) {
     console.error(
       "[waku-dev] Daemon build failed; keeping the current daemon running.",

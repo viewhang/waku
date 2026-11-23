@@ -2,7 +2,12 @@
 set -eu
 
 profile="${1:-debug}"
+build_mode="${2:-}"
 cargo_target_dir="${CARGO_TARGET_DIR:-target}"
+if [ -n "$build_mode" ] && { [ "$profile" != "debug" ] || [ "$build_mode" != "--daemon-only" ]; }; then
+  echo "usage: scripts/bundle.sh [debug [--daemon-only]|release]" >&2
+  exit 2
+fi
 debug_identity_cache=".waku-cache/codesign/debug-identity"
 codesign_identity_from_environment=0
 if [ -n "${WAKU_CODESIGN_IDENTITY:-}" ]; then
@@ -50,7 +55,7 @@ case "$profile" in
     icon_file="AppIcon.icns"
     ;;
   *)
-    echo "usage: scripts/bundle.sh [debug|release]" >&2
+    echo "usage: scripts/bundle.sh [debug [--daemon-only]|release]" >&2
     exit 2
     ;;
 esac
@@ -59,6 +64,26 @@ if [ "$profile" = "debug" ] && [ "$codesign_identity_from_environment" = "0" ] &
   printf '%s\n' "$codesign_identity" > "$debug_identity_cache"
 fi
 debug_adhoc_requirement="=designated => identifier \"$bundle_identifier\""
+if [ "$profile" = "debug" ]; then
+  if [ "${WAKU_SKIP_CARGO_BUILD:-0}" != "1" ]; then
+    cargo build --package waku-daemon --features dev-binary --bin waku-debug-daemon
+  fi
+  # Publish only the signed daemon so hot reload never sees Cargo's ad-hoc binary
+  # A development certificate keeps the identity stable for Keychain permissions
+  (
+    signed_daemon_directory="$cargo_target_dir/debug/signed-daemon"
+    mkdir -p "$signed_daemon_directory"
+    staging_directory=$(mktemp -d "$signed_daemon_directory/.staging.XXXXXX")
+    trap 'rm -rf "$staging_directory"' EXIT
+    staged_daemon="$staging_directory/waku-debug-daemon"
+    cp "$cargo_target_dir/debug/waku-debug-daemon" "$staged_daemon"
+    codesign --force --identifier "$bundle_identifier.daemon" --sign "$codesign_identity" "$staged_daemon"
+    mv -f "$staged_daemon" "$signed_daemon_directory/waku-debug-daemon"
+  )
+  if [ "$build_mode" = "--daemon-only" ]; then
+    exit 0
+  fi
+fi
 if [ "${WAKU_SKIP_CARGO_BUILD:-0}" != "1" ]; then
   if [ "$profile" = "release" ]; then
     cargo build --release --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon
