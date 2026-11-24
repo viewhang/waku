@@ -361,12 +361,12 @@ impl Render for Waku {
                     .when(panels.sidebar > 0.0, |element| {
                         element.border_l_1().border_color(theme.sidebar_border)
                     })
+                    .child(self.render_header(window, translating, cx))
                     .when_some(translation, |element, page| {
                         element.child(self.render_translation(page, window, cx))
                     })
                     .when(!translating, |element| {
                         element
-                            .child(self.render_header(window, cx))
                             .child(if empty {
                                 self.render_empty_state(cx).into_any_element()
                             } else {

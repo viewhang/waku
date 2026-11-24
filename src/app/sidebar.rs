@@ -2262,15 +2262,22 @@ impl Waku {
     pub(super) fn render_header(
         &self,
         window: &Window,
+        translating: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = Theme::current(cx);
         let session = self.selected_session();
-        let title = session
-            .map(localized_session_title)
-            .unwrap_or_else(|| tr!("session.new_task"));
+        let title = if translating {
+            tr!("translation.title")
+        } else {
+            session
+                .map(localized_session_title)
+                .unwrap_or_else(|| tr!("session.new_task"))
+        };
         let agent_preset_label = session
-            .filter(|session| session.provider == ProviderKind::DeepSeek && session.has_started())
+            .filter(|session| {
+                !translating && session.provider == ProviderKind::DeepSeek && session.has_started()
+            })
             .and_then(|session| self.agent_preset_label_for_session(session));
         let left_window_controls = (!self.sidebar_visible)
             .then(|| {
@@ -2281,7 +2288,8 @@ impl Waku {
                 )
             })
             .flatten();
-        let right_window_controls = (!self.right_panel_visible)
+        // Translation fills the workspace so the header also owns the right window controls
+        let right_window_controls = (translating || !self.right_panel_visible)
             .then(|| {
                 self.render_client_window_controls(
                     super::window_chrome::WindowControlSide::Right,
@@ -2304,7 +2312,8 @@ impl Waku {
             // a sidebar sliding in shrinks the inset as it takes the lights
             // over, which is what keeps the title from passing under them.
             .pl(if self.sidebar_visible {
-                px(14.0 + (TRAFFIC_LIGHT_CLEARANCE - self.sidebar_rendered_width).max(0.0))
+                let inset = if translating { 20.0 } else { 14.0 };
+                px(inset + (TRAFFIC_LIGHT_CLEARANCE - self.sidebar_rendered_width).max(0.0))
             } else {
                 px(0.0)
             })
@@ -2366,7 +2375,10 @@ impl Waku {
                                 .text_size(sp(13.0))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text)
-                                .child(SharedString::from(title)),
+                                .when(translating, |title| {
+                                    title.text_size(sp(18.0)).font_weight(FontWeight::SEMIBOLD)
+                                })
+                                .child(title),
                         )
                         .children(agent_preset_label.map(|label| {
                             div()
@@ -2394,13 +2406,17 @@ impl Waku {
                     cx,
                 ),
             )
-            .child(self.render_background_work_summary(cx))
-            .when(!self.right_panel_visible, |element| {
-                element
-                    .when(self.fps_counter_visible, |element| {
-                        element.child(self.render_fps_counter(cx))
-                    })
-                    .child(self.render_right_panel_toggle(cx))
+            .when(!translating, |element| {
+                element.child(self.render_background_work_summary(cx)).when(
+                    !self.right_panel_visible,
+                    |element| {
+                        element
+                            .when(self.fps_counter_visible, |element| {
+                                element.child(self.render_fps_counter(cx))
+                            })
+                            .child(self.render_right_panel_toggle(cx))
+                    },
+                )
             })
             .children(right_window_controls)
     }

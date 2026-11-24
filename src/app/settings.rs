@@ -338,13 +338,15 @@ impl Waku {
                 .border_l_1()
                 .border_color(theme.sidebar_border)
                 .bg(theme.surface)
-                .children(right_window_controls.map(|controls| {
+                .child(
                     self.render_settings_drag_region("settings-split-titlebar", cx)
                         .flex()
                         .items_center()
                         .justify_end()
-                        .child(controls)
-                }))
+                        // Native window buttons need only a short drag strip above the split view
+                        .when(right_window_controls.is_none(), |bar| bar.h(px(16.0)))
+                        .children(right_window_controls),
+                )
                 .child(div().flex_1().min_h_0().child(match page {
                     SettingsPage::Skills => self.render_skills_settings(cx),
                     SettingsPage::ModelServices => self.render_model_services_settings(cx),
@@ -2547,40 +2549,7 @@ impl Waku {
         id: &'static str,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let region = div().id(id);
-        // Windows drags from the hit test rather than a mouse-move handler.
-        #[cfg(target_os = "windows")]
-        let region = region.window_control_area(gpui::WindowControlArea::Drag);
-
-        region
-            .h(px(48.0))
-            .flex_none()
-            .on_click(|event, window, _| {
-                if event.click_count() == 2 {
-                    crate::platform::titlebar_double_click(window);
-                }
-            })
-            .on_mouse_down_out(cx.listener(|this, _, _, _| {
-                this.header_drag_armed = false;
-            }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| {
-                    this.header_drag_armed = true;
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| {
-                    this.header_drag_armed = false;
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, _, window, _| {
-                if this.header_drag_armed {
-                    this.header_drag_armed = false;
-                    crate::platform::start_window_move(window);
-                }
-            }))
+        self.window_drag_region(div().id(id).h(px(48.0)).flex_none(), cx)
     }
 
     fn set_theme_preference(

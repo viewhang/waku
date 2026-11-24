@@ -473,14 +473,7 @@ impl Waku {
             .flex_col()
             .gap(px(12.0))
             .p(px(20.0))
-            .when(!self.sidebar_visible, |page| page.pt(px(38.0)))
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(sp(18.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(tr!("translation.title")),
-            )
+            .pt(px(6.0))
             .child(
                 div()
                     .flex_none()
