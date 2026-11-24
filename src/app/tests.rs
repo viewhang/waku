@@ -1923,12 +1923,13 @@ fn settings_search_filters_pages_for_arrow_cycling() {
         SettingsPage::Appearance,
         SettingsPage::Providers,
         SettingsPage::ModelServices,
+        SettingsPage::SearchProviders,
         SettingsPage::Assistants,
         SettingsPage::Skills,
         SettingsPage::Usage,
         SettingsPage::Daemon,
     ];
-    if cfg!(debug_assertions) {
+    if SettingsPage::ComputerUse.is_visible_in_navigation() {
         all_pages.push(SettingsPage::ComputerUse);
     }
     assert_eq!(pages(""), all_pages);
@@ -1936,6 +1937,7 @@ fn settings_search_filters_pages_for_arrow_cycling() {
     assert_eq!(pages("theme"), vec![SettingsPage::Appearance]);
     assert_eq!(pages("skill"), vec![SettingsPage::Skills]);
     assert_eq!(pages("sync"), vec![SettingsPage::ModelServices]);
+    assert_eq!(pages("tavily"), vec![SettingsPage::SearchProviders]);
     assert_eq!(pages("react"), vec![SettingsPage::Assistants]);
 
     // A keyword shared across pages keeps them all reachable.
@@ -1944,7 +1946,7 @@ fn settings_search_filters_pages_for_arrow_cycling() {
         SettingsPage::Skills,
         SettingsPage::Usage,
     ];
-    if cfg!(debug_assertions) {
+    if SettingsPage::ComputerUse.is_visible_in_navigation() {
         codex_pages.push(SettingsPage::ComputerUse);
     }
     assert_eq!(pages("codex"), codex_pages);

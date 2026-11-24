@@ -901,6 +901,11 @@ impl Waku {
             id: form.editing.unwrap_or_else(Uuid::new_v4),
             name: form.name.read(cx).content().trim().to_owned(),
             model: selection.model,
+            web_search: self
+                .state
+                .assistant_profiles
+                .iter()
+                .any(|profile| Some(profile.id) == form.editing && profile.web_search),
             model_service_id: Some(selection.service_id),
             base_url: String::new(),
             system_prompt: form.prompt.read(cx).content().to_owned(),

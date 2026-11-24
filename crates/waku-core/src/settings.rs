@@ -11,6 +11,10 @@ use uuid::Uuid;
 pub use waku_protocol::settings::DaemonSettings;
 use waku_protocol::settings::{ModelProtocol, ModelService, ServiceModel};
 
+pub(crate) const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
+// Model entries use UUIDs, leaving this credential ID reserved for Tavily
+const TAVILY_KEY_ID: &str = "tavily-search";
+
 pub struct DaemonSettingsStore {
     path: PathBuf,
     settings: Mutex<DaemonSettings>,
@@ -83,6 +87,28 @@ impl DaemonSettingsStore {
             .iter()
             .find(|service| service.id == id)
             .cloned()
+    }
+
+    /// Resolve the old assistant-wide search default for conversations without a saved choice
+    pub(crate) fn assistant_web_search(&self, id: Uuid) -> bool {
+        self.settings
+            .lock()
+            .assistants
+            .iter()
+            .any(|profile| profile.id == id && profile.web_search)
+    }
+
+    pub(crate) fn tavily_api_key(&self) -> anyhow::Result<Option<String>> {
+        self.api_key(TAVILY_KEY_ID, TAVILY_ENDPOINT)
+    }
+
+    pub(crate) fn save_tavily_api_key(&self, key: &str) -> anyhow::Result<()> {
+        let key = key.trim();
+        if !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+            bail!("The API key must be a single token");
+        }
+        let database = open_model_service_key_db(&self.path)?;
+        store_api_key(&database, TAVILY_KEY_ID, TAVILY_ENDPOINT, key)
     }
 
     /// Older sessions still refer to a model service by URL
@@ -165,19 +191,12 @@ impl DaemonSettingsStore {
             let mut database = open_model_service_key_db(&self.path)
                 .context("Could not open the local API key store")?;
             let transaction = database.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if key.is_empty() {
-                transaction.execute(
-                    "DELETE FROM model_service_keys WHERE service_id = ?1",
-                    [service.id.to_string()],
-                )?;
-            } else {
-                transaction.execute(
-                    "INSERT INTO model_service_keys (service_id, endpoint, api_key)
-                     VALUES (?1, ?2, ?3) ON CONFLICT(service_id) DO UPDATE SET
-                     endpoint = excluded.endpoint, api_key = excluded.api_key",
-                    params![service.id.to_string(), endpoint.as_str(), key],
-                )?;
-            }
+            store_api_key(
+                &transaction,
+                &service.id.to_string(),
+                endpoint.as_str(),
+                key,
+            )?;
             // Settings write failure rolls the credential back with the SQLite transaction
             write_atomic(&self.path, &next)?;
             if let Err(error) = transaction.commit() {
@@ -245,6 +264,10 @@ impl DaemonSettingsStore {
         id: Uuid,
         endpoint: &str,
     ) -> anyhow::Result<Option<String>> {
+        self.api_key(&id.to_string(), endpoint)
+    }
+
+    fn api_key(&self, id: &str, endpoint: &str) -> anyhow::Result<Option<String>> {
         let path = DaemonSettings::model_service_key_db_path(&self.path);
         if !path.try_exists()? {
             return Ok(None);
@@ -256,12 +279,27 @@ impl DaemonSettingsStore {
         database
             .query_row(
                 "SELECT api_key FROM model_service_keys WHERE service_id = ?1 AND endpoint = ?2",
-                params![id.to_string(), endpoint],
+                params![id, endpoint],
                 |row| row.get(0),
             )
             .optional()
             .context("Could not read the saved API key")
     }
+}
+
+/// Keep credential writes bound to the endpoint that will receive the key
+fn store_api_key(database: &Connection, id: &str, endpoint: &str, key: &str) -> anyhow::Result<()> {
+    if key.is_empty() {
+        database.execute("DELETE FROM model_service_keys WHERE service_id = ?1", [id])?;
+    } else {
+        database.execute(
+            "INSERT INTO model_service_keys (service_id, endpoint, api_key)
+             VALUES (?1, ?2, ?3) ON CONFLICT(service_id) DO UPDATE SET
+             endpoint = excluded.endpoint, api_key = excluded.api_key",
+            params![id, endpoint, key],
+        )?;
+    }
+    Ok(())
 }
 
 /// Resolve system directory aliases before SQLite rejects symlinks in the database path
@@ -377,6 +415,43 @@ fn to_io_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assistant_tavily_key_stays_in_the_daemon_and_can_be_replaced() {
+        let root = std::env::temp_dir().join(format!("waku-tavily-{}", Uuid::new_v4()));
+        let path = root.join("settings.json");
+        let settings = DaemonSettingsStore::open(path.clone()).unwrap();
+        assert_eq!(settings.tavily_api_key().unwrap(), None);
+        assert!(settings.save_tavily_api_key("invalid key").is_err());
+        settings.save_tavily_api_key("fixture-old").unwrap();
+        settings.save_tavily_api_key("fixture-new").unwrap();
+        let id = Uuid::new_v4();
+        let mut preferences = DaemonSettings::default();
+        preferences
+            .assistants
+            .push(waku_protocol::settings::AssistantProfile {
+                id,
+                name: "Search test".into(),
+                system_prompt: String::new(),
+                model: "demo".into(),
+                web_search: true,
+                model_service_id: None,
+                base_url: String::new(),
+            });
+        settings.replace_preferences(preferences).unwrap();
+        assert!(settings.assistant_web_search(id));
+        assert!(!fs::read_to_string(&path).unwrap().contains("fixture-new"));
+        drop(settings);
+        let reopened = DaemonSettingsStore::open(path).unwrap();
+        assert_eq!(
+            reopened.tavily_api_key().unwrap().as_deref(),
+            Some("fixture-new")
+        );
+        assert!(reopened.assistant_web_search(id));
+        reopened.save_tavily_api_key("").unwrap();
+        assert_eq!(reopened.tavily_api_key().unwrap(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn stores_model_keys_locally_and_scopes_them_to_the_exact_endpoint() {

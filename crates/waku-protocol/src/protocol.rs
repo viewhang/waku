@@ -190,6 +190,16 @@ pub enum Command {
         turns_to_remove: usize,
     },
     GetSettings,
+    /// Report whether the daemon has a saved Tavily key
+    GetTavilyApiKeyStatus,
+    /// Replace the daemon's local Tavily credential without returning it to clients
+    SaveTavilyApiKey {
+        api_key: String,
+    },
+    /// Save the conversation's web-search choice for subsequent turns
+    SetAssistantWebSearch {
+        enabled: bool,
+    },
     /// Persist a provider and its optional credential change together
     SaveModelService {
         service: crate::settings::ModelService,
@@ -488,6 +498,9 @@ pub enum ResponsePayload {
     },
     Settings {
         settings: DaemonSettings,
+    },
+    TavilyApiKeyStatus {
+        configured: bool,
     },
     ModelServiceModels {
         models: Vec<String>,

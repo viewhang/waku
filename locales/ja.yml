@@ -623,6 +623,8 @@ user_input.progress: "%{current} / %{total}"
 composer.preparing_task: タスクを準備中…
 composer.queue_followup: フォローアップとしてキューに追加（⏎）
 composer.clear_context: コンテキストをクリア
+composer.enable_web_search: ウェブ検索をオンにする
+composer.disable_web_search: ウェブ検索をオフにする
 composer.clear_context_failed: "コンテキストをクリアできませんでした：%{error}"
 transcript.context_cleared: コンテキストをクリアしました
 composer.message: メッセージ
@@ -1132,3 +1134,20 @@ usage_error.curl_did_not_finish: curl がリクエストを完了しませんで
 usage_error.curl_failed: "curl に失敗しました：%{error}"
 usage_error.unknown_error: 不明なエラー
 usage_error.curl_no_status: curl から HTTP ステータス行が返されませんでした
+assistant.web_search: "ウェブ検索"
+search_providers.settings: 検索プロバイダー
+search_providers.keywords: 検索プロバイダー ウェブ検索 Tavily API キー
+search_providers.api_key: "Tavily API キー（アシスタント共通）"
+search_providers.save_key: "キーを保存"
+search_providers.clear_key: "キーを削除"
+search_providers.tavily_key_required: "「設定 → 検索プロバイダー」で Tavily API キーを入力してください"
+search_providers.tavily_key_saved: "Tavily API キーを保存しました"
+search_providers.tavily_key_cleared: "Tavily API キーを削除しました"
+search_providers.tavily_key_failed: "Tavily API キーを保存できませんでした：%{error}"
+assistant.search_requires_tools: "ウェブ検索にはツールを有効にしたモデルが必要です"
+assistant.search_invalid_query: "モデルは 1〜400 文字の検索語を指定してください"
+assistant.search_http_error: "Tavily の検索に失敗しました（HTTP %{status}）"
+assistant.search_limit: "1 回の回答につき検索は 1 回までです"
+assistant.search_reply_missing: "検索後にモデルから回答が返りませんでした"
+assistant.search_result_count: "%{count} 件の参照元を取得"
+assistant.search_sources: "参照元"

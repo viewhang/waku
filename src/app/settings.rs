@@ -1,5 +1,7 @@
 use super::composer::next_picker_highlight;
 use super::*;
+use crate::ui::ActivationExt as _;
+use waku_client::{Command, ResponsePayload};
 
 const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
 pub(super) const SETTINGS_SPLIT_LIST_WIDTH: f32 = 264.0;
@@ -20,7 +22,7 @@ const SETTINGS_SEARCH_CONTEXT: &str = "SettingsSidebar > TextInput";
 
 /// The sidebar's rows in display order, each with the keyword haystack the
 /// search field filters against.
-const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 9] = [
+const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 10] = [
     (
         SettingsPage::General,
         "settings.general",
@@ -44,6 +46,12 @@ const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 9] = [
         "model_services.settings",
         "icons/server.svg",
         "model_services.keywords",
+    ),
+    (
+        SettingsPage::SearchProviders,
+        "search_providers.settings",
+        "icons/globe.svg",
+        "search_providers.keywords",
     ),
     (
         SettingsPage::Assistants,
@@ -378,6 +386,7 @@ impl Waku {
                         SettingsPage::General => tr!("settings.general"),
                         SettingsPage::Assistants => tr!("assistant.settings"),
                         SettingsPage::ModelServices => tr!("model_services.settings"),
+                        SettingsPage::SearchProviders => tr!("search_providers.settings"),
                         SettingsPage::Providers => tr!("settings.providers"),
                         SettingsPage::Skills => tr!("settings.skills"),
                         SettingsPage::Usage => tr!("settings.usage"),
@@ -392,6 +401,7 @@ impl Waku {
                     unreachable!()
                 }
                 SettingsPage::Providers => self.render_providers_settings(cx),
+                SettingsPage::SearchProviders => self.render_search_providers_settings(cx),
                 SettingsPage::Usage => self.render_usage_settings(cx),
                 SettingsPage::Daemon => self.render_daemon_settings(cx),
                 SettingsPage::ComputerUse => self.render_computer_use_settings(cx),
@@ -1565,6 +1575,168 @@ impl Waku {
             .reset(self.right_panel_diff_tree_rows.borrow().len());
         self.skills_list_state
             .reset(self.skills_rows.borrow().len());
+    }
+
+    fn render_search_providers_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::current(cx);
+        let pending = self.tavily_key_pending;
+        let buttons = [
+            (false, "save-tavily-key", tr!("search_providers.save_key")),
+            (true, "clear-tavily-key", tr!("search_providers.clear_key")),
+        ]
+        .map(|(clear, id, label)| {
+            super::assistants::assistant_button_base(id, label.clone(), theme)
+                .track_focus(&self.transcript_control_focus(id, cx))
+                .tab_stop(true)
+                .aria_label(label)
+                .when(pending, |button| button.opacity(0.55))
+                .when(!pending, |button| {
+                    button
+                        .hover(|button| button.bg(theme.overlay))
+                        .on_activation(cx, move |this, _, cx| this.save_tavily_key(clear, cx))
+                })
+        });
+
+        div()
+            .mt(px(15.0))
+            .px(px(20.0))
+            .py(px(14.0))
+            .rounded(px(13.0))
+            .bg(theme.raised)
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .text_size(sp(13.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child("Tavily"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.0))
+                    .child(
+                        div()
+                            .text_size(sp(12.0))
+                            .text_color(theme.text_secondary)
+                            .child(tr!("search_providers.api_key")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                TextField::new(
+                                    "search-provider-tavily-key",
+                                    self.tavily_key_input.clone(),
+                                )
+                                .flex_1()
+                                .min_w_0(),
+                            )
+                            .children(buttons),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Show a fixed mask as a placeholder so edits always start with an empty value
+    fn set_tavily_key_mask(&self, configured: bool, cx: &mut Context<Self>) {
+        let placeholder = if configured {
+            "••••••••"
+        } else {
+            ""
+        };
+        self.tavily_key_input
+            .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+    }
+
+    /// Serialize the page's status read with credential edits
+    pub(super) fn refresh_tavily_key_status(&mut self, cx: &mut Context<Self>) {
+        if self.tavily_key_pending {
+            return;
+        }
+        self.tavily_key_pending = true;
+        let daemon = self.daemon.client();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    daemon.request(Uuid::nil(), Uuid::nil(), Command::GetTavilyApiKeyStatus)
+                })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                this.tavily_key_pending = false;
+                match result {
+                    Ok(ResponsePayload::TavilyApiKeyStatus { configured }) => {
+                        this.set_tavily_key_mask(configured, cx);
+                    }
+                    Err(error) => this.show_toast(error.to_string()),
+                    _ => this.show_toast(tr!("assistant.invalid_response")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Store the shared credential on the daemon without including it in assistant profiles
+    fn save_tavily_key(&mut self, clear: bool, cx: &mut Context<Self>) {
+        if self.tavily_key_pending {
+            return;
+        }
+        let draft = self.tavily_key_input.read(cx).content().trim().to_owned();
+        if !clear && draft.is_empty() {
+            self.show_toast(tr!("search_providers.tavily_key_required"));
+            cx.notify();
+            return;
+        }
+        self.tavily_key_pending = true;
+        let daemon = self.daemon.client();
+        cx.spawn(async move |view, cx| {
+            let (result, draft) = cx
+                .background_executor()
+                .spawn(async move {
+                    let result = daemon.request(
+                        Uuid::nil(),
+                        Uuid::nil(),
+                        Command::SaveTavilyApiKey {
+                            api_key: if clear { String::new() } else { draft.clone() },
+                        },
+                    );
+                    (result, draft)
+                })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                this.tavily_key_pending = false;
+                match result {
+                    Ok(ResponsePayload::Ack) => {
+                        this.set_tavily_key_mask(!clear, cx);
+                        // Preserve a replacement typed while the daemon was saving
+                        if this.tavily_key_input.read(cx).content().trim() == draft {
+                            this.tavily_key_input
+                                .update(cx, |field, cx| field.clear(cx));
+                        }
+                        this.show_success_toast(if clear {
+                            tr!("search_providers.tavily_key_cleared")
+                        } else {
+                            tr!("search_providers.tavily_key_saved")
+                        });
+                    }
+                    Err(error) => this.show_toast(tr!(
+                        "search_providers.tavily_key_failed",
+                        error = error.to_string()
+                    )),
+                    _ => this.show_toast(tr!("assistant.invalid_response")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn render_providers_settings(&self, cx: &mut Context<Self>) -> AnyElement {

@@ -6,7 +6,8 @@ use reqwest::multipart::{Form, Part};
 use rig::client::CompletionClient as _;
 use rig::completion::{CompletionModel, GetTokenUsage, Usage};
 use rig::message::{
-    self, DocumentSourceKind, Message, MimeType as _, ReasoningContent, UserContent,
+    self, AssistantContent, DocumentSourceKind, Message, MimeType as _, ReasoningContent, ToolCall,
+    ToolChoice, ToolResultContent, UserContent,
 };
 use rig::providers::{anthropic, gemini, openai};
 use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
@@ -17,7 +18,7 @@ use waku_protocol::settings::{
     ModelKind, ModelModality, ModelProtocol, ModelPurpose, ServiceModelOptions,
 };
 
-use super::{bearer_auth, transport::AssistantHttp};
+use super::{bearer_auth, search, transport::AssistantHttp};
 use crate::attachments::{AttachmentStore, AttachmentUpload, MAX_ATTACHMENT_BYTES};
 use crate::driver::DriverEventSender;
 use crate::model::{ActivityItem, ActivityKind, DriverEvent, MessageAttachment};
@@ -175,6 +176,13 @@ pub(super) struct ModelReply {
     pub tokens: TokenTotals,
 }
 
+struct ChatRound {
+    reply: ModelReply,
+    used: u64,
+    /// Preserve the provider's tool call IDs and reasoning for the follow-up request
+    continuation: Option<(Message, Vec<(ToolCall, String)>)>,
+}
+
 fn chat_tokens(usage: Option<Usage>, protocol: ModelProtocol) -> TokenTotals {
     let Some(usage) = usage else {
         return TokenTotals::default();
@@ -206,6 +214,16 @@ impl Chat<'_> {
         prompt: Message,
         events: &DriverEventSender,
     ) -> Result<ModelReply> {
+        self.send_with_search(http, prompt, events, None).await
+    }
+
+    pub async fn send_with_search(
+        self,
+        http: &reqwest::Client,
+        prompt: Message,
+        events: &DriverEventSender,
+        tavily: Option<&search::Tavily<'_>>,
+    ) -> Result<ModelReply> {
         let base = self.url.as_str().trim_end_matches('/');
         let model = self.model;
         let http = AssistantHttp::new(http.clone(), self.key.is_empty(), self.options.protocol);
@@ -216,7 +234,7 @@ impl Chat<'_> {
                     .base_url(base)
                     .http_client(http)
                     .build()?;
-                self.stream(client.completion_model(model), prompt, events)
+                self.stream(client.completion_model(model), prompt, events, tavily)
                     .await
             }
             ModelProtocol::OpenAiResponses => {
@@ -225,7 +243,7 @@ impl Chat<'_> {
                     .base_url(base)
                     .http_client(http)
                     .build()?;
-                self.stream(client.completion_model(model), prompt, events)
+                self.stream(client.completion_model(model), prompt, events, tavily)
                     .await
             }
             ModelProtocol::AnthropicMessages => {
@@ -234,7 +252,7 @@ impl Chat<'_> {
                     .base_url(base.trim_end_matches("/v1"))
                     .http_client(http)
                     .build()?;
-                self.stream(client.completion_model(model), prompt, events)
+                self.stream(client.completion_model(model), prompt, events, tavily)
                     .await
             }
             ModelProtocol::Gemini => {
@@ -250,7 +268,7 @@ impl Chat<'_> {
                     .base_url(base.trim_end_matches("/v1beta").trim_end_matches("/v1"))
                     .http_client(http)
                     .build()?;
-                self.stream(client.completion_model(model), prompt, events)
+                self.stream(client.completion_model(model), prompt, events, tavily)
                     .await
             }
         }
@@ -261,15 +279,82 @@ impl Chat<'_> {
         model: impl CompletionModel,
         prompt: Message,
         events: &DriverEventSender,
+        tavily: Option<&search::Tavily<'_>>,
     ) -> Result<ModelReply> {
+        let original = tavily.map(|_| prompt.clone());
+        let ChatRound {
+            mut reply,
+            mut used,
+            continuation,
+        } = self
+            .stream_round(
+                &model,
+                prompt,
+                &[],
+                tavily.map(|_| ToolChoice::Auto),
+                events,
+            )
+            .await?;
+
+        if let (Some(tavily), Some(original), Some((assistant, calls))) =
+            (tavily, original, continuation)
+        {
+            let (results, sources) = search_results(tavily, calls, events).await?;
+            if !reply.text.trim().is_empty() {
+                reply.text.push_str("\n\n");
+                let _ = events.send(DriverEvent::TextDelta("\n\n".into()));
+            }
+            let follow_up = self
+                .stream_round(
+                    &model,
+                    results,
+                    &[original, assistant],
+                    Some(ToolChoice::None),
+                    events,
+                )
+                .await?;
+            if follow_up.reply.text.trim().is_empty() {
+                bail!(tr!("assistant.search_reply_missing"));
+            }
+            used = follow_up.used;
+            reply.tokens.add(&follow_up.reply.tokens);
+            reply.text.push_str(&follow_up.reply.text);
+            if !sources.is_empty() {
+                let links = search::links(&sources);
+                reply.text.push_str(&links);
+                let _ = events.send(DriverEvent::TextDelta(links));
+            }
+        }
+
+        // The meter reflects the latest model request while billing includes both rounds
+        let _ = events.send(DriverEvent::UsageUpdated {
+            context_tokens: (used > 0).then_some(used),
+            context_window: self.options.context_window.map(u64::from),
+        });
+        Ok(reply)
+    }
+
+    async fn stream_round(
+        &self,
+        model: &impl CompletionModel,
+        prompt: Message,
+        extra_history: &[Message],
+        tool_choice: Option<ToolChoice>,
+        events: &DriverEventSender,
+    ) -> Result<ChatRound> {
         let window = self.options.context_window.map(|value| value as usize);
         let limit = [self.options.max_input_tokens, self.options.context_window]
             .into_iter()
             .flatten()
             .min();
         let mut input = self.preamble.len();
+        let tool = tool_choice.as_ref().map(|_| search::tool());
+        let history = self.history.iter().chain(extra_history);
         if let Some(limit) = limit {
-            for message in self.history.iter().chain(std::iter::once(&prompt)) {
+            if let Some(tool) = &tool {
+                input += serde_json::to_vec(tool)?.len();
+            }
+            for message in history.clone().chain(std::iter::once(&prompt)) {
                 input += estimate(message)?;
                 if input > limit as usize {
                     bail!("Estimated input exceeds the configured token budget ({input} tokens)");
@@ -287,10 +372,17 @@ impl Chat<'_> {
         // Keep the legacy limit field for compatible gateways that only accept it
         let completion_limit = self.options.protocol == ModelProtocol::OpenAiChat
             && (self.options.reasoning || self.url.host_str() == Some("api.openai.com"));
-        let params = protocol_parameters(self.options, self.model, output, completion_limit)?;
+        let mut params = protocol_parameters(self.options, self.model, output, completion_limit)?;
+        let can_search = matches!(tool_choice, Some(ToolChoice::Auto));
+        if can_search
+            && self.options.protocol == ModelProtocol::OpenAiResponses
+            && self.options.reasoning
+        {
+            params["include"] = json!(["reasoning.encrypted_content"]);
+        }
         let mut request = model
             .completion_request(prompt)
-            .messages(self.history.iter().cloned())
+            .messages(history.cloned())
             .additional_params(params)
             .max_tokens_opt(
                 output
@@ -300,11 +392,17 @@ impl Chat<'_> {
         if !self.preamble.is_empty() {
             request = request.preamble(self.preamble.to_owned());
         }
-        // Consume provider events directly since this session has no local tool executor
+        if let (Some(tool), Some(choice)) = (tool, tool_choice) {
+            request = request.tool(tool).tool_choice(choice);
+        }
         let mut stream = model.stream(request.build()).await?;
         let mut answer = String::new();
         let mut streamed_reasoning = String::new();
-        while let Some(item) = stream.next().await {
+        let mut calls = Vec::new();
+        let usage = loop {
+            let Some(item) = stream.next().await else {
+                bail!("The model stream ended before completing its response");
+            };
             match item? {
                 StreamedAssistantContent::Text(text) => {
                     answer.push_str(&text.text);
@@ -340,39 +438,168 @@ impl Chat<'_> {
                     internal_call_id,
                     content: ToolCallDeltaContent::Name(name),
                     ..
-                } if !name.is_empty() => report_tool_request(events, internal_call_id, &name, None),
+                } if !name.is_empty() => {
+                    if can_search && name == search::NAME {
+                        report_search(events, internal_call_id, None, None);
+                    } else {
+                        report_tool_request(events, internal_call_id, &name, None);
+                    }
+                }
                 StreamedAssistantContent::ToolCall {
                     tool_call,
                     internal_call_id,
                 } => {
-                    report_tool_request(
-                        events,
-                        internal_call_id,
-                        &tool_call.function.name,
-                        Some(tool_call.function.arguments.to_string()),
-                    );
+                    if !can_search || tool_call.function.name != search::NAME {
+                        report_tool_request(
+                            events,
+                            internal_call_id.clone(),
+                            &tool_call.function.name,
+                            Some(tool_call.function.arguments.to_string()),
+                        );
+                    }
+                    if can_search {
+                        calls.push((tool_call, internal_call_id));
+                    }
                 }
-                StreamedAssistantContent::Final(response) => {
-                    let usage = response.token_usage();
-                    let tokens = chat_tokens(usage, self.options.protocol);
-                    // Include cached input and reasoning once, using the reported total if it is larger
-                    let used = usage
-                        .map_or(0, |usage| usage.total_tokens)
-                        .max(tokens.total());
-                    let _ = events.send(DriverEvent::UsageUpdated {
-                        context_tokens: (used > 0).then_some(used),
-                        context_window: self.options.context_window.map(u64::from),
-                    });
-                    return Ok(ModelReply {
-                        text: answer,
-                        tokens,
-                    });
-                }
+                StreamedAssistantContent::Final(response) => break response.token_usage(),
                 _ => {}
             }
-        }
-        bail!("The model stream ended before completing its response")
+        };
+        let tokens = chat_tokens(usage, self.options.protocol);
+        let used = usage
+            .map_or(0, |usage| usage.total_tokens)
+            .max(tokens.total());
+        let continuation = if calls
+            .iter()
+            .any(|(call, _)| call.function.name == search::NAME)
+        {
+            // Rig builds its complete assistant message when the stream closes
+            while let Some(item) = stream.next().await {
+                item?;
+            }
+            let content = rig::OneOrMany::many(stream.choice.into_iter().filter(|item| {
+                // Keep only replayable provider reasoning blocks in the follow-up request
+                match (self.options.protocol, item) {
+                    (ModelProtocol::OpenAiResponses, AssistantContent::Reasoning(block)) => block
+                        .content
+                        .iter()
+                        .any(|part| matches!(part, ReasoningContent::Encrypted(_))),
+                    (ModelProtocol::AnthropicMessages, AssistantContent::Reasoning(block)) => {
+                        block.content.iter().any(|part| {
+                            matches!(
+                                part,
+                                ReasoningContent::Text {
+                                    signature: Some(_),
+                                    ..
+                                } | ReasoningContent::Redacted { .. }
+                            )
+                        })
+                    }
+                    _ => true,
+                }
+            }))?;
+            Some((
+                Message::Assistant {
+                    id: stream.message_id,
+                    content,
+                },
+                calls,
+            ))
+        } else {
+            None
+        };
+        Ok(ChatRound {
+            reply: ModelReply {
+                text: answer,
+                tokens,
+            },
+            used,
+            continuation,
+        })
     }
+}
+
+/// Execute one Tavily call and complete every provider tool call before asking for the answer
+async fn search_results(
+    tavily: &search::Tavily<'_>,
+    calls: Vec<(ToolCall, String)>,
+    events: &DriverEventSender,
+) -> Result<(Message, Vec<search::Source>)> {
+    let mut sources = None;
+    let mut results = Vec::new();
+    for (call, internal_id) in calls {
+        let output = if call.function.name != search::NAME {
+            tr!("assistant.tool_unavailable")
+        } else if sources.is_some() {
+            let message = tr!("assistant.search_limit");
+            report_search(events, internal_id, None, Some((true, message.clone())));
+            message
+        } else {
+            let query = serde_json::from_value::<search::Query>(call.function.arguments)
+                .context(tr!("assistant.search_invalid_query"));
+            report_search(
+                events,
+                internal_id.clone(),
+                query.as_ref().ok().map(|q| q.query.clone()),
+                None,
+            );
+            let found = match query {
+                Ok(query) => tavily.search(&query.query).await,
+                Err(error) => Err(error),
+            };
+            let found = match found {
+                Ok(found) => found,
+                Err(error) => {
+                    report_search(events, internal_id, None, Some((true, error.to_string())));
+                    return Err(error);
+                }
+            };
+            let output = serde_json::to_string(&found)?;
+            report_search(
+                events,
+                internal_id,
+                None,
+                Some((
+                    false,
+                    tr!("assistant.search_result_count", count = found.len()),
+                )),
+            );
+            sources = Some(found);
+            output
+        };
+        results.push(UserContent::ToolResult(message::ToolResult {
+            id: call.id,
+            call_id: call.call_id,
+            content: rig::OneOrMany::one(ToolResultContent::text(output)),
+        }));
+    }
+    Ok((
+        Message::User {
+            content: rig::OneOrMany::many(results)?,
+        },
+        sources.unwrap_or_default(),
+    ))
+}
+
+fn report_search(
+    events: &DriverEventSender,
+    id: String,
+    query: Option<String>,
+    result: Option<(bool, String)>,
+) {
+    let mut item = ActivityItem::new(
+        Some(id),
+        ActivityKind::Tool,
+        tr!("assistant.web_search"),
+        None,
+        result.is_some(),
+    )
+    .with_tool_name(Some(search::NAME))
+    .with_arguments(query);
+    if let Some((failed, output)) = result {
+        item = item.with_failed(failed).with_output(Some(output));
+    }
+    let _ = events.send(DriverEvent::RichActivity(item));
 }
 
 fn report_tool_request(
@@ -791,6 +1018,124 @@ mod tests {
                 "candidates":[{"content":{"parts":[{"text":"Plan","thought":true},{"text":"OK"}],"role":"model"},"finishReason":"STOP","index":0}],
                 "usageMetadata":{"promptTokenCount":6,"cachedContentTokenCount":2,"candidatesTokenCount":1,"thoughtsTokenCount":1,"totalTokenCount":8}
             })]),
+        }
+    }
+
+    fn search_call_stream(protocol: ModelProtocol) -> String {
+        let arguments = json!({"query":"public search terms"});
+        match protocol {
+            ModelProtocol::OpenAiChat => {
+                sse(vec![
+                    json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_search","type":"function","function":{"name":search::NAME,"arguments":arguments.to_string()}}]},"finish_reason":null}]}),
+                    json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+                ]) + "data: [DONE]\n\n"
+            }
+            ModelProtocol::OpenAiResponses => sse(vec![
+                json!({"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{
+                    "type":"function_call","id":"fc_test","call_id":"call_search","status":"completed",
+                    "name":search::NAME,"arguments":arguments.to_string()
+                }}),
+                json!({"type":"response.completed","sequence_number":2,"response":{
+                    "id":"resp_test","object":"response","created_at":0,"status":"completed","model":"demo","output":[]
+                }}),
+            ]),
+            ModelProtocol::AnthropicMessages => sse(vec![
+                json!({"type":"message_start","message":{"id":"msg_test","role":"assistant","content":[],"model":"demo","usage":{"input_tokens":12,"output_tokens":0}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_search","name":search::NAME,"input":{}}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":arguments.to_string()}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}),
+                json!({"type":"message_stop"}),
+            ]),
+            ModelProtocol::Gemini => sse(vec![json!({
+                "candidates":[{"content":{"parts":[{"functionCall":{"name":search::NAME,"args":arguments}}],"role":"model"},"finishReason":"STOP","index":0}],
+                "usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":1,"totalTokenCount":13}
+            })]),
+        }
+    }
+
+    #[tokio::test]
+    async fn assistant_search_gives_each_protocol_results_and_appends_verified_links() {
+        use super::super::tests::{mock_service, request, send};
+
+        let http = super::super::http_client().unwrap();
+        for protocol in [
+            ModelProtocol::OpenAiChat,
+            ModelProtocol::OpenAiResponses,
+            ModelProtocol::AnthropicMessages,
+            ModelProtocol::Gemini,
+        ] {
+            let (listener, service) = mock_service("Fixture", "demo");
+            let (search_listener, search_service) = mock_service("Search fixture", "unused");
+            let model_server = std::thread::spawn(move || {
+                let (socket, _, first, auth) = request(&listener);
+                assert!(first["tools"].to_string().contains(search::NAME), "{first}");
+                assert_ne!(auth.as_deref(), Some("Bearer fixture-tavily-key"));
+                send(socket, "text/event-stream", &search_call_stream(protocol));
+                let (socket, _, second, _) = request(&listener);
+                assert!(second.to_string().contains("Verified example"), "{second}");
+                assert!(!second.to_string().contains("javascript:"));
+                send(socket, "text/event-stream", &receive_chat(protocol));
+                second
+            });
+            let search_server = std::thread::spawn(move || {
+                let (socket, method, body, auth) = request(&search_listener);
+                assert_eq!(method, "POST /v1/search");
+                assert_eq!(auth.as_deref(), Some("Bearer fixture-tavily-key"));
+                assert_eq!(
+                    body,
+                    json!({"query":"public search terms","max_results":5,"search_depth":"basic"})
+                );
+                send(socket, "application/json", &json!({"results":[
+                    {"title":"Verified example","url":"https://example.org/report(a)","content":"An attributed fact"},
+                    {"title":"Invalid address","url":"javascript:alert(1)","content":"discard this"}
+                ]}).to_string());
+            });
+            let options = ServiceModelOptions {
+                protocol,
+                max_output_tokens: Some(2048),
+                ..Default::default()
+            };
+            let url = Url::parse(&service.base_url).unwrap();
+            let endpoint = format!("{}/search", search_service.base_url);
+            let tavily = search::Tavily {
+                http: &http,
+                endpoint: &endpoint,
+                key: "fixture-tavily-key",
+            };
+            let (events, received) = crate::driver::test_event_channel();
+            let reply = Chat {
+                url: &url,
+                key: "",
+                model: "demo",
+                options: &options,
+                preamble: "private system prompt",
+                history: &[],
+            }
+            .send_with_search(
+                &http,
+                Message::user("private user turn"),
+                &events,
+                Some(&tavily),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{protocol:?}: {error:#}"));
+            assert!(reply.text.starts_with("OK"), "{protocol:?}: {}", reply.text);
+            assert!(
+                reply
+                    .text
+                    .contains("[Verified example](<https://example.org/report(a)>)")
+            );
+            assert!(received.try_iter().any(|event| matches!(event, DriverEvent::RichActivity(item) if item.complete && !item.failed && item.tool_name.as_deref() == Some(search::NAME))));
+            search_server.join().unwrap();
+            let second = model_server.join().unwrap();
+            assert_eq!(
+                second
+                    .to_string()
+                    .matches("https://example.org/report(a)")
+                    .count(),
+                1
+            );
         }
     }
 

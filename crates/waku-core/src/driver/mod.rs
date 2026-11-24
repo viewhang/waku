@@ -115,6 +115,10 @@ impl DriverHandle {
         self.inner.clear_assistant_context();
     }
 
+    pub(crate) fn set_assistant_web_search(&self, enabled: bool) {
+        self.inner.set_assistant_web_search(enabled);
+    }
+
     pub fn cancel_computer_use(&self) {
         self.inner.cancel_computer_use();
     }
@@ -179,6 +183,7 @@ pub trait DriverControl: Send + Sync {
         false
     }
     fn clear_assistant_context(&self) {}
+    fn set_assistant_web_search(&self, _enabled: bool) {}
     fn cancel_computer_use(&self) {}
     fn refresh_background_work(&self) {}
     fn stop_background_work(&self, _key: BackgroundWorkKey, _control_id: String) {}

@@ -215,6 +215,7 @@ enum SettingsPage {
     Assistants,
     General,
     ModelServices,
+    SearchProviders,
     Providers,
     Skills,
     Usage,
@@ -1071,6 +1072,8 @@ pub struct Waku {
     model_search: Entity<TextInput>,
     settings_search: Entity<TextInput>,
     assistant_form: assistants::AssistantForm,
+    tavily_key_input: Entity<TextInput>,
+    tavily_key_pending: bool,
     model_services_page: model_services_page::ModelServicesPage,
     model_service_form: Option<model_services::ModelServiceForm>,
     assistant_model_scroll: gpui::UniformListScrollHandle,
@@ -1300,6 +1303,8 @@ pub struct Waku {
     submission_preparations: HashSet<Uuid>,
     /// Hold new prompts until the daemon has saved the assistant context reset
     assistant_context_resets_pending: HashSet<Uuid>,
+    /// Hold new prompts until the daemon has applied the assistant's search choice
+    assistant_web_search_pending: HashSet<Uuid>,
     /// First Escape press for the current turn. A matching second press stops
     /// the response; otherwise this returns to the ordinary Stop icon after a
     /// short timeout.
@@ -2015,6 +2020,7 @@ impl Waku {
         });
         let assistant_form =
             assistants::AssistantForm::new(window, cx, state.assistant_profiles.first());
+        let tavily_key_input = cx.new(|cx| TextInput::new(window, cx).password().tab_stop());
         let model_services_page = model_services_page::ModelServicesPage::new(window, cx);
         let assistant_model_scroll = gpui::UniformListScrollHandle::new();
         let daemon_port = state.daemon_exposure.port.to_string();
@@ -2770,6 +2776,8 @@ impl Waku {
                 project_search,
                 settings_search,
                 assistant_form,
+                tavily_key_input,
+                tavily_key_pending: false,
                 model_services_page,
                 model_service_form: None,
                 assistant_model_scroll,
@@ -2892,6 +2900,7 @@ impl Waku {
                 last_background_work_tick: Instant::now(),
                 submission_preparations: HashSet::new(),
                 assistant_context_resets_pending: HashSet::new(),
+                assistant_web_search_pending: HashSet::new(),
                 escape_stop_confirmation: EscapeStopConfirmation::default(),
                 response_fork_preparations: HashMap::new(),
                 pending_queue_drains: Vec::new(),

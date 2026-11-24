@@ -1,6 +1,7 @@
 //! Direct model sessions stream replies through Rig
 
 mod request;
+mod search;
 mod transport;
 
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use waku_protocol::settings::{
 
 use super::{DriverControl, DriverEventSender, DriverHandle};
 use crate::model::{DriverEvent, Message, MessageAttachment, MessageRole, ProviderResumeCursor};
-use crate::settings::DaemonSettingsStore;
+use crate::settings::{DaemonSettingsStore, TAVILY_ENDPOINT};
 use crate::usage_history::AssistantUsage;
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(120);
@@ -369,7 +370,7 @@ fn redacted_error(error: anyhow::Error, key: &str) -> String {
 }
 
 enum Control {
-    Prompt(String, Vec<MessageAttachment>),
+    Prompt(String, Vec<MessageAttachment>, bool),
     Cancel,
     ClearContext,
 }
@@ -377,6 +378,7 @@ enum Control {
 /// Closing the last handle drops the channel and cancels any active model stream
 struct AssistantDriver {
     commands: mpsc::UnboundedSender<Control>,
+    web_search: AtomicBool,
     /// Counts a queued prompt as busy before the worker starts its request
     busy: Arc<AtomicBool>,
 }
@@ -388,7 +390,11 @@ impl DriverControl for AssistantDriver {
 
     fn prompt_with_attachments(&self, prompt: String, attachments: Vec<MessageAttachment>) {
         self.busy.store(true, Ordering::Release);
-        let _ = self.commands.send(Control::Prompt(prompt, attachments));
+        // Snapshot the switch for the entire turn before handing the prompt to the worker
+        let web_search = self.web_search.load(Ordering::Acquire);
+        let _ = self
+            .commands
+            .send(Control::Prompt(prompt, attachments, web_search));
     }
 
     fn cancel(&self) {
@@ -403,6 +409,10 @@ impl DriverControl for AssistantDriver {
         let _ = self.commands.send(Control::ClearContext);
     }
 
+    fn set_assistant_web_search(&self, enabled: bool) {
+        self.web_search.store(enabled, Ordering::Release);
+    }
+
     fn respond(&self, _: String, _: String) {}
 
     fn rollback(&self, _: usize) -> anyhow::Result<Option<ProviderResumeCursor>> {
@@ -412,6 +422,7 @@ impl DriverControl for AssistantDriver {
 
 pub(crate) fn start(
     profile: AssistantProfile,
+    web_search: bool,
     settings: Arc<DaemonSettingsStore>,
     attachments: AttachmentStore,
     messages: Vec<Message>,
@@ -460,6 +471,7 @@ pub(crate) fn start(
         .context("Could not start the assistant worker")?;
     Ok(DriverHandle::from_control(Arc::new(AssistantDriver {
         commands: tx,
+        web_search: AtomicBool::new(web_search),
         busy,
     })))
 }
@@ -505,8 +517,8 @@ fn run(
         let http = http_client()?;
         let legacy_options = ServiceModelOptions::default();
         while let Some(command) = commands.recv().await {
-            let (prompt, input) = match command {
-                Control::Prompt(prompt, input) => (prompt, input),
+            let (prompt, input, web_search) = match command {
+                Control::Prompt(prompt, input, web_search) => (prompt, input, web_search),
                 Control::ClearContext => {
                     history.clear();
                     continue;
@@ -531,6 +543,23 @@ fn run(
                 let result = async {
                     let media = request::read_media(&attachments, input, options)?;
                     if options.dialogue() {
+                        let tavily_key = if web_search {
+                            if !options.tools {
+                                bail!(tr!("assistant.search_requires_tools"));
+                            }
+                            Some(
+                                settings
+                                    .tavily_api_key()?
+                                    .context(tr!("search_providers.tavily_key_required"))?,
+                            )
+                        } else {
+                            None
+                        };
+                        let tavily = tavily_key.as_deref().map(|key| search::Tavily {
+                            http: &http,
+                            endpoint: TAVILY_ENDPOINT,
+                            key,
+                        });
                         let prompt = request::message(prompt, media)?;
                         let answer = request::Chat {
                             url: &url,
@@ -540,7 +569,7 @@ fn run(
                             preamble: &profile.system_prompt,
                             history: &history,
                         }
-                        .send(&http, prompt.clone(), events)
+                        .send_with_search(&http, prompt.clone(), events, tavily.as_ref())
                         .await?;
                         let mut messages = vec![prompt];
                         if !answer.text.is_empty() {
@@ -779,6 +808,7 @@ pub(crate) mod tests {
             name: "Guide".into(),
             system_prompt: "Answer concisely".into(),
             model: "first-model".into(),
+            web_search: false,
             model_service_id: Some(first_service.id),
             base_url: String::new(),
         };
@@ -910,7 +940,7 @@ pub(crate) mod tests {
         (socket, method, body, auth)
     }
 
-    fn send(mut socket: std::net::TcpStream, mime: &str, body: &str) {
+    pub(super) fn send(mut socket: std::net::TcpStream, mime: &str, body: &str) {
         write!(
             socket,
             "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -940,6 +970,7 @@ pub(crate) mod tests {
         let (events, receiver) = super::super::test_event_channel();
         let driver = start(
             profile,
+            false,
             settings,
             AttachmentStore::new(project.join("attachments")),
             history,

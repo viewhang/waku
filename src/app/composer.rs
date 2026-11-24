@@ -2707,6 +2707,166 @@ impl Waku {
         )
     }
 
+    fn render_assistant_web_search(
+        &self,
+        session: &AgentSession,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = Theme::current(cx);
+        let enabled = session.assistant_web_search.unwrap_or_else(|| {
+            self.state.assistant_profiles.iter().any(|profile| {
+                Some(profile.id) == session.assistant_profile_id() && profile.web_search
+            })
+        });
+        let disabled = !session.detail_loaded
+            || self.submission_preparations.contains(&session.id)
+            || self.assistant_web_search_pending.contains(&session.id);
+        let focus = self.transcript_control_focus("assistant-web-search", cx);
+        let session_id = session.id;
+        let label = if enabled {
+            tr!("composer.disable_web_search")
+        } else {
+            tr!("composer.enable_web_search")
+        };
+        div()
+            .id("assistant-web-search")
+            .size(px(26.0))
+            .flex_none()
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_default()
+            .when(enabled, |button| {
+                button
+                    .border_1()
+                    .border_color(theme.accent.opacity(0.42))
+                    .bg(theme.accent.opacity(0.10))
+            })
+            .child(icon(
+                "icons/globe.svg",
+                14.0,
+                if enabled {
+                    theme.accent
+                } else {
+                    theme.text_secondary
+                },
+            ))
+            .track_focus(&focus)
+            .tab_index(0)
+            .tab_stop(true)
+            .focus_visible(|button| button.border_1().border_color(theme.accent))
+            .aria_label(label.clone())
+            .tooltip(Tooltip::text(label))
+            .when(disabled, |button| button.opacity(0.55))
+            .when(!disabled, |button| {
+                button
+                    .hover(|button| {
+                        button.bg(if enabled {
+                            theme.accent.opacity(0.16)
+                        } else {
+                            theme.overlay
+                        })
+                    })
+                    .active(|button| button.bg(theme.overlay_strong))
+                    .on_activation(cx, move |this, _, cx| {
+                        this.set_assistant_web_search(session_id, !enabled, cx);
+                    })
+            })
+    }
+
+    /// Wait for the daemon to persist the choice before accepting a prompt
+    fn set_assistant_web_search(
+        &mut self,
+        session_id: Uuid,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.submission_preparations.contains(&session_id) {
+            return;
+        }
+        let Some(session) = self.selected_session().filter(|session| {
+            session.id == session_id
+                && session.provider == ProviderKind::Assistant
+                && session.detail_loaded
+        }) else {
+            return;
+        };
+        // An untouched draft may only have a queued task save, so acknowledge it first
+        let draft = (!session.has_started()).then(|| {
+            let projects = self
+                .state
+                .projects
+                .iter()
+                .filter(|project| project.id == session.project_id)
+                .cloned()
+                .collect();
+            (session.clone(), projects)
+        });
+        if !self.assistant_web_search_pending.insert(session_id) {
+            return;
+        }
+        let was_draft = draft.is_some();
+        let client = self.daemon.client();
+        cx.spawn(async move |waku, cx| {
+            let result: anyhow::Result<()> = cx
+                .background_executor()
+                .spawn(async move {
+                    use waku_client::{Command, ResponsePayload};
+
+                    if let Some((session, projects)) = draft {
+                        let response = client.request(
+                            Uuid::nil(),
+                            Uuid::nil(),
+                            Command::SaveTaskState {
+                                projects,
+                                live_session_ids: vec![session_id],
+                                sessions: vec![session],
+                            },
+                        )?;
+                        anyhow::ensure!(
+                            matches!(response, ResponsePayload::TaskStateSaved { .. }),
+                            tr!("assistant.invalid_response")
+                        );
+                    }
+                    let response = client.request(
+                        session_id,
+                        Uuid::nil(),
+                        Command::SetAssistantWebSearch { enabled },
+                    )?;
+                    anyhow::ensure!(
+                        matches!(response, ResponsePayload::Ack),
+                        tr!("assistant.invalid_response")
+                    );
+                    Ok(())
+                })
+                .await;
+            let _ = waku.update(cx, |waku, cx| {
+                waku.assistant_web_search_pending.remove(&session_id);
+                match result {
+                    Ok(()) => {
+                        if let Some(session) = waku
+                            .state
+                            .sessions
+                            .iter_mut()
+                            .find(|session| session.id == session_id)
+                        {
+                            session.assistant_web_search = Some(enabled);
+                            if was_draft {
+                                waku.save();
+                            }
+                        }
+                    }
+                    Err(error) => waku.show_toast(tr!("errors.save_local_state", error = error)),
+                }
+                waku.drain_queued_message(session_id, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// The daemon acknowledges the reset before the next prompt can leave the composer
     fn clear_assistant_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((session_id, turn_id)) = self
@@ -2784,7 +2944,9 @@ impl Waku {
         let no_providers = !native && self.model_picker_has_no_providers();
         let resetting_context = session
             .is_some_and(|session| self.assistant_context_resets_pending.contains(&session.id));
-        let can_send = has_draft && !no_providers && !resetting_context;
+        let saving_search =
+            session.is_some_and(|session| self.assistant_web_search_pending.contains(&session.id));
+        let can_send = has_draft && !no_providers && !resetting_context && !saving_search;
         let (autocomplete, autocomplete_actionable) =
             match self.render_composer_autocomplete(window, cx) {
                 Some((element, actionable)) => (Some(element), actionable),
@@ -2865,6 +3027,9 @@ impl Waku {
                         .children(self.render_agent_preset_control(cx))
                         .when(!native, |row| row.child(self.render_access_control(cx)))
                         .children(self.render_goal_control(cx))
+                        .when_some(session.filter(|_| native), |row, session| {
+                            row.child(self.render_assistant_web_search(session, cx))
+                        })
                         .when(native, |row| {
                             let enabled = !resetting_context
                                 && session

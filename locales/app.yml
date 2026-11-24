@@ -1217,6 +1217,10 @@ composer.queue_followup:
   en: Queue as follow-up (⏎)
 composer.clear_context:
   en: Clear context
+composer.enable_web_search:
+  en: Enable web search
+composer.disable_web_search:
+  en: Disable web search
 composer.clear_context_failed:
   en: "Could not clear context: %{error}"
 composer.message:
@@ -2254,6 +2258,40 @@ assistant.test_ok:
   en: The model connection works
 assistant.tool_unavailable:
   en: This tool is unavailable in this assistant session
+assistant.web_search:
+  en: "Web search"
+search_providers.settings:
+  en: Search providers
+search_providers.keywords:
+  en: search providers tavily web search api key
+search_providers.api_key:
+  en: "Tavily API key (shared by assistants)"
+search_providers.save_key:
+  en: "Save key"
+search_providers.clear_key:
+  en: "Clear key"
+search_providers.tavily_key_required:
+  en: "Enter a Tavily API key in Settings → Search providers"
+search_providers.tavily_key_saved:
+  en: "Tavily API key saved"
+search_providers.tavily_key_cleared:
+  en: "Tavily API key cleared"
+search_providers.tavily_key_failed:
+  en: "Could not save the Tavily API key: %{error}"
+assistant.search_requires_tools:
+  en: "Web search needs a model with tool support enabled"
+assistant.search_invalid_query:
+  en: "The model must supply a search query of 1 to 400 characters"
+assistant.search_http_error:
+  en: "Tavily search failed (HTTP %{status})"
+assistant.search_limit:
+  en: "Only one web search is available per reply"
+assistant.search_reply_missing:
+  en: "The model returned no answer after searching"
+assistant.search_result_count:
+  en: "%{count} sources found"
+assistant.search_sources:
+  en: "Sources"
 assistant.model_unavailable:
   en: "%{model} is unavailable. Choose another model."
 assistant.invalid_response:

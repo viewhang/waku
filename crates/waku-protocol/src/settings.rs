@@ -16,6 +16,9 @@ pub struct AssistantProfile {
     pub name: String,
     pub system_prompt: String,
     pub model: String,
+    /// Previous assistant-wide preference for sessions without a saved choice
+    #[serde(default)]
+    pub web_search: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_service_id: Option<Uuid>,
     /// Endpoint stored by older assistant profiles and sessions

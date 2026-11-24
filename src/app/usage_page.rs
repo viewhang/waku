@@ -44,8 +44,7 @@ fn usage_provider_label(provider: UsageProvider) -> String {
 }
 
 impl Waku {
-    /// Switch the settings view to `page`, warming the Usage scan when that
-    /// is where the user is heading.
+    /// Switch the settings view and refresh the data used by the destination
     pub(super) fn open_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
         // Secrets are revealed only for the current visit to the page. This
         // also masks the token again when the Daemon row is reselected.
@@ -59,6 +58,9 @@ impl Waku {
         }
         if page == SettingsPage::Skills {
             self.ensure_skills_catalog(false, cx);
+        }
+        if page == SettingsPage::SearchProviders {
+            self.refresh_tavily_key_status(cx);
         }
         cx.notify();
     }

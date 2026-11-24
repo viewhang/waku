@@ -301,6 +301,13 @@ impl Backend for WakuBackend {
             Command::GetSettings => Ok(ResponsePayload::Settings {
                 settings: self.settings.get(),
             }),
+            Command::GetTavilyApiKeyStatus => Ok(ResponsePayload::TavilyApiKeyStatus {
+                configured: self.settings.tavily_api_key()?.is_some(),
+            }),
+            Command::SaveTavilyApiKey { api_key } => {
+                self.settings.save_tavily_api_key(&api_key)?;
+                Ok(ResponsePayload::Ack)
+            }
             Command::SaveModelService { service, api_key } => {
                 let service = self
                     .settings
@@ -518,9 +525,10 @@ impl Backend for WakuBackend {
                         ) {
                             merge_stale_session_metadata(existing, session);
                         } else {
-                            // Only the daemon can change reset boundaries, even if an older client saves last
+                            // Keep daemon-owned assistant options when a client saves its transcript
                             if existing.provider == ProviderKind::Assistant {
                                 self.task_store.hydrate(existing)?;
+                                session.assistant_web_search = existing.assistant_web_search;
                                 session.assistant_context_resets =
                                     existing.assistant_context_resets.clone();
                                 // A projection ending at the reset boundary cannot retain old usage
@@ -841,6 +849,33 @@ impl Backend for WakuBackend {
                     cleanup_warning,
                 })
             }
+            Command::SetAssistantWebSearch { enabled } => {
+                let driver = self
+                    .sessions
+                    .lock()
+                    .get(&session_id)
+                    .map(|(_, driver)| driver.clone());
+                let mut state = self.task_state.lock();
+                let index = state
+                    .sessions
+                    .iter()
+                    .position(|session| {
+                        session.id == session_id && session.provider == ProviderKind::Assistant
+                    })
+                    .context("Assistant session no longer exists")?;
+                let session = &mut state.sessions[index];
+                self.task_store.hydrate(session)?;
+                let previous = session.assistant_web_search.replace(enabled);
+                state.mark_session_dirty(session_id);
+                if let Err(error) = self.task_store.save(&mut state) {
+                    state.sessions[index].assistant_web_search = previous;
+                    return Err(error.into());
+                }
+                if let Some(driver) = driver {
+                    driver.set_assistant_web_search(enabled);
+                }
+                Ok(ResponsePayload::Ack)
+            }
             Command::ClearAssistantContext { turn_id } => {
                 let driver = self
                     .sessions
@@ -984,8 +1019,13 @@ impl Backend for WakuBackend {
                     if let Some(session) = stored.as_mut() {
                         self.task_store.hydrate(session)?;
                     }
+                    let web_search = stored
+                        .as_ref()
+                        .and_then(|session| session.assistant_web_search)
+                        .unwrap_or_else(|| self.settings.assistant_web_search(profile.id));
                     driver::assistant::start(
                         profile,
+                        web_search,
                         self.settings.clone(),
                         self.attachments.clone(),
                         stored
@@ -2013,6 +2053,9 @@ fn handle_driver_command(
         }
         Command::AttachSession
         | Command::Start { .. }
+        | Command::GetTavilyApiKeyStatus
+        | Command::SaveTavilyApiKey { .. }
+        | Command::SetAssistantWebSearch { .. }
         | Command::SaveModelService { .. }
         | Command::SetModelServiceEnabled { .. }
         | Command::TestModelService { .. }

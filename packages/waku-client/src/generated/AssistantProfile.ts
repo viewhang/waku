@@ -3,7 +3,11 @@
 /**
  * Reusable direct-model configuration saved by the daemon without credentials
  */
-export type AssistantProfile = { id: string, name: string, system_prompt: string, model: string, model_service_id?: string | null,
+export type AssistantProfile = { id: string, name: string, system_prompt: string, model: string,
+/**
+ * Previous assistant-wide preference for sessions without a saved choice
+ */
+web_search: boolean, model_service_id?: string | null,
 /**
  * Endpoint stored by older assistant profiles and sessions
  */

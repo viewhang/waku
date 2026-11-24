@@ -835,7 +835,7 @@ impl Waku {
         let translate = self
             .render_sidebar_action_row(
                 "sidebar-translation",
-                "icons/globe.svg",
+                "icons/translate.svg",
                 tr!("translation.title"),
                 cx,
             )

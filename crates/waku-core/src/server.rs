@@ -794,6 +794,7 @@ fn command_targets_runtime(command: &Command) -> bool {
             | Command::ForkSessionFromResponse { .. }
             | Command::RewindSessionToMessage { .. }
             | Command::ClearAssistantContext { .. }
+            | Command::SetAssistantWebSearch { .. }
             | Command::OpenTerminal { .. }
             | Command::WriteTerminal { .. }
             | Command::ResizeTerminal { .. }
@@ -1005,6 +1006,7 @@ fn task_catalog_action(command: &Command) -> TaskCatalogAction {
         Command::RemoveSession
         | Command::ForkSessionFromResponse { .. }
         | Command::RewindSessionToMessage { .. }
+        | Command::SetAssistantWebSearch { .. }
         | Command::ClearAssistantContext { .. } => TaskCatalogAction::Changed,
         _ => TaskCatalogAction::None,
     }
@@ -1373,12 +1375,8 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn assistant_context_reset_survives_reopen_and_excludes_old_model_history() {
-        use crate::driver::assistant::tests::{mock_service, request, stream};
-        use crate::model::{ContextUsage, MessageRole, TurnStatus};
-        use waku_protocol::settings::AssistantProfile;
-
-        let root = std::env::temp_dir().join(format!("waku-clear-context-{}", Uuid::new_v4()));
+    fn tavily_key_status_reports_presence_after_reopen_and_clear() {
+        let root = std::env::temp_dir().join(format!("waku-tavily-status-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let open_backend = || {
             WakuBackend::new(
@@ -1387,18 +1385,93 @@ mod tests {
             )
             .unwrap()
         };
+        let hub = Arc::new(Hub::default());
+        let call = |backend: &WakuBackend, command| {
+            backend
+                .handle(
+                    Request {
+                        request_id: Uuid::new_v4(),
+                        session_id: Uuid::nil(),
+                        runtime_id: Uuid::nil(),
+                        command,
+                    },
+                    hub.event_sink(Uuid::nil(), Uuid::nil()),
+                )
+                .unwrap()
+        };
+        let assert_status = |backend: &WakuBackend, configured| {
+            let status = call(backend, Command::GetTavilyApiKeyStatus);
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                json!({"type": "tavilyApiKeyStatus", "configured": configured})
+            );
+        };
+
+        let backend = open_backend();
+        assert_status(&backend, false);
+        call(
+            &backend,
+            Command::SaveTavilyApiKey {
+                api_key: "fixture-key".into(),
+            },
+        );
+        assert_status(&backend, true);
+        drop(backend);
+        let reopened = open_backend();
+        assert_status(&reopened, true);
+        call(
+            &reopened,
+            Command::SaveTavilyApiKey {
+                api_key: String::new(),
+            },
+        );
+        assert_status(&reopened, false);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn assistant_context_reset_and_search_choice_survive_reopen() {
+        use crate::driver::assistant::tests::{mock_service, request, stream};
+        use crate::model::{ContextUsage, MessageRole, TurnStatus};
+        use waku_protocol::settings::AssistantProfile;
+
+        let root = std::env::temp_dir().join(format!("waku-clear-context-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let open_backend = || {
+            let settings = DaemonSettingsStore::open(root.join("settings.json")).unwrap();
+            settings.save_tavily_api_key("fixture-key").unwrap();
+            WakuBackend::new(settings, StateStore::daemon(root.join("app.db"))).unwrap()
+        };
         let (listener, service) = mock_service("Test provider", "test-chat");
         let mock_provider = std::thread::spawn(move || {
-            for expected in [
-                vec!["Test preamble", "first new prompt"],
-                vec![
-                    "Test preamble",
-                    "first new prompt",
-                    "reply",
-                    "second new prompt",
-                ],
+            for (web_search, expected) in [
+                (true, vec!["Test preamble", "first new prompt"]),
+                (
+                    true,
+                    vec![
+                        "Test preamble",
+                        "first new prompt",
+                        "reply",
+                        "second new prompt",
+                    ],
+                ),
+                (
+                    false,
+                    vec![
+                        "Test preamble",
+                        "first new prompt",
+                        "reply",
+                        "second new prompt",
+                        "reply",
+                        "search off",
+                    ],
+                ),
             ] {
                 let (socket, _, body, _) = request(&listener);
+                let tools = body["tools"].as_array();
+                assert_eq!(tools.is_some_and(|tools| !tools.is_empty()), web_search);
                 let text = body["messages"]
                     .as_array()
                     .unwrap()
@@ -1431,6 +1504,7 @@ mod tests {
             name: "Test assistant".into(),
             system_prompt: "Test preamble".into(),
             model: "test-chat".into(),
+            web_search: false,
             model_service_id: None,
             base_url: service.base_url,
         };
@@ -1439,7 +1513,7 @@ mod tests {
         let hub = Arc::new(Hub::default());
         let (outgoing, events) = unbounded();
         hub.subscribe(&[], Subscriber::new(outgoing).0);
-        let call = |backend: &WakuBackend, runtime_id, command| {
+        let call_for = |backend: &WakuBackend, session_id, runtime_id, command| {
             backend
                 .handle(
                     Request {
@@ -1452,13 +1526,16 @@ mod tests {
                 )
                 .unwrap()
         };
+        let call = |backend: &WakuBackend, runtime_id, command| {
+            call_for(backend, session_id, runtime_id, command)
+        };
         let save = |backend: &WakuBackend, session: &AgentSession| {
             call(
                 backend,
                 Uuid::nil(),
                 Command::SaveTaskState {
                     projects: vec![project.clone()],
-                    live_session_ids: vec![session_id],
+                    live_session_ids: vec![session.id],
                     sessions: vec![session.clone()],
                 },
             )
@@ -1512,6 +1589,20 @@ mod tests {
         let runtime_id = Uuid::new_v4();
         save(&backend, &session);
         start(&backend, runtime_id);
+        let mut other = AgentSession::new(project.id, ProviderKind::Assistant);
+        other.assistant = Some(profile.clone());
+        save(&backend, &other);
+        call_for(
+            &backend,
+            other.id,
+            Uuid::nil(),
+            Command::SetAssistantWebSearch { enabled: false },
+        );
+        call(
+            &backend,
+            Uuid::nil(),
+            Command::SetAssistantWebSearch { enabled: true },
+        );
         for _ in 0..2 {
             call(
                 &backend,
@@ -1558,11 +1649,32 @@ mod tests {
             panic!("expected saved assistant session");
         };
         assert_eq!(restored.assistant_context_resets, vec![turn_id]);
+        assert_eq!(restored.assistant_web_search, Some(true));
         assert_eq!(restored.messages.len(), 4);
         assert_eq!(restored.messages[0].content, "old context");
+        let ResponsePayload::Session {
+            session: Some(other),
+        } = call(
+            &backend,
+            Uuid::nil(),
+            Command::HydrateSession {
+                session_id: other.id,
+            },
+        )
+        else {
+            panic!("expected the unsent conversation with its own search choice");
+        };
+        assert_eq!(other.assistant_web_search, Some(false));
+        assert!(other.messages.is_empty());
         let new_runtime_id = Uuid::new_v4();
         start(&backend, new_runtime_id);
         prompt(&backend, new_runtime_id, "second new prompt");
+        call(
+            &backend,
+            Uuid::nil(),
+            Command::SetAssistantWebSearch { enabled: false },
+        );
+        prompt(&backend, new_runtime_id, "search off");
         mock_provider.join().unwrap();
         drop(backend);
         std::fs::remove_dir_all(root).unwrap();

@@ -968,6 +968,9 @@ pub struct AgentSession {
     /// Native sessions retain the configuration chosen when they were created
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant: Option<crate::settings::AssistantProfile>,
+    /// Latest web-search choice for this conversation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_web_search: Option<bool>,
     /// Completed assistant chat boundaries retained as transcript dividers
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assistant_context_resets: Vec<Uuid>,
@@ -1056,6 +1059,7 @@ impl AgentSession {
             provider,
             assistant_id: None,
             assistant: None,
+            assistant_web_search: None,
             assistant_context_resets: Vec::new(),
             model: None,
             runtime_mode: RuntimeMode::FullAccess,
@@ -1096,6 +1100,7 @@ impl AgentSession {
             provider: self.provider,
             assistant_id: self.assistant_profile_id(),
             assistant: None,
+            assistant_web_search: self.assistant_web_search,
             assistant_context_resets: self.assistant_context_resets.clone(),
             model: self.model.clone(),
             runtime_mode: RuntimeMode::default(),
@@ -1158,9 +1163,9 @@ impl AgentSession {
     }
 
     pub fn has_started(&self) -> bool {
-        // A skeleton came from a stored row, and only started sessions are
-        // stored, so it has started even though its transcript is not loaded.
+        // A saved search choice also makes an empty assistant session worth keeping
         !self.detail_loaded
+            || (self.provider == ProviderKind::Assistant && self.assistant_web_search.is_some())
             || !self.turns.is_empty()
             || !self.messages.is_empty()
             || self.provider_cursor.is_some()

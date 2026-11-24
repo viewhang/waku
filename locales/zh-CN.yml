@@ -594,6 +594,8 @@ user_input.progress: "%{current} / %{total}"
 composer.preparing_task: 正在准备任务…
 composer.queue_followup: 排队为后续消息（⏎）
 composer.clear_context: 清空上下文
+composer.enable_web_search: 开启联网搜索
+composer.disable_web_search: 关闭联网搜索
 composer.clear_context_failed: "无法清空上下文：%{error}"
 composer.message: 消息
 composer.queue_placeholder: 添加后续消息…
@@ -1100,6 +1102,23 @@ assistant.current_project: "已选项目：%{project}"
 assistant.text_only: 此助手支持文本输入，请先移除附件
 assistant.test_ok: 模型连接正常
 assistant.tool_unavailable: 此助手会话未配置该工具，未执行
+assistant.web_search: "联网搜索"
+search_providers.settings: 搜索供应商
+search_providers.keywords: 搜索供应商 搜索服务商 联网搜索 Tavily API 密钥
+search_providers.api_key: "Tavily API 密钥（助手共用）"
+search_providers.save_key: "保存密钥"
+search_providers.clear_key: "清除密钥"
+search_providers.tavily_key_required: "请在「设置 → 搜索供应商」中填写 Tavily API 密钥"
+search_providers.tavily_key_saved: "已保存 Tavily API 密钥"
+search_providers.tavily_key_cleared: "已清除 Tavily API 密钥"
+search_providers.tavily_key_failed: "无法保存 Tavily API 密钥：%{error}"
+assistant.search_requires_tools: "联网搜索需要启用工具能力的模型"
+assistant.search_invalid_query: "模型需提供 1 至 400 字的搜索词"
+assistant.search_http_error: "Tavily 搜索失败（HTTP %{status}）"
+assistant.search_limit: "每轮回复可进行一次联网搜索"
+assistant.search_reply_missing: "搜索完成后，模型未返回回答"
+assistant.search_result_count: "找到 %{count} 条来源"
+assistant.search_sources: "来源"
 assistant.model_unavailable: "%{model} 已不可用，请重新选择模型"
 assistant.invalid_response: Daemon 返回了意外响应
 assistant.default_model: 默认模型
