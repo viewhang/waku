@@ -4,6 +4,7 @@ use super::assistants::{ModelSelection, assistant_button_base};
 use super::*;
 use crate::ui::ActivationExt as _;
 use waku_client::{Command, ResponsePayload};
+use waku_protocol::settings::ModelService;
 use waku_protocol::{GOOGLE_TRANSLATION_MAX_CHARACTERS, TranslationLanguage};
 
 const PAGE_CONTEXT: &str = "TranslationPage";
@@ -123,22 +124,37 @@ impl TranslationPage {
     fn google_available(&self) -> bool {
         self.source_characters <= GOOGLE_TRANSLATION_MAX_CHARACTERS
     }
+
+    /// Check the selected model against the current service settings
+    fn dialogue_model(&self, services: &[ModelService]) -> Option<&ModelSelection> {
+        let selection = self.model.as_ref()?;
+        services
+            .iter()
+            .find(|service| service.id == selection.service_id)
+            .filter(|service| service.enabled)?
+            .model(&selection.model)
+            .filter(|model| model.options.dialogue())?;
+        Some(selection)
+    }
 }
 
 impl Waku {
+    /// Share the active page between rendering and focus handling
+    pub(super) fn open_translation_page(&self) -> Option<&TranslationPage> {
+        self.translation.as_ref().filter(|page| page.open)
+    }
+
     pub(super) fn translation_is_open(&self) -> bool {
-        self.translation.as_ref().is_some_and(|page| page.open)
+        self.open_translation_page().is_some()
     }
 
     pub(super) fn translation_source_focus(&self, cx: &App) -> Option<FocusHandle> {
-        self.translation
-            .as_ref()
-            .filter(|page| page.open)
+        self.open_translation_page()
             .map(|page| page.source.read(cx).focus_handle(cx))
     }
 
     pub(super) fn open_translation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.translation.is_none() {
+        let page = self.translation.get_or_insert_with(|| {
             let default_model = self
                 .state
                 .model_services
@@ -172,12 +188,8 @@ impl Waku {
                 },
             )
             .detach();
-            self.translation = Some(page);
-        }
-        let page = self
-            .translation
-            .as_mut()
-            .expect("translation page was created above");
+            page
+        });
         page.open = true;
         let focus = page.source.read(cx).focus_handle(cx);
         window.on_next_frame(move |window, cx| window.focus(&focus, cx));
@@ -196,17 +208,10 @@ impl Waku {
         cx.notify();
     }
 
-    fn translation_model_available(&self, selection: &ModelSelection) -> bool {
-        self.model_service(selection.service_id)
-            .filter(|service| service.enabled)
-            .and_then(|service| service.model(&selection.model))
-            .is_some_and(|model| model.options.dialogue())
-    }
-
     fn translate(&mut self, cx: &mut Context<Self>) {
         let Some(page) = self
             .translation
-            .as_ref()
+            .as_mut()
             .filter(|page| page.open && !page.busy())
         else {
             return;
@@ -216,9 +221,7 @@ impl Waku {
             return;
         }
         let model = page
-            .model
-            .as_ref()
-            .filter(|model| self.translation_model_available(model))
+            .dialogue_model(&self.state.model_services)
             .map(|model| Command::TranslateText {
                 service_id: model.service_id,
                 model: model.model.clone(),
@@ -236,10 +239,6 @@ impl Waku {
         if model.is_none() && google.is_none() {
             return;
         }
-        let page = self
-            .translation
-            .as_mut()
-            .expect("translation page remains present");
         page.clear_results(cx);
         page.model_output.busy = model.is_some();
         page.google_output.busy = google.is_some();
@@ -378,10 +377,10 @@ impl Waku {
 
     pub(super) fn render_translation(
         &self,
+        page: &TranslationPage,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let page = self.translation.as_ref().expect("translation is open");
         let theme = Theme::current(cx);
         let busy = page.busy();
         let same_language = page.source_language == Some(page.target_language);
@@ -389,10 +388,7 @@ impl Waku {
             && !same_language
             && !page.source.read(cx).content().trim().is_empty()
             && (page.google_available()
-                || page
-                    .model
-                    .as_ref()
-                    .is_some_and(|model| self.translation_model_available(model)));
+                || page.dialogue_model(&self.state.model_services).is_some());
         let stacked = window.viewport_size().width - px(self.sidebar_rendered_width) < px(650.0);
         let source_height =
             px((f32::from(window.viewport_size().height) * 0.31).clamp(154.0, 304.0));

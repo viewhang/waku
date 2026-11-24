@@ -277,7 +277,6 @@ impl Render for Waku {
         self.schedule_time_label_wake(cx);
 
         let theme = Theme::current(cx);
-        let translating = self.translation_is_open();
         let empty = should_render_empty_state(self.selected_session());
         let permission = self.render_permission(cx);
         let computer_use = self.render_computer_use_overlay(window, cx);
@@ -285,6 +284,8 @@ impl Render for Waku {
         let commit_dialog = self.render_commit_dialog(cx);
         let goal_dialog = self.render_goal_dialog(window, cx);
         let toast = self.render_active_toast(cx);
+        let translation = self.open_translation_page();
+        let translating = translation.is_some();
         let content = div()
             .key_context("Waku")
             .on_action(cx.listener(Self::close_window_or_right_panel_tab_action))
@@ -360,8 +361,8 @@ impl Render for Waku {
                     .when(panels.sidebar > 0.0, |element| {
                         element.border_l_1().border_color(theme.sidebar_border)
                     })
-                    .when(translating, |element| {
-                        element.child(self.render_translation(window, cx))
+                    .when_some(translation, |element, page| {
+                        element.child(self.render_translation(page, window, cx))
                     })
                     .when(!translating, |element| {
                         element
