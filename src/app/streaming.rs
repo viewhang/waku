@@ -616,6 +616,14 @@ impl Waku {
                 }
             }
             DriverEvent::TurnFinished { success, summary } => {
+                if success
+                    && self.state.sessions.iter().any(|session| {
+                        session.id == session_id && session.provider == ProviderKind::Assistant
+                    })
+                {
+                    // The worker saves usage before publishing completion
+                    self.usage_history_scanned_at = None;
+                }
                 self.settle_foreground_work(
                     session_id,
                     if success {

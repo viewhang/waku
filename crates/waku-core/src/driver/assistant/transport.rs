@@ -7,21 +7,22 @@ use rig::http_client::{
 };
 use serde_json::Value;
 use smol::stream::StreamExt as _;
+use waku_protocol::settings::ModelProtocol;
 
-/// Keep the pinned Rig client's OpenAI parser compatible with both reasoning field names
+/// Normalize provider streaming fields that the pinned Rig client cannot merge
 #[derive(Clone, Debug, Default)]
 pub(super) struct AssistantHttp {
     client: reqwest::Client,
     anonymous: bool,
-    normalize_reasoning: bool,
+    protocol: ModelProtocol,
 }
 
 impl AssistantHttp {
-    pub(super) fn new(client: reqwest::Client, anonymous: bool, normalize_reasoning: bool) -> Self {
+    pub(super) fn new(client: reqwest::Client, anonymous: bool, protocol: ModelProtocol) -> Self {
         Self {
             client,
             anonymous,
-            normalize_reasoning,
+            protocol,
         }
     }
 
@@ -62,23 +63,33 @@ impl HttpClientExt for AssistantHttp {
         T: Into<Bytes> + Send,
     {
         let response = self.client.send_streaming(self.prepare(request)).await?;
-        if !self.normalize_reasoning {
+        let protocol = self.protocol;
+        if !matches!(
+            protocol,
+            ModelProtocol::OpenAiChat | ModelProtocol::AnthropicMessages
+        ) {
             return Ok(response);
         }
         let (mut parts, body) = response.into_parts();
         parts.headers.remove("content-length");
-        let body = body.eventsource().map(|event| {
+        let mut cache_tokens = [None; 2];
+        let body = body.eventsource().map(move |event| {
             event
-                .map(normalize_event)
+                .map(|event| normalize_event(event, protocol, &mut cache_tokens))
                 .map_err(|error| http_client::Error::Instance(error.into()))
         });
         Ok(Response::from_parts(parts, Box::pin(body)))
     }
 }
 
-fn normalize_event(event: Event) -> Bytes {
+fn normalize_event(
+    event: Event,
+    protocol: ModelProtocol,
+    cache_tokens: &mut [Option<u64>; 2],
+) -> Bytes {
     let mut data = event.data;
-    if data.contains("\"reasoning\"")
+    if protocol == ModelProtocol::OpenAiChat
+        && data.contains("\"reasoning\"")
         && let Ok(mut chunk) = serde_json::from_str::<Value>(&data)
         && let Some(choices) = chunk.get_mut("choices").and_then(Value::as_array_mut)
     {
@@ -95,6 +106,13 @@ fn normalize_event(event: Event) -> Bytes {
         }
         data = chunk.to_string();
     }
+    if protocol == ModelProtocol::AnthropicMessages
+        && (data.contains("\"message_start\"") || data.contains("\"message_delta\""))
+        && let Ok(mut chunk) = serde_json::from_str::<Value>(&data)
+        && merge_anthropic_cache_usage(&mut chunk, cache_tokens)
+    {
+        data = chunk.to_string();
+    }
     let mut frame = format!("id: {}\nevent: {}\n", event.id, event.event);
     if let Some(retry) = event.retry {
         frame.push_str(&format!("retry: {}\n", retry.as_millis()));
@@ -106,4 +124,31 @@ fn normalize_event(event: Event) -> Bytes {
     }
     frame.push('\n');
     Bytes::from(frame)
+}
+
+/// Carry initial cache counts into a cumulative delta when it omits those fields
+fn merge_anthropic_cache_usage(chunk: &mut Value, counts: &mut [Option<u64>; 2]) -> bool {
+    const FIELDS: [&str; 2] = ["cache_creation_input_tokens", "cache_read_input_tokens"];
+    match chunk["type"].as_str() {
+        Some("message_start") => {
+            *counts = FIELDS.map(|field| chunk["message"]["usage"][field].as_u64());
+            false
+        }
+        Some("message_delta") => {
+            let Some(usage) = chunk.get_mut("usage").and_then(Value::as_object_mut) else {
+                return false;
+            };
+            let mut changed = false;
+            for (field, count) in FIELDS.into_iter().zip(counts) {
+                if let Some(current) = usage.get(field).and_then(Value::as_u64) {
+                    *count = Some(current);
+                } else if let Some(previous) = *count {
+                    usage.insert(field.into(), previous.into());
+                    changed = true;
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
 }

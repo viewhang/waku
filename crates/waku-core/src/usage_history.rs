@@ -33,6 +33,8 @@ const MTIME_SLACK: Duration = Duration::from_secs(36 * 3600);
 const LITELLM_RATES_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 const RATES_CACHE_FILE: &str = "usage-model-rates.json";
+mod assistant;
+pub(crate) use assistant::AssistantUsage;
 /// Rates move rarely; a day-old table keeps the page working offline.
 const RATES_TTL: Duration = Duration::from_secs(24 * 3600);
 
@@ -61,6 +63,7 @@ fn might_carry_usage(line: &str, provider: UsageProvider) -> bool {
     match provider {
         UsageProvider::Claude => line.contains("\"usage\""),
         UsageProvider::Codex => line.contains("\"token_count\""),
+        UsageProvider::Assistant => false,
     }
 }
 
@@ -569,6 +572,7 @@ fn provider_root(provider: UsageProvider) -> Option<PathBuf> {
             Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir).join("sessions")),
             _ => dirs::home_dir().map(|home| home.join(".codex/sessions")),
         },
+        UsageProvider::Assistant => None,
     }
 }
 
@@ -667,6 +671,9 @@ fn read_transcript_records(path: &Path, provider: UsageProvider) -> Option<Vec<U
                     records.push(record);
                 }
             }
+            UsageProvider::Assistant => {
+                unreachable!("assistant usage comes from the local database")
+            }
         }
     }
     Some(records)
@@ -698,7 +705,7 @@ struct Bucket {
 struct ProjectAccumulator {
     cost_usd: f64,
     total_tokens: u64,
-    by_provider: [ProviderDay; 2],
+    by_provider: [ProviderDay; UsageProvider::COUNT],
     sessions: HashSet<(UsageProvider, String)>,
     /// Cost per model, for the row's "top models" caption.
     models: HashMap<String, f64>,
@@ -769,9 +776,13 @@ impl Aggregator {
             return;
         }
 
+        // Model IDs from custom gateways do not establish their billing rates
+        let rate = (record.provider != UsageProvider::Assistant)
+            .then(|| lookup_rate(rates, &record.model))
+            .flatten();
         let (cost_usd, source) = match record.reported_cost_usd {
             Some(cost) => (cost, CostSource::Reported),
-            None => match lookup_rate(rates, &record.model) {
+            None => match rate {
                 Some(rate) => (
                     record.totals.uncached_input as f64 * rate.input
                         + record.totals.cached_input as f64 * rate.cache_read
@@ -784,7 +795,7 @@ impl Aggregator {
         };
         // What the cached input would have cost at full input rates, minus
         // what it actually cost. Drives the "cache savings" figure.
-        let cache_savings_usd = lookup_rate(rates, &record.model)
+        let cache_savings_usd = rate
             .map(|rate| record.totals.cached_input as f64 * (rate.input - rate.cache_read))
             .unwrap_or(0.0);
 
@@ -837,6 +848,7 @@ pub fn scan(
     rates: &RateTable,
     window: UsageWindow,
     project_roots: &[PathBuf],
+    usage_directory: &Path,
 ) -> UsageHistory {
     let started = Instant::now();
     let (since_day, until_day) = window.bounds(Local::now().date_naive());
@@ -853,6 +865,15 @@ pub fn scan(
     let mut scanned_files = 0;
     let mut skipped_files = 0;
     let mut errors = Vec::new();
+
+    match assistant::load(usage_directory, mtime_cutoff_ms) {
+        Ok(records) => {
+            for record in &records {
+                aggregator.add(record, rates);
+            }
+        }
+        Err(error) => errors.push(format!("Assistant usage could not be read: {error}")),
+    }
 
     for provider in UsageProvider::ALL {
         let Some(root) = provider_root(provider) else {
@@ -968,7 +989,7 @@ fn derive_history(
             day: *day,
             cost_usd: 0.0,
             total_tokens: 0,
-            by_provider: [ProviderDay::default(); 2],
+            by_provider: [ProviderDay::default(); UsageProvider::COUNT],
         });
         day_entry.cost_usd += bucket.cost_usd;
         day_entry.total_tokens += tokens;
@@ -1028,7 +1049,7 @@ fn derive_history(
                 first_day: first_of_month(day.day),
                 cost_usd: 0.0,
                 total_tokens: 0,
-                by_provider: [ProviderDay::default(); 2],
+                by_provider: [ProviderDay::default(); UsageProvider::COUNT],
                 sessions: 0,
                 active_days: 0,
                 top_models: Vec::new(),
@@ -1416,6 +1437,60 @@ mod tests {
         .expect("a full-second gap ends copy suppression");
         assert_eq!(child.session_id, "child");
         assert_eq!(child.totals.total(), 330);
+    }
+
+    #[test]
+    fn assistant_usage_is_persisted_and_included_in_each_view_without_guessing_cost() {
+        let directory =
+            std::env::temp_dir().join(format!("waku-assistant-usage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let project = directory.join("project");
+        let session_id = uuid::Uuid::new_v4();
+        let usage = AssistantUsage::new(&directory, session_id, &project.join("src"));
+        let totals = TokenTotals {
+            uncached_input: 40,
+            cached_input: 10,
+            output: 20,
+            reasoning: 5,
+            ..Default::default()
+        };
+        usage.record("claude-fable-5", totals).unwrap();
+        usage
+            .record("claude-fable-5", TokenTotals::default())
+            .unwrap();
+
+        let records = assistant::load(&directory, 0).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].totals, totals);
+        assert_eq!(records[0].session_id, session_id.to_string());
+        let today = Utc
+            .timestamp_millis_opt(records[0].timestamp_ms)
+            .unwrap()
+            .with_timezone(&Local)
+            .date_naive();
+        let mut aggregator = Aggregator::new(today, today, &[project.clone()]);
+        aggregator.add(&records[0], &rate_table(&[("claude-fable-5", FLAT_RATE)]));
+        let history = derive_history(
+            aggregator,
+            UsageWindow::TrailingDays(1),
+            today,
+            today,
+            PricingStatus::Fresh,
+            0,
+            0,
+            Vec::new(),
+            Duration::ZERO,
+        );
+        let index = UsageProvider::Assistant.index();
+        assert_eq!(history.total_tokens, 70);
+        assert_eq!(history.providers[0].provider, UsageProvider::Assistant);
+        assert_eq!(history.daily[0].by_provider[index].total_tokens, 70);
+        assert_eq!(history.months[0].by_provider[index].total_tokens, 70);
+        assert_eq!(history.projects[0].by_provider[index].total_tokens, 70);
+        assert_eq!(history.projects[0].path, project.to_str().unwrap());
+        assert_eq!(history.cost_usd, 0.0);
+        assert_eq!(history.quality.unpriced_share, 1.0);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

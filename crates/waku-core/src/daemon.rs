@@ -374,6 +374,7 @@ impl Backend for WakuBackend {
                     &rates,
                     window,
                     &project_roots,
+                    &self.usage_rates_dir,
                 );
                 Ok(ResponsePayload::UsageHistory { history })
             }
@@ -937,6 +938,11 @@ impl Backend for WakuBackend {
                             })
                             .unwrap_or_default(),
                         event_sender,
+                        Some(crate::usage_history::AssistantUsage::new(
+                            &self.usage_rates_dir,
+                            session_id,
+                            &options.cwd,
+                        )),
                     )?
                 } else {
                     driver::start_local(provider, options, event_sender)?

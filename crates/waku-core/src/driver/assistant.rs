@@ -23,6 +23,7 @@ use waku_protocol::settings::{
 use super::{DriverControl, DriverEventSender, DriverHandle};
 use crate::model::{DriverEvent, Message, MessageAttachment, MessageRole, ProviderResumeCursor};
 use crate::settings::DaemonSettingsStore;
+use crate::usage_history::AssistantUsage;
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -116,7 +117,7 @@ pub(crate) fn test_model(base_url: &str, key: &str, model: &ServiceModel) -> any
                     url: &url, key: &key, model: &model.id, options: &model.options,
                     preamble: "", history: &[],
                 }.send(&http, RigMessage::user("Reply with OK"), &events).await?;
-                if response.trim().is_empty() { bail!("The model returned no text"); }
+                if response.text.trim().is_empty() { bail!("The model returned no text"); }
             } else {
                 let (prompt, media) = match model.options.purpose {
                     ModelPurpose::ImageGeneration => ("A red square on a white background", Vec::new()),
@@ -200,15 +201,17 @@ pub(crate) fn translate_text(
         preamble: &preamble,
         history: &[],
     };
-    let translated = runtime.block_on(async {
-        tokio::time::timeout(
-            Duration::from_secs(90),
-            chat.send(&http, RigMessage::user(text), &events),
-        )
-        .await
-        .context("The translation request timed out")?
-        .map_err(|error| anyhow!(redacted_error(error, &key)))
-    })?;
+    let translated = runtime
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(90),
+                chat.send(&http, RigMessage::user(text), &events),
+            )
+            .await
+            .context("The translation request timed out")?
+            .map_err(|error| anyhow!(redacted_error(error, &key)))
+        })?
+        .text;
     if translated.trim().is_empty() {
         bail!("The model returned no translation");
     }
@@ -389,6 +392,7 @@ pub(crate) fn start(
     attachments: AttachmentStore,
     messages: Vec<Message>,
     events: DriverEventSender,
+    usage: Option<AssistantUsage>,
 ) -> anyhow::Result<DriverHandle> {
     if profile.name.trim().is_empty() || profile.model.trim().is_empty() {
         bail!("An assistant name and model ID are required");
@@ -423,6 +427,7 @@ pub(crate) fn start(
                 rx,
                 &worker_busy,
                 &events,
+                usage.as_ref(),
             ) {
                 let _ = events.send(DriverEvent::Error(error.to_string()));
                 let _ = events.send(DriverEvent::ProcessExited);
@@ -467,6 +472,7 @@ fn run(
     mut commands: mpsc::UnboundedReceiver<Control>,
     busy: &AtomicBool,
     events: &DriverEventSender,
+    usage: Option<&AssistantUsage>,
 ) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -513,10 +519,10 @@ fn run(
                         .send(&http, prompt.clone(), events)
                         .await?;
                         let mut messages = vec![prompt];
-                        if !answer.is_empty() {
-                            messages.push(RigMessage::assistant(&answer));
+                        if !answer.text.is_empty() {
+                            messages.push(RigMessage::assistant(&answer.text));
                         }
-                        Ok::<_, anyhow::Error>((answer, messages))
+                        Ok::<_, anyhow::Error>((answer, messages, model.to_owned()))
                     } else {
                         let summary = request::Operation {
                             url: &url,
@@ -528,7 +534,7 @@ fn run(
                         }
                         .send(&http, Some(&attachments), events)
                         .await?;
-                        Ok((summary, Vec::new()))
+                        Ok((summary, Vec::new(), model.to_owned()))
                     }
                 }
                 .await;
@@ -546,11 +552,16 @@ fn run(
             };
             busy.store(false, Ordering::Release);
             match result {
-                Ok(Ok((summary, messages))) => {
+                Ok(Ok((reply, messages, model))) => {
+                    if let Some(usage) = usage
+                        && let Err(error) = usage.record(&model, reply.tokens)
+                    {
+                        eprintln!("could not save assistant usage: {error}");
+                    }
                     history.extend(messages);
                     let _ = events.send(DriverEvent::TurnFinished {
                         success: true,
-                        summary: Some(summary),
+                        summary: Some(reply.text),
                     });
                 }
                 failure => {
@@ -863,6 +874,7 @@ pub(crate) mod tests {
             AttachmentStore::new(project.join("attachments")),
             history,
             events,
+            None,
         )
         .unwrap();
         driver.prompt(prompt.into());

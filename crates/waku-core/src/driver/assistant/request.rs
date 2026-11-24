@@ -4,7 +4,7 @@ use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use reqwest::multipart::{Form, Part};
 use rig::client::CompletionClient as _;
-use rig::completion::CompletionModel;
+use rig::completion::{CompletionModel, GetTokenUsage, Usage};
 use rig::message::{
     self, DocumentSourceKind, Message, MimeType as _, ReasoningContent, UserContent,
 };
@@ -21,6 +21,7 @@ use super::{bearer_auth, transport::AssistantHttp};
 use crate::attachments::{AttachmentStore, AttachmentUpload, MAX_ATTACHMENT_BYTES};
 use crate::driver::DriverEventSender;
 use crate::model::{ActivityItem, ActivityKind, DriverEvent, MessageAttachment};
+use crate::usage_history::TokenTotals;
 
 pub(super) struct Media {
     pub(super) mime: &'static str,
@@ -168,20 +169,46 @@ pub(super) struct Chat<'a> {
     pub history: &'a [Message],
 }
 
+#[derive(Debug)]
+pub(super) struct ModelReply {
+    pub text: String,
+    pub tokens: TokenTotals,
+}
+
+fn chat_tokens(usage: Option<Usage>, protocol: ModelProtocol) -> TokenTotals {
+    let Some(usage) = usage else {
+        return TokenTotals::default();
+    };
+    // Anthropic reports uncached input separately, while Gemini omits thinking from output
+    let uncached_input = if protocol == ModelProtocol::AnthropicMessages {
+        usage.input_tokens
+    } else {
+        usage.input_tokens.saturating_sub(usage.cached_input_tokens)
+    };
+    let output = if protocol == ModelProtocol::Gemini {
+        usage.output_tokens.saturating_add(usage.reasoning_tokens)
+    } else {
+        usage.output_tokens
+    };
+    TokenTotals {
+        uncached_input,
+        cached_input: usage.cached_input_tokens,
+        cache_creation: usage.cache_creation_input_tokens,
+        output,
+        reasoning: usage.reasoning_tokens,
+    }
+}
+
 impl Chat<'_> {
     pub async fn send(
         self,
         http: &reqwest::Client,
         prompt: Message,
         events: &DriverEventSender,
-    ) -> Result<String> {
+    ) -> Result<ModelReply> {
         let base = self.url.as_str().trim_end_matches('/');
         let model = self.model;
-        let http = AssistantHttp::new(
-            http.clone(),
-            self.key.is_empty(),
-            self.options.protocol == ModelProtocol::OpenAiChat,
-        );
+        let http = AssistantHttp::new(http.clone(), self.key.is_empty(), self.options.protocol);
         match self.options.protocol {
             ModelProtocol::OpenAiChat => {
                 let client = openai::CompletionsClient::builder()
@@ -234,7 +261,7 @@ impl Chat<'_> {
         model: impl CompletionModel,
         prompt: Message,
         events: &DriverEventSender,
-    ) -> Result<String> {
+    ) -> Result<ModelReply> {
         let window = self.options.context_window.map(|value| value as usize);
         let limit = [self.options.max_input_tokens, self.options.context_window]
             .into_iter()
@@ -325,7 +352,12 @@ impl Chat<'_> {
                         Some(tool_call.function.arguments.to_string()),
                     );
                 }
-                StreamedAssistantContent::Final(_) => return Ok(answer),
+                StreamedAssistantContent::Final(response) => {
+                    return Ok(ModelReply {
+                        text: answer,
+                        tokens: chat_tokens(response.token_usage(), self.options.protocol),
+                    });
+                }
                 _ => {}
             }
         }
@@ -415,7 +447,7 @@ impl Operation<'_> {
         http: &reqwest::Client,
         store: Option<&AttachmentStore>,
         events: &DriverEventSender,
-    ) -> Result<String> {
+    ) -> Result<ModelReply> {
         let base = self.url.as_str().trim_end_matches('/');
         let estimated = self.prompt.len() + self.media.len() * 2048;
         if [self.options.context_window, self.options.max_input_tokens]
@@ -510,7 +542,10 @@ impl Operation<'_> {
             serde_json::to_string_pretty(output)?
         );
         let _ = events.send(DriverEvent::TextDelta(text.clone()));
-        Ok(text)
+        Ok(ModelReply {
+            text,
+            tokens: operation_tokens(&result),
+        })
     }
 }
 
@@ -520,7 +555,7 @@ async fn image_result(
     store: Option<&AttachmentStore>,
     events: &DriverEventSender,
     label: &str,
-) -> Result<String> {
+) -> Result<ModelReply> {
     let value = read_json(response).await?;
     let image = value["data"]
         .get(0)
@@ -546,7 +581,10 @@ async fn image_result(
         bail!("The provider returned an unsupported image format");
     };
     let Some(store) = store else {
-        return Ok(label.to_owned());
+        return Ok(ModelReply {
+            text: label.to_owned(),
+            tokens: operation_tokens(&value),
+        });
     };
     let name = format!(
         "{}.{}",
@@ -567,7 +605,23 @@ async fn image_result(
         is_image: true,
         blob_reference: Some(stored.reference),
     }));
-    Ok(label.to_owned())
+    Ok(ModelReply {
+        text: label.to_owned(),
+        tokens: operation_tokens(&value),
+    })
+}
+
+/// The direct image and embedding APIs return usage in their JSON response
+fn operation_tokens(value: &Value) -> TokenTotals {
+    let usage = &value["usage"];
+    TokenTotals {
+        uncached_input: usage["input_tokens"]
+            .as_u64()
+            .or_else(|| usage["prompt_tokens"].as_u64())
+            .unwrap_or_default(),
+        output: usage["output_tokens"].as_u64().unwrap_or_default(),
+        ..TokenTotals::default()
+    }
 }
 
 async fn read_json(response: reqwest::Response) -> Result<Value> {
@@ -698,6 +752,7 @@ mod tests {
                     json!({"choices":[{"index":0,"delta":{"reasoning_content":"Plan"},"finish_reason":null}]}),
                     json!({"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}),
                     json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+                    json!({"choices":[],"usage":{"prompt_tokens":6,"completion_tokens":2,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":2}}}),
                 ]) + "data: [DONE]\n\n"
             }
             ModelProtocol::OpenAiResponses => sse(vec![
@@ -707,11 +762,12 @@ mod tests {
                 }}),
                 json!({"type":"response.output_text.delta","item_id":"msg_test","output_index":1,"delta":"OK","content_index":0,"sequence_number":3}),
                 json!({"type":"response.completed","sequence_number":4,"response":{
-                    "id":"resp_test","object":"response","created_at":0,"status":"completed","model":"demo","output":[]
+                    "id":"resp_test","object":"response","created_at":0,"status":"completed","model":"demo","output":[],
+                    "usage":{"input_tokens":6,"input_tokens_details":{"cached_tokens":2},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":1},"total_tokens":8}
                 }}),
             ]),
             ModelProtocol::AnthropicMessages => sse(vec![
-                json!({"type":"message_start","message":{"id":"msg_test","role":"assistant","content":[],"model":"demo","usage":{"input_tokens":4,"output_tokens":0}}}),
+                json!({"type":"message_start","message":{"id":"msg_test","role":"assistant","content":[],"model":"demo","usage":{"input_tokens":4,"output_tokens":0,"cache_read_input_tokens":2,"cache_creation_input_tokens":1}}}),
                 json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
                 json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Plan"}}),
                 json!({"type":"content_block_stop","index":0}),
@@ -723,7 +779,7 @@ mod tests {
             ]),
             ModelProtocol::Gemini => sse(vec![json!({
                 "candidates":[{"content":{"parts":[{"text":"Plan","thought":true},{"text":"OK"}],"role":"model"},"finishReason":"STOP","index":0}],
-                "usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":1,"totalTokenCount":5}
+                "usageMetadata":{"promptTokenCount":6,"cachedContentTokenCount":2,"candidatesTokenCount":1,"thoughtsTokenCount":1,"totalTokenCount":8}
             })]),
         }
     }
@@ -792,7 +848,23 @@ mod tests {
             )
             .await
             .unwrap_or_else(|error| panic!("{protocol:?}: {error:#}"));
-            assert_eq!(response, "OK", "{protocol:?}");
+            assert_eq!(response.text, "OK", "{protocol:?}");
+            let (cache_creation, output, reasoning) = match protocol {
+                ModelProtocol::OpenAiChat => (0, 2, 0),
+                ModelProtocol::OpenAiResponses | ModelProtocol::Gemini => (0, 2, 1),
+                ModelProtocol::AnthropicMessages => (1, 1, 0),
+            };
+            assert_eq!(
+                response.tokens,
+                TokenTotals {
+                    uncached_input: 4,
+                    cached_input: 2,
+                    cache_creation,
+                    output,
+                    reasoning,
+                },
+                "{protocol:?}"
+            );
             let reasoning = std::iter::from_fn(|| received_events.try_recv().ok())
                 .filter_map(|event| match event {
                     DriverEvent::ReasoningDelta(text) => Some(text),
@@ -916,7 +988,7 @@ mod tests {
         .send(&http, Message::user("Check the job"), &events)
         .await
         .unwrap();
-        assert_eq!(response, "OK");
+        assert_eq!(response.text, "OK");
         let (requested, received) = observed.join().unwrap();
         assert!(
             matches!(received.try_recv().unwrap(), DriverEvent::TextDelta(text) if text == "OK")
@@ -989,7 +1061,7 @@ mod tests {
         .await
         .unwrap();
         observed.join().unwrap();
-        assert_eq!(answer, "OK");
+        assert_eq!(answer.text, "OK");
         let received = server.join().unwrap();
         let headers = received.headers.to_ascii_lowercase();
         assert!(headers.contains(&format!("host: models.test:{}", address.port())));
