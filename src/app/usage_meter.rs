@@ -244,7 +244,7 @@ impl Waku {
             (Some(error), _) => SharedString::from(tr!("usage.refresh_failed", error = error)),
             (None, Some(percent)) => SharedString::from(tr!(
                 "usage.context_used",
-                percent = format!("{percent:.0}"),
+                percent = context_percent_label(provider, percent),
                 shortcut = crate::platform::primary_shortcut("⌘U", "Ctrl+U")
             )),
             (None, None) => SharedString::from(tr!(
@@ -297,6 +297,15 @@ fn context_percent(usage: ContextUsage) -> Option<f64> {
         .map(|window| (usage.tokens as f64 * 100.0 / window as f64).min(100.0))
 }
 
+/// Keep a nonzero assistant reading visible even when the window is much larger
+fn context_percent_label(provider: ProviderKind, percent: f64) -> String {
+    if provider == ProviderKind::Assistant && percent > 0.0 && percent < 1.0 {
+        "<1".into()
+    } else {
+        format!("{percent:.0}")
+    }
+}
+
 /// The trigger glyph: a ring whose arc fills clockwise from 12 o'clock as the
 /// context window does, over a faint full ring. An unknown fraction draws the
 /// track alone. This is Zed's `CircularProgress` drawing sized for the footer
@@ -338,7 +347,7 @@ fn context_gauge(percent: Option<f64>, track: Hsla, fill: Hsla) -> impl IntoElem
                 window.paint_path(path, track);
             }
 
-            let Some(percent) = percent else {
+            let Some(percent) = percent.filter(|percent| *percent > 0.0) else {
                 return;
             };
             // Keep a visible sliver for a nearly-empty context.
@@ -397,17 +406,21 @@ fn usage_panel(
         .gap(px(12.0))
         .text_size(sp(12.5));
 
-    // The context row always renders; a session with nothing measured yet
-    // reads "0" over an empty track, exactly like the CLI's own panel.
+    // An assistant with no provider measurement shows a dash above the empty track
     let usage = context.unwrap_or_default();
     let percent = context_percent(usage);
     let value = match (usage.window, percent) {
         (Some(window), Some(percent)) => format!(
-            "{} / {} ({percent:.0}%)",
-            format_tokens(usage.tokens.min(window)),
-            format_tokens(window)
+            "{} / {} ({}%)",
+            format_tokens(if provider == ProviderKind::Assistant {
+                usage.tokens
+            } else {
+                usage.tokens.min(window)
+            }),
+            format_tokens(window),
+            context_percent_label(provider, percent)
         ),
-        // The transport reports occupancy but not the window size.
+        _ if provider == ProviderKind::Assistant && context.is_none() => "—".into(),
         _ => format_tokens(usage.tokens),
     };
     panel = panel.child(

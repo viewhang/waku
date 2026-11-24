@@ -2743,6 +2743,7 @@ impl Waku {
                             && !session.assistant_context_resets.contains(&turn_id)
                         {
                             session.assistant_context_resets.push(turn_id);
+                            session.context_usage.get_or_insert_default().tokens = 0;
                         }
                         if waku.state.selected_session == Some(session_id) {
                             waku.scroll_transcript_to_bottom(cx);

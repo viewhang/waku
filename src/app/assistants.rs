@@ -879,6 +879,7 @@ impl Waku {
                 profile.model = selection.model.clone();
                 profile.base_url.clear();
                 session.model = Some(selection.model);
+                session.context_usage = None;
                 // A new runtime replays the saved dialogue at the new supplier
                 self.runtime_attach_pending.remove(&id);
                 self.reset_session_runtime(id);

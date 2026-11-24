@@ -605,12 +605,20 @@ impl Waku {
                 // Meta about the conversation, not turn output: it applies
                 // even while a rewound or cancelled turn's tail drains.
                 if let Some(session) = self.state.session_mut(session_id) {
-                    let usage = session.context_usage.get_or_insert(ContextUsage::default());
-                    if let Some(tokens) = context_tokens {
-                        usage.tokens = tokens;
-                    }
-                    if let Some(window) = context_window {
-                        usage.window = Some(window);
+                    if session.provider == ProviderKind::Assistant {
+                        // Assistant snapshots replace the previous request's measurement in full
+                        session.context_usage = context_tokens.map(|tokens| ContextUsage {
+                            tokens,
+                            window: context_window,
+                        });
+                    } else {
+                        let usage = session.context_usage.get_or_insert(ContextUsage::default());
+                        if let Some(tokens) = context_tokens {
+                            usage.tokens = tokens;
+                        }
+                        if let Some(window) = context_window {
+                            usage.window = Some(window);
+                        }
                     }
                     self.state.mark_session_dirty(session_id);
                 }

@@ -1898,9 +1898,13 @@ function UsageMeter({
   const [open, setOpen] = useState(false)
   const usageShortcut = usePrimaryShortcut('⌘U', 'Ctrl+U')
   const context = session.context_usage
+  const isAssistant = session.provider === 'assistant'
   const contextPercent = context?.window
-    ? context.tokens * 100 / context.window
+    ? Math.min(100, context.tokens * 100 / context.window)
     : null
+  const percentLabel = contextPercent == null
+    ? ''
+    : isAssistant && contextPercent > 0 && contextPercent < 1 ? '<1' : contextPercent.toFixed(0)
   const supportsPlanUsage = PLAN_USAGE_PROVIDERS.includes(session.provider)
   const plan = useQuery({
     queryKey: daemonKeys.planUsage(config?.address ?? 'disconnected', session.provider),
@@ -1920,7 +1924,7 @@ function UsageMeter({
     ? t('usage.refresh_failed', { error })
     : contextPercent == null
       ? t('usage.shortcut', { shortcut: usageShortcut })
-      : t('usage.context_used', { percent: contextPercent.toFixed(0), shortcut: usageShortcut })
+      : t('usage.context_used', { percent: percentLabel, shortcut: usageShortcut })
 
   return (
     <Popover.Root modal={false} open={open} onOpenChange={setOpen}>
@@ -1953,8 +1957,8 @@ function UsageMeter({
               label={t('usage.context_window')}
               percent={contextPercent ?? 0}
               value={context?.window && contextPercent != null
-                ? `${formatTokens(context.tokens)} / ${formatTokens(context.window)} (${contextPercent.toFixed(0)}%)`
-                : formatTokens(context?.tokens ?? 0)}
+                ? `${formatTokens(context.tokens)} / ${formatTokens(context.window)} (${percentLabel}%)`
+                : isAssistant && !context ? '—' : formatTokens(context?.tokens ?? 0)}
             />
             {(plan.data || plan.isFetching || error) && <div className="h-px bg-border" />}
             {plan.data && <PlanUsageLanes locale={locale} plan={plan.data} provider={session.provider} t={t} />}
@@ -1975,7 +1979,7 @@ function UsageMeter({
 function ContextGauge({ percent }: { percent: number | null }) {
   const radius = 5.25
   const circumference = 2 * Math.PI * radius
-  const bounded = percent == null ? 0 : Math.min(100, Math.max(5, percent))
+  const bounded = percent == null || percent <= 0 ? 0 : Math.min(100, Math.max(5, percent))
   const color = percent != null && percent >= 95
     ? 'var(--destructive)'
     : percent != null && percent >= 80

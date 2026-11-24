@@ -523,6 +523,13 @@ impl Backend for WakuBackend {
                                 self.task_store.hydrate(existing)?;
                                 session.assistant_context_resets =
                                     existing.assistant_context_resets.clone();
+                                // A projection ending at the reset boundary cannot retain old usage
+                                if let Some(turn) = session.turns.last()
+                                    && session.assistant_context_resets.last() == Some(&turn.id)
+                                    && let Some(usage) = session.context_usage.as_mut()
+                                {
+                                    usage.tokens = 0;
+                                }
                             }
                             preserve_daemon_checkpoints(existing, &mut session);
                             *existing = session;
@@ -859,9 +866,12 @@ impl Backend for WakuBackend {
                     bail!("The assistant turn must be settled before clearing its context");
                 }
                 session.assistant_context_resets.push(turn_id);
+                let previous_usage = session.context_usage;
+                session.context_usage.get_or_insert_default().tokens = 0;
                 state.mark_session_dirty(session_id);
                 if let Err(error) = self.task_store.save(&mut state) {
                     state.sessions[index].assistant_context_resets.pop();
+                    state.sessions[index].context_usage = previous_usage;
                     return Err(error.into());
                 }
                 if let Some(driver) = driver {

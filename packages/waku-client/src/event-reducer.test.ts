@@ -19,6 +19,16 @@ const SUBMISSION = {
   messageId: '20000000-0000-4000-8000-000000000002',
 }
 
+test('assistant context snapshots replace the count and window from the previous request', () => {
+  const session: AgentSession = { ...idleSession(), provider: 'assistant' }
+  const measured = apply(session, 'usageUpdated', { contextTokens: 128, contextWindow: 4000 })
+  expect(measured.context_usage).toEqual({ tokens: 128, window: 4000 })
+  const unknownWindow = apply(measured, 'usageUpdated', { contextTokens: 144, contextWindow: null })
+  expect(unknownWindow.context_usage).toEqual({ tokens: 144, window: null })
+  const unreported = apply(unknownWindow, 'usageUpdated', { contextTokens: null, contextWindow: null })
+  expect(unreported.context_usage).toBeNull()
+})
+
 describe('promptSubmitted', () => {
   test('a client following the runtime mirrors another client’s submission under its ids', () => {
     // The desktop stayed attached to the idle runtime after the first turn;

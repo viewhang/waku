@@ -146,6 +146,9 @@ pub(super) fn merge_remote_session_catalog(
             for turn_id in remote.assistant_context_resets {
                 if !local.assistant_context_resets.contains(&turn_id) {
                     local.assistant_context_resets.push(turn_id);
+                    if local.turns.last().is_some_and(|turn| turn.id == turn_id) {
+                        local.context_usage.get_or_insert_default().tokens = 0;
+                    }
                 }
             }
             local.model = remote.model;

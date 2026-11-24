@@ -353,9 +353,19 @@ impl Chat<'_> {
                     );
                 }
                 StreamedAssistantContent::Final(response) => {
+                    let usage = response.token_usage();
+                    let tokens = chat_tokens(usage, self.options.protocol);
+                    // Include cached input and reasoning once, using the reported total if it is larger
+                    let used = usage
+                        .map_or(0, |usage| usage.total_tokens)
+                        .max(tokens.total());
+                    let _ = events.send(DriverEvent::UsageUpdated {
+                        context_tokens: (used > 0).then_some(used),
+                        context_window: self.options.context_window.map(u64::from),
+                    });
                     return Ok(ModelReply {
                         text: answer,
-                        tokens: chat_tokens(response.token_usage(), self.options.protocol),
+                        tokens,
                     });
                 }
                 _ => {}
@@ -865,13 +875,20 @@ mod tests {
                 },
                 "{protocol:?}"
             );
-            let reasoning = std::iter::from_fn(|| received_events.try_recv().ok())
-                .filter_map(|event| match event {
-                    DriverEvent::ReasoningDelta(text) => Some(text),
-                    _ => None,
-                })
-                .collect::<String>();
+            let mut reasoning = String::new();
+            let mut context = None;
+            while let Ok(event) = received_events.try_recv() {
+                match event {
+                    DriverEvent::ReasoningDelta(text) => reasoning.push_str(&text),
+                    DriverEvent::UsageUpdated {
+                        context_tokens,
+                        context_window,
+                    } => context = Some((context_tokens, context_window)),
+                    _ => {}
+                }
+            }
             assert_eq!(reasoning, "Plan", "{protocol:?}");
+            assert_eq!(context, Some((Some(8), Some(32000))), "{protocol:?}");
             let received = server.join().unwrap();
             let body: Value = serde_json::from_slice(&received.body).unwrap();
             let payload = body.to_string();
@@ -1005,6 +1022,13 @@ mod tests {
             with_arguments.output,
             Some(tr!("assistant.tool_unavailable"))
         );
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            DriverEvent::UsageUpdated {
+                context_tokens: None,
+                context_window: None,
+            }
+        ));
         assert!(received.try_recv().is_err());
         let wire: Value = serde_json::from_slice(&server.join().unwrap().body).unwrap();
         assert_ne!(wire["reasoning"]["summary"], "auto");
@@ -1044,6 +1068,17 @@ mod tests {
                 matches!(received.recv_timeout(timeout).unwrap(), DriverEvent::ReasoningDelta(text) if text == "Plan")
             );
             release.send(()).unwrap();
+            assert!(matches!(
+                received.recv_timeout(timeout).unwrap(),
+                DriverEvent::TextDelta(text) if text == "OK"
+            ));
+            assert!(matches!(
+                received.recv_timeout(timeout).unwrap(),
+                DriverEvent::UsageUpdated {
+                    context_tokens: None,
+                    context_window: None,
+                }
+            ));
         });
         let options = ServiceModelOptions {
             reasoning: true,

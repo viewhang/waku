@@ -218,6 +218,16 @@ export function reduceRuntimeEvent(
     case 'usageUpdated': {
       const value = asRecord(payload)
       if (!value) break
+      if (session.provider === 'assistant') {
+        // Assistant snapshots replace the previous request's measurement in full
+        session.context_usage = typeof value.contextTokens === 'number'
+          ? {
+              tokens: value.contextTokens,
+              window: typeof value.contextWindow === 'number' ? value.contextWindow : null,
+            }
+          : null
+        break
+      }
       const previous = session.context_usage ?? { tokens: 0, window: null }
       session.context_usage = {
         tokens:

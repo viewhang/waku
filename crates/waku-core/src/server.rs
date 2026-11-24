@@ -1375,7 +1375,7 @@ mod tests {
     #[cfg(unix)]
     fn assistant_context_reset_survives_reopen_and_excludes_old_model_history() {
         use crate::driver::assistant::tests::{mock_service, request, stream};
-        use crate::model::{MessageRole, TurnStatus};
+        use crate::model::{ContextUsage, MessageRole, TurnStatus};
         use waku_protocol::settings::AssistantProfile;
 
         let root = std::env::temp_dir().join(format!("waku-clear-context-{}", Uuid::new_v4()));
@@ -1422,6 +1422,10 @@ mod tests {
         let turn_id = session.begin_turn("old context");
         session.push_message(MessageRole::Assistant, "old answer");
         session.finish_active_turn(TurnStatus::Completed);
+        session.context_usage = Some(ContextUsage {
+            tokens: 128,
+            window: Some(4000),
+        });
         let profile = AssistantProfile {
             id: Uuid::new_v4(),
             name: "Test assistant".into(),
@@ -1515,6 +1519,26 @@ mod tests {
                 Command::ClearAssistantContext { turn_id },
             );
         }
+        // A client saving the old projection must preserve the cleared reading
+        save(&backend, &session);
+        let ResponsePayload::Session {
+            session: Some(cleared),
+        } = call(
+            &backend,
+            Uuid::nil(),
+            Command::HydrateSession { session_id },
+        )
+        else {
+            panic!("expected saved assistant session");
+        };
+        assert_eq!(
+            cleared.context_usage,
+            Some(ContextUsage {
+                tokens: 0,
+                window: Some(4000),
+            })
+        );
+        session = cleared;
         prompt(&backend, runtime_id, "first new prompt");
         session.begin_turn("first new prompt");
         session.push_message(MessageRole::Assistant, "reply");
