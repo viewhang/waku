@@ -21,6 +21,7 @@ pub(super) struct TranslationPage {
     open: bool,
     source: Entity<TextInput>,
     source_characters: usize,
+    source_revision: u64,
     model_output: TranslationOutput,
     google_output: TranslationOutput,
     source_language: Option<TranslationLanguage>,
@@ -78,10 +79,12 @@ impl TranslationPage {
             source: cx.new(|cx| {
                 TextInput::new(window, cx)
                     .multi_line()
+                    .submit_on_enter()
                     .tab_stop()
                     .placeholder(tr!("translation.input"))
             }),
             source_characters: 0,
+            source_revision: 0,
             model_output: TranslationOutput::new(window, cx),
             google_output: TranslationOutput::new(window, cx),
             source_language: None,
@@ -153,16 +156,21 @@ impl Waku {
                 });
             let page =
                 TranslationPage::new(window, self.state.language.locale(), default_model, cx);
-            cx.subscribe(&page.source, |this, input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Edited)
-                    && let Some(page) = this.translation.as_mut()
-                    && !page.busy()
-                {
-                    page.source_characters = input.read(cx).content().chars().count();
-                    page.clear_results(cx);
-                    cx.notify();
-                }
-            })
+            cx.subscribe(
+                &page.source,
+                |this, input, event: &InputEvent, cx| match event {
+                    InputEvent::Submit(_) => this.translate(cx),
+                    InputEvent::Edited => {
+                        if let Some(page) = this.translation.as_mut() {
+                            page.source_characters = input.read(cx).content().chars().count();
+                            page.source_revision += 1;
+                            page.clear_results(cx);
+                            cx.notify();
+                        }
+                    }
+                    _ => {}
+                },
+            )
             .detach();
             self.translation = Some(page);
         }
@@ -196,7 +204,11 @@ impl Waku {
     }
 
     fn translate(&mut self, cx: &mut Context<Self>) {
-        let Some(page) = self.translation.as_ref().filter(|page| !page.busy()) else {
+        let Some(page) = self
+            .translation
+            .as_ref()
+            .filter(|page| page.open && !page.busy())
+        else {
             return;
         };
         let text = page.source.read(cx).content();
@@ -231,16 +243,13 @@ impl Waku {
         page.clear_results(cx);
         page.model_output.busy = model.is_some();
         page.google_output.busy = google.is_some();
-        page.source.update(cx, |input, cx| {
-            input.set_read_only(true);
-            cx.notify();
-        });
+        let source_revision = page.source_revision;
         for (engine, command) in [
             (TranslationEngine::Model, model),
             (TranslationEngine::Google, google),
         ] {
             if let Some(command) = command {
-                self.request_translation(engine, command, cx);
+                self.request_translation(engine, command, source_revision, cx);
             }
         }
         cx.notify();
@@ -250,6 +259,7 @@ impl Waku {
         &self,
         engine: TranslationEngine,
         command: Command,
+        source_revision: u64,
         cx: &mut Context<Self>,
     ) {
         let client = self.daemon.client();
@@ -263,20 +273,20 @@ impl Waku {
                 .await;
             let _ = view.update(cx, |this, cx| {
                 if let Some(page) = this.translation.as_mut() {
+                    let source_matches = page.source_revision == source_revision;
                     let output = page.output_mut(engine);
                     output.busy = false;
-                    match result {
-                        Ok(ResponsePayload::Translation { text }) => output
-                            .input
-                            .update(cx, |input, cx| input.set_content(text, cx)),
-                        Ok(_) => output.error = Some(tr!("assistant.invalid_response")),
-                        Err(error) => output.error = Some(tr!("translation.failed", error = error)),
-                    }
-                    if !page.busy() {
-                        page.source.update(cx, |input, cx| {
-                            input.set_read_only(false);
-                            cx.notify();
-                        });
+                    // An edit while either engine is working invalidates its previous result
+                    if source_matches {
+                        match result {
+                            Ok(ResponsePayload::Translation { text }) => output
+                                .input
+                                .update(cx, |input, cx| input.set_content(text, cx)),
+                            Ok(_) => output.error = Some(tr!("assistant.invalid_response")),
+                            Err(error) => {
+                                output.error = Some(tr!("translation.failed", error = error))
+                            }
+                        }
                     }
                     cx.notify();
                 }
@@ -387,13 +397,6 @@ impl Waku {
         let source_height =
             px((f32::from(window.viewport_size().height) * 0.31).clamp(154.0, 304.0));
 
-        let back = self.translation_button(
-            "translation-back",
-            tr!("translation.back"),
-            true,
-            cx,
-            Self::close_translation,
-        );
         let source = self.translation_language_menu(page, true, cx);
         let target = self.translation_language_menu(page, false, cx);
         let swap = self
@@ -478,16 +481,9 @@ impl Waku {
             .child(
                 div()
                     .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.0))
-                    .child(back)
-                    .child(
-                        div()
-                            .text_size(sp(18.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(tr!("translation.title")),
-                    ),
+                    .text_size(sp(18.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(tr!("translation.title")),
             )
             .child(
                 div()
@@ -663,6 +659,89 @@ fn translation_text_field(
         .line_height(sp(22.0))
         .child(input)
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-            window.focus(&focus, cx)
+            window.focus(&focus, cx);
+            // Clicking the blank part of this scroll pane must focus the input, not the pane
+            window.prevent_default();
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{EntityInputHandler, Modifiers, TestAppContext, point};
+
+    struct SourcePane(Entity<TextInput>);
+
+    impl Render for SourcePane {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(200.0))
+                .h(px(120.0))
+                .flex()
+                .flex_col()
+                .child(translation_text_field(
+                    "test-translation-source",
+                    self.0.clone(),
+                    Theme::dark(),
+                    cx,
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn translation_accepts_input_after_clicking_below_the_text(cx: &mut TestAppContext) {
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            SourcePane(TranslationPage::new(window, "zh-CN", None, cx).source)
+        });
+        let source = cx.read_entity(&pane, |pane, _| pane.0.clone());
+        // The empty input draws one line at the top; hit the surrounding blank pane
+        cx.simulate_mouse_down(
+            point(px(80.0), px(95.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.update(|window, cx| assert!(source.read(cx).focus_handle(cx).is_focused(window)));
+        cx.simulate_input("Hello");
+        cx.read_entity(&source, |input, _| assert_eq!(input.content(), "Hello"));
+    }
+
+    #[gpui::test]
+    fn translation_enter_submits_and_shift_enter_inserts_a_line(cx: &mut TestAppContext) {
+        cx.update(crate::input::init);
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            SourcePane(TranslationPage::new(window, "zh-CN", None, cx).source)
+        });
+        let source = cx.read_entity(&pane, |pane, _| pane.0.clone());
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|window, cx| {
+            let submitted = submitted.clone();
+            cx.subscribe(&source, move |_, event: &InputEvent, _| {
+                if let InputEvent::Submit(text) = event {
+                    submitted.borrow_mut().push(text.clone());
+                }
+            })
+            .detach();
+            window.focus(&source.read(cx).focus_handle(cx), cx);
+        });
+        cx.simulate_input("Hello");
+        cx.simulate_keystrokes("shift-enter");
+        cx.read_entity(&source, |input, _| assert_eq!(input.content(), "Hello\n"));
+        assert!(submitted.borrow().is_empty());
+
+        cx.update(|window, cx| {
+            source.update(cx, |input, cx| {
+                input.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
+            });
+        });
+        cx.simulate_keystrokes("enter");
+        assert!(submitted.borrow().is_empty());
+        cx.update(|window, cx| {
+            source.update(cx, |input, cx| {
+                input.replace_text_in_range(None, "你", window, cx)
+            });
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(submitted.borrow().as_slice(), ["Hello\n你"]);
+        cx.read_entity(&source, |input, _| assert_eq!(input.content(), "Hello\n你"));
+    }
 }

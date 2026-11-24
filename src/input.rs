@@ -1728,7 +1728,8 @@ impl TextInput {
     }
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
-        if self.password {
+        // A submit-on-Enter field must leave active candidate text to the IME
+        if self.password || (self.submit_on_enter && self.marked_range.is_some()) {
             return;
         }
         if self.mode == FieldMode::MultiLine && !self.submit_on_enter {

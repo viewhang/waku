@@ -243,7 +243,6 @@ session.new_task: 新規タスク
 sidebar.today: 今日
 sidebar.search: 検索
 translation.title: 翻訳
-translation.back: チャットに戻る
 translation.auto: 言語を自動検出
 translation.input: 翻訳するテキストを入力または貼り付け
 translation.source: 原文

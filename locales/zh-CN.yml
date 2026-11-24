@@ -231,7 +231,6 @@ session.new_task: 新任务
 sidebar.today: 今天
 sidebar.search: 搜索
 translation.title: 翻译
-translation.back: 返回会话
 translation.auto: 自动识别
 translation.input: 输入或粘贴要翻译的文本
 translation.source: 原文
