@@ -207,7 +207,7 @@ impl Waku {
                 .await;
             if let Err(error) = result {
                 let _ = waku.update(cx, |waku, cx| {
-                    waku.show_toast(tr!("errors.save_local_state", error = error));
+                    waku.show_error_toast(tr!("errors.save_local_state", error = error));
                     cx.notify();
                 });
             }

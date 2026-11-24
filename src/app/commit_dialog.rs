@@ -121,7 +121,7 @@ impl Waku {
                 ))
             })
         else {
-            self.show_toast(tr!("commit.no_task"));
+            self.show_info_toast(tr!("commit.no_task"));
             cx.notify();
             return;
         };
@@ -385,7 +385,7 @@ impl Waku {
                                 .message
                                 .update(cx, |message, _| message.set_read_only(false));
                         } else {
-                            waku.show_toast(error);
+                            waku.show_error_toast(error);
                         }
                     }
                 }
@@ -498,7 +498,7 @@ impl Waku {
                                 .message
                                 .update(cx, |message, _| message.set_read_only(false));
                         } else {
-                            waku.show_toast(error);
+                            waku.show_error_toast(error);
                         }
                         None
                     }

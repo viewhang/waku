@@ -205,6 +205,12 @@ pub enum Command {
         service: crate::settings::ModelService,
         api_key: Option<String>,
     },
+    /// Remove the selected IDs from the current provider catalog
+    RemoveModelServiceModels {
+        service_id: Uuid,
+        base_url: String,
+        model_ids: Vec<String>,
+    },
     /// Update only the provider's availability in current daemon settings
     SetModelServiceEnabled {
         service_id: Uuid,
@@ -216,11 +222,17 @@ pub enum Command {
         api_key: String,
         model: crate::settings::ServiceModel,
     },
-    /// Fetch model IDs for an explicit catalog sync
+    /// Fetch model IDs for a connection check
     ListModelServiceModels {
         base_url: String,
         api_key: String,
         #[serde(default)]
+        protocol: crate::settings::ModelProtocol,
+    },
+    /// Discover models and metadata before saving a model service
+    SyncDraftModelService {
+        base_url: String,
+        api_key: String,
         protocol: crate::settings::ModelProtocol,
     },
     /// Fetch and merge the saved provider's catalog on the daemon that owns its key
@@ -504,6 +516,9 @@ pub enum ResponsePayload {
     },
     ModelServiceModels {
         models: Vec<String>,
+    },
+    ModelServiceCatalog {
+        models: Vec<crate::settings::ServiceModel>,
     },
     ModelServiceSaved {
         service: crate::settings::ModelService,

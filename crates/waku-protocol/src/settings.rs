@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,9 @@ pub struct ServiceModel {
     pub aliases: Vec<String>,
     #[serde(default, skip_serializing_if = "ServiceModelOptions::is_default")]
     pub options: ServiceModelOptions,
+    /// True while awaiting metadata, false once configured, absent on older structured rows
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_metadata_pending: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -65,6 +68,8 @@ pub enum ModelPurpose {
     Chat,
     ImageGeneration,
     ImageEdit,
+    /// Catalog capability is known but the provider operation has not been configured
+    CatalogOnly,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -85,6 +90,13 @@ pub enum ModelKind {
     Image,
     Embedding,
     Rerank,
+    Speech,
+    Transcription,
+    Realtime,
+    Video,
+    Moderation,
+    Other,
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -136,14 +148,28 @@ impl ServiceModelOptions {
 
     /// These models send text or media through the selected dialogue API
     pub fn dialogue(&self) -> bool {
+        // An unclassified custom model can still use the configured dialogue protocol
         self.purpose == ModelPurpose::Chat
-            && matches!(self.kind, ModelKind::Text | ModelKind::Image)
+            && matches!(
+                self.kind,
+                ModelKind::Text | ModelKind::Image | ModelKind::Unknown
+            )
+    }
+
+    /// Whether the assistant implements an operation for the selected model
+    pub fn assistant_supported(&self) -> bool {
+        self.dialogue()
+            || match self.purpose {
+                ModelPurpose::ImageGeneration | ModelPurpose::ImageEdit => true,
+                ModelPurpose::Chat => matches!(self.kind, ModelKind::Embedding | ModelKind::Rerank),
+                ModelPurpose::CatalogOnly => false,
+            }
     }
 
     pub fn accepts(&self, modality: ModelModality) -> bool {
         match self.purpose {
             ModelPurpose::ImageEdit => modality == ModelModality::Vision,
-            ModelPurpose::ImageGeneration => false,
+            ModelPurpose::ImageGeneration | ModelPurpose::CatalogOnly => false,
             ModelPurpose::Chat => {
                 self.dialogue()
                     && self.inputs.contains(&modality)
@@ -191,24 +217,30 @@ impl ModelProtocol {
 }
 
 impl ServiceModel {
-    /// Add newly discovered models while preserving existing edits, aliases and manual entries
-    pub fn merge_catalog(existing: &mut Vec<Self>, incoming: Vec<String>, protocol: ModelProtocol) {
-        let known: HashSet<_> = existing
-            .iter()
-            .flat_map(|model| {
-                std::iter::once(model.id.as_str()).chain(model.aliases.iter().map(String::as_str))
-            })
-            .collect();
-        let new: Vec<_> = incoming
+    /// Add discoveries and repair untouched legacy rows without replacing edited models
+    pub fn merge_catalog(existing: &mut Vec<Self>, incoming: Vec<Self>) {
+        let mut incoming: HashMap<_, _> = incoming
             .into_iter()
-            .filter(|id| !known.contains(id.as_str()))
-            .map(|id| {
-                let mut model = Self::new(id);
-                model.options.protocol = protocol;
-                model
-            })
+            .map(|model| (model.id.clone(), model))
             .collect();
-        existing.extend(new);
+        for model in existing.iter_mut() {
+            let discovered = incoming.remove(&model.id);
+            for alias in &model.aliases {
+                incoming.remove(alias);
+            }
+            if let Some(discovered) = discovered
+                && (model.catalog_metadata_pending == Some(true)
+                    || model.catalog_metadata_pending.is_none()
+                        && model.matches_legacy_discovery(&discovered.options))
+            {
+                model.options = ServiceModelOptions {
+                    protocol: model.options.protocol,
+                    ..discovered.options
+                };
+                model.catalog_metadata_pending = discovered.catalog_metadata_pending;
+            }
+        }
+        existing.extend(incoming.into_values());
         existing.sort_by(|a, b| a.options.group.cmp(&b.options.group).then(a.id.cmp(&b.id)));
     }
 
@@ -218,7 +250,38 @@ impl ServiceModel {
             name: String::new(),
             aliases: Vec::new(),
             options: ServiceModelOptions::default(),
+            catalog_metadata_pending: Some(false),
         }
+    }
+
+    /// A supplier-listed ID can receive public metadata on this or a later sync
+    pub fn discovered(id: String, protocol: ModelProtocol) -> Self {
+        let mut model = Self::new(id);
+        model.options.protocol = protocol;
+        // Keep unfamiliar IDs unclassified and avoid advertising unverified tool support
+        model.options.kind = ModelKind::Unknown;
+        model.options.tools = false;
+        model.catalog_metadata_pending = Some(true);
+        model
+    }
+
+    fn matches_legacy_discovery(&self, discovered: &ServiceModelOptions) -> bool {
+        if !self.name.is_empty() || !self.aliases.is_empty() {
+            return false;
+        }
+        let protocol = self.options.protocol;
+        // Older discovery either stored just defaults or enriched a default text model
+        let defaults = ServiceModelOptions {
+            protocol,
+            ..Default::default()
+        };
+        let previous_catalog = ServiceModelOptions {
+            protocol,
+            kind: ModelKind::Text,
+            purpose: ModelPurpose::Chat,
+            ..discovered.clone()
+        };
+        self.options == defaults || self.options == previous_catalog
     }
 
     pub fn display_name(&self) -> &str {
@@ -246,7 +309,10 @@ fn deserialize_service_models<'de, D: serde::Deserializer<'de>>(
     Ok(Vec::<StoredModel>::deserialize(deserializer)?
         .into_iter()
         .map(|model| match model {
-            StoredModel::Id(id) => ServiceModel::new(id),
+            StoredModel::Id(id) => ServiceModel {
+                catalog_metadata_pending: Some(true),
+                ..ServiceModel::new(id)
+            },
             StoredModel::Model(model) => model,
         })
         .collect())
@@ -331,5 +397,61 @@ mod tests {
         let round_trip: DaemonSettings =
             serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
         assert_eq!(round_trip, settings);
+    }
+
+    #[test]
+    fn catalog_fills_pending_models_without_overwriting_saved_choices() {
+        let pending = |id: &str| ServiceModel::discovered(id.into(), ModelProtocol::Gemini);
+        let mut edited = ServiceModel::new("edited".into());
+        edited.name = "My model".into();
+        edited.aliases.push("old-id".into());
+        edited.options.tools = false;
+        edited.options.max_output_tokens = Some(1024);
+        let mut models = vec![edited.clone(), pending("pending")];
+        let incoming = ["pending", "edited", "old-id", "new"]
+            .map(|id| {
+                let mut model = ServiceModel::new(id.into());
+                model.options.tools = true;
+                model.options.max_output_tokens = Some(8192);
+                model
+            })
+            .into();
+
+        ServiceModel::merge_catalog(&mut models, incoming);
+
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0], edited);
+        assert_eq!(models[1].id, "new");
+        assert_eq!(models[2].options.protocol, ModelProtocol::Gemini);
+        assert!(models[2].options.tools);
+        assert_eq!(models[2].options.max_output_tokens, Some(8192));
+        assert_eq!(models[2].catalog_metadata_pending, Some(false));
+    }
+
+    #[test]
+    fn catalog_repairs_legacy_defaults_and_preserves_explicit_model_settings() {
+        let legacy: ServiceModel =
+            serde_json::from_value(serde_json::json!({"id": "tts"})).unwrap();
+        let locked = ServiceModel::new("manual".into());
+        let mut old_embedding = ServiceModel::new("embedding".into());
+        old_embedding.catalog_metadata_pending = None;
+        old_embedding.options.tools = false;
+        old_embedding.options.context_window = Some(8191);
+        let mut models = vec![legacy, locked.clone(), old_embedding.clone()];
+        let mut tts = ServiceModel::discovered("tts".into(), ModelProtocol::OpenAiChat);
+        tts.options.kind = ModelKind::Speech;
+        let mut embedding = old_embedding;
+        embedding.options.kind = ModelKind::Embedding;
+        embedding.catalog_metadata_pending = Some(false);
+        let mut attempted_override = tts.clone();
+        attempted_override.id = "manual".into();
+        ServiceModel::merge_catalog(&mut models, vec![tts, embedding, attempted_override]);
+
+        assert_eq!(models[0].options.kind, ModelKind::Embedding);
+        assert_eq!(models[0].options.context_window, Some(8191));
+        assert_eq!(models[1], locked);
+        assert_eq!(models[2].options.kind, ModelKind::Speech);
+        assert!(!models[2].options.tools);
+        assert!(!models[2].options.assistant_supported());
     }
 }

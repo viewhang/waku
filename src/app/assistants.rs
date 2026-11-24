@@ -38,7 +38,10 @@ impl ModelPickerTarget {
     }
 
     fn accepts(self, model: &ServiceModel) -> bool {
-        !matches!(self, Self::Translation) || model.options.dialogue()
+        match self {
+            Self::Translation => model.options.dialogue(),
+            Self::Default | Self::Session(_) => model.options.assistant_supported(),
+        }
     }
 }
 
@@ -893,7 +896,7 @@ impl Waku {
     fn save_assistant(&mut self, cx: &mut Context<Self>) {
         let form = &self.assistant_form;
         let Some(selection) = form.default_model.clone() else {
-            self.show_toast(tr!("assistant.choose_model"));
+            self.show_warning_toast(tr!("assistant.choose_model"));
             cx.notify();
             return;
         };
@@ -911,7 +914,7 @@ impl Waku {
             system_prompt: form.prompt.read(cx).content().to_owned(),
         };
         if profile.name.is_empty() {
-            self.show_toast(tr!("assistant.fields_required"));
+            self.show_warning_toast(tr!("assistant.fields_required"));
             cx.notify();
             return;
         }

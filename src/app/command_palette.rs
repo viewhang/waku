@@ -1509,7 +1509,7 @@ impl Waku {
                         let error = error.to_string();
                         waku.command_palette.provider_session_import = None;
                         waku.command_palette.provider_session_error = Some(error.clone());
-                        waku.show_toast(tr!("command_palette.resume_failed", error = error));
+                        waku.show_error_toast(tr!("command_palette.resume_failed", error = error));
                         cx.notify();
                         None
                     }

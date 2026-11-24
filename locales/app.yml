@@ -2346,6 +2346,16 @@ model_services.remove_model:
   en: Remove
 model_services.confirm_remove_model:
   en: 'Remove “%{model}” from this provider?'
+model_services.batch_remove:
+  en: Batch remove
+model_services.select_all_results:
+  en: Select all results
+model_services.clear_selection:
+  en: Deselect all
+model_services.remove_selected:
+  en: 'Remove selected (%{count})'
+model_services.confirm_remove_models:
+  en: 'Remove %{count} models from this provider?'
 model_services.test:
   en: Test
 model_services.working:
@@ -2420,6 +2430,18 @@ service_model.embedding:
   en: Embedding
 service_model.rerank:
   en: Rerank
+service_model.speech:
+  en: Speech
+service_model.transcription:
+  en: Transcription
+service_model.realtime:
+  en: Realtime audio
+service_model.moderation:
+  en: Moderation
+service_model.other:
+  en: Other
+service_model.unsupported_operation:
+  en: This model type is available in the catalog. The assistant has no operation configured for it.
 service_model.protocol:
   en: Chat protocol
 service_model.capabilities:

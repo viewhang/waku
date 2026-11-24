@@ -1,5 +1,6 @@
 //! Daemon-owned, user-editable configuration.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 pub use waku_protocol::settings::DaemonSettings;
-use waku_protocol::settings::{ModelProtocol, ModelService, ServiceModel};
+use waku_protocol::settings::{ModelService, ServiceModel};
 
 pub(crate) const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
 // Model entries use UUIDs, leaving this credential ID reserved for Tavily
@@ -234,12 +235,41 @@ impl DaemonSettingsStore {
         Ok(saved)
     }
 
+    /// Apply one removal to the latest catalog so concurrent edits to other models survive
+    pub(crate) fn remove_model_service_models(
+        &self,
+        id: Uuid,
+        base_url: &str,
+        model_ids: &[String],
+    ) -> anyhow::Result<ModelService> {
+        let mut current = self.settings.lock();
+        let mut next = current.clone();
+        let service = next
+            .model_services
+            .iter_mut()
+            .find(|service| service.id == id)
+            .context("Model service is missing")?;
+        if service.base_url != base_url {
+            bail!("The API address changed. Review the current model list and try again");
+        }
+        let model_ids: HashSet<_> = model_ids.iter().collect();
+        let count_before = service.models.len();
+        service
+            .models
+            .retain(|model| !model_ids.contains(&model.id));
+        let saved = service.clone();
+        if service.models.len() != count_before {
+            write_atomic(&self.path, &next)?;
+            *current = next;
+        }
+        Ok(saved)
+    }
+
     /// Merge into the latest catalog so edits made during discovery survive
     pub(crate) fn merge_model_service_catalog(
         &self,
         source: &ModelService,
-        models: Vec<String>,
-        protocol: ModelProtocol,
+        models: Vec<ServiceModel>,
     ) -> anyhow::Result<ModelService> {
         let mut current = self.settings.lock();
         let mut next = current.clone();
@@ -251,7 +281,7 @@ impl DaemonSettingsStore {
         if service.base_url != source.base_url {
             bail!("The API address changed during model sync. Try again with the new address");
         }
-        ServiceModel::merge_catalog(&mut service.models, models, protocol);
+        ServiceModel::merge_catalog(&mut service.models, models);
         let saved = service.clone();
         write_atomic(&self.path, &next)?;
         *current = next;
@@ -451,6 +481,64 @@ mod tests {
         reopened.save_tavily_api_key("").unwrap();
         assert_eq!(reopened.tavily_api_key().unwrap(), None);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_removal_updates_only_its_selected_model_ids() {
+        let directory = std::env::temp_dir().join(format!("waku-batch-remove-{}", Uuid::new_v4()));
+        let path = directory.join("settings.json");
+        let store = DaemonSettingsStore::open(path.clone()).unwrap();
+        let mut renamed = ServiceModel::new("renamed".into());
+        renamed.aliases.push("old-id".into());
+        let service = ModelService {
+            id: Uuid::new_v4(),
+            name: "Test service".into(),
+            base_url: "https://models.example/v1".into(),
+            enabled: true,
+            models: vec![
+                ServiceModel::new("first".into()),
+                ServiceModel::new("second".into()),
+                renamed.clone(),
+            ],
+            legacy_key: false,
+        };
+        store
+            .save_model_service(service.clone(), Some("fixture-key"))
+            .unwrap();
+        let added = ServiceModel::new("added".into());
+        store
+            .merge_model_service_catalog(&service, vec![added.clone()])
+            .unwrap();
+        store.set_model_service_enabled(service.id, false).unwrap();
+        let selected = ["first".into(), "second".into(), "old-id".into()];
+        assert!(
+            store
+                .remove_model_service_models(service.id, "https://other.example/v1", &selected)
+                .is_err()
+        );
+        assert_eq!(store.model_service(service.id).unwrap().models.len(), 4);
+
+        let saved = store
+            .remove_model_service_models(service.id, &service.base_url, &selected)
+            .unwrap();
+        assert_eq!(saved.models, [added, renamed]);
+        assert!(!saved.enabled);
+        assert_eq!(
+            store
+                .remove_model_service_models(service.id, &service.base_url, &selected)
+                .unwrap(),
+            saved
+        );
+        let reopened = DaemonSettingsStore::open(path).unwrap();
+        assert_eq!(reopened.model_service(service.id), Some(saved));
+        assert_eq!(
+            reopened
+                .model_service_key(service.id, &service.base_url)
+                .unwrap()
+                .as_deref(),
+            Some("fixture-key")
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

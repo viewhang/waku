@@ -537,7 +537,7 @@ impl Waku {
                 if busy {
                     self.enqueue_follow_up_submission(session_id, submission, cx);
                     if self.state.selected_session == Some(session_id) {
-                        self.show_toast(tr!(
+                        self.show_warning_toast(tr!(
                             "session.steer_rejected",
                             error = compact_driver_error(&reason)
                         ));
@@ -747,7 +747,7 @@ impl Waku {
                 let error = compact_driver_error(&error);
                 runtime.last_driver_error = Some(error.clone());
                 if self.state.selected_session == Some(session_id) {
-                    self.show_toast(error.clone());
+                    self.show_error_toast(error.clone());
                 }
                 // An optimistic pursuit turn has no submission to fail with.
                 // Unwind it so the error cannot strand a spinner; if the

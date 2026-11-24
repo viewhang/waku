@@ -368,7 +368,7 @@ impl Waku {
                         }
                     }
                     Err(error) => {
-                        waku.show_toast(tr!("errors.change_branch", error = error));
+                        waku.show_error_toast(tr!("errors.change_branch", error = error));
                     }
                 }
                 cx.notify();

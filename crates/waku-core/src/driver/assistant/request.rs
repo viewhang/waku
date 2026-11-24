@@ -756,6 +756,7 @@ impl Operation<'_> {
                 }
                 _ => bail!("Invalid model operation"),
             },
+            ModelPurpose::CatalogOnly => bail!(tr!("service_model.unsupported_operation")),
         };
         let response = bearer_auth(http.post(format!("{base}{endpoint}")), self.key)
             .json(&payload)

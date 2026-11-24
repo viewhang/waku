@@ -137,7 +137,7 @@ impl Waku {
                         this.usage_history_scanned_at = Some(Instant::now());
                         this.usage_history = Some(history);
                     }
-                    Err(error) => this.show_toast(error.to_string()),
+                    Err(error) => this.show_error_toast(error.to_string()),
                 }
                 cx.notify();
             });

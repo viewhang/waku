@@ -1747,7 +1747,7 @@ impl Waku {
             }
             TranscriptLinkRoute::Finder(path) => {
                 if self.daemon.is_remote() {
-                    self.show_toast(tr!("errors.remote_host_path"));
+                    self.show_info_toast(tr!("errors.remote_host_path"));
                     cx.notify();
                 } else {
                     crate::platform::reveal_in_file_manager(&path, cx);
@@ -3395,11 +3395,14 @@ impl Waku {
             return;
         };
         if !editor.writable {
-            self.show_toast(if editor.reading {
-                tr!("files.could_not_save_opening", path = relative_path)
+            if editor.reading {
+                self.show_info_toast(tr!("files.could_not_save_opening", path = relative_path));
             } else {
-                tr!("files.could_not_save_read_only", path = relative_path)
-            });
+                self.show_warning_toast(tr!(
+                    "files.could_not_save_read_only",
+                    path = relative_path
+                ));
+            }
             cx.notify();
             return;
         }
@@ -3453,7 +3456,7 @@ impl Waku {
                             editor.dirty = current != content;
                         }
                     }
-                    Err(error) => waku.show_toast(tr!(
+                    Err(error) => waku.show_error_toast(tr!(
                         "files.could_not_save",
                         path = relative_path,
                         error = error.to_string()
@@ -4604,7 +4607,7 @@ impl Waku {
                     Err(error) => {
                         let message = error.to_string();
                         if waku.right_panel_diff_snapshot.is_some() {
-                            waku.show_toast(tr!("diff.refresh_failed", error = message));
+                            waku.show_error_toast(tr!("diff.refresh_failed", error = message));
                         } else {
                             waku.right_panel_diff_error = Some(message);
                         }

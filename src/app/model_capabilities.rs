@@ -13,10 +13,13 @@ pub(super) enum ModelCategory {
     Audio,
     Video,
     Rerank,
+    Speech,
+    Transcription,
+    Other,
 }
 
 impl ModelCategory {
-    pub(super) const ALL: [Self; 7] = [
+    pub(super) const ALL: [Self; 10] = [
         Self::All,
         Self::Text,
         Self::Image,
@@ -24,6 +27,9 @@ impl ModelCategory {
         Self::Audio,
         Self::Video,
         Self::Rerank,
+        Self::Speech,
+        Self::Transcription,
+        Self::Other,
     ];
 
     pub(super) fn index(self) -> usize {
@@ -36,16 +42,30 @@ impl ModelCategory {
             Self::Text => options.purpose == ModelPurpose::Chat && options.kind == ModelKind::Text,
             // Image generation and editing are distinct from a text model accepting an image
             Self::Image => {
-                options.kind == ModelKind::Image || options.purpose != ModelPurpose::Chat
+                options.kind == ModelKind::Image
+                    || matches!(
+                        options.purpose,
+                        ModelPurpose::ImageGeneration | ModelPurpose::ImageEdit
+                    )
             }
             Self::Embedding => {
                 options.purpose == ModelPurpose::Chat && options.kind == ModelKind::Embedding
             }
-            Self::Audio => options.accepts(ModelModality::Audio),
-            Self::Video => options.accepts(ModelModality::Video),
+            Self::Audio => {
+                options.kind == ModelKind::Realtime || options.accepts(ModelModality::Audio)
+            }
+            Self::Video => {
+                options.kind == ModelKind::Video || options.accepts(ModelModality::Video)
+            }
             Self::Rerank => {
                 options.purpose == ModelPurpose::Chat && options.kind == ModelKind::Rerank
             }
+            Self::Speech => options.kind == ModelKind::Speech,
+            Self::Transcription => options.kind == ModelKind::Transcription,
+            Self::Other => matches!(
+                options.kind,
+                ModelKind::Moderation | ModelKind::Other | ModelKind::Unknown
+            ),
         }
     }
 
@@ -58,6 +78,9 @@ impl ModelCategory {
             Self::Audio => tr!("service_model.audio"),
             Self::Video => tr!("service_model.video"),
             Self::Rerank => tr!("service_model.rerank"),
+            Self::Speech => tr!("service_model.speech"),
+            Self::Transcription => tr!("service_model.transcription"),
+            Self::Other => tr!("service_model.other"),
         }
     }
 
@@ -70,6 +93,9 @@ impl ModelCategory {
             Self::Audio => "icons/file-types/audio.svg",
             Self::Video => "icons/file-types/video.svg",
             Self::Rerank => "icons/chevrons-up-down.svg",
+            Self::Speech => "icons/file-types/audio.svg",
+            Self::Transcription => "icons/file.svg",
+            Self::Other => "icons/package.svg",
         }
     }
 }
@@ -119,6 +145,12 @@ pub(super) fn model_capability_badges(options: &ServiceModelOptions, theme: Them
             theme.success,
         ),
         (
+            options.kind == ModelKind::Image && options.purpose == ModelPurpose::CatalogOnly,
+            "service_model.image",
+            ModelCategory::Image.icon(),
+            theme.text_secondary,
+        ),
+        (
             ModelCategory::Embedding.matches(options),
             "service_model.embedding",
             ModelCategory::Embedding.icon(),
@@ -128,6 +160,36 @@ pub(super) fn model_capability_badges(options: &ServiceModelOptions, theme: Them
             ModelCategory::Rerank.matches(options),
             "service_model.rerank",
             ModelCategory::Rerank.icon(),
+            theme.text_secondary,
+        ),
+        (
+            options.kind == ModelKind::Speech,
+            "service_model.speech",
+            ModelCategory::Speech.icon(),
+            theme.gauge,
+        ),
+        (
+            options.kind == ModelKind::Transcription,
+            "service_model.transcription",
+            ModelCategory::Transcription.icon(),
+            theme.gauge,
+        ),
+        (
+            options.kind == ModelKind::Realtime,
+            "service_model.realtime",
+            ModelCategory::Audio.icon(),
+            theme.gauge,
+        ),
+        (
+            options.kind == ModelKind::Video,
+            "service_model.video",
+            ModelCategory::Video.icon(),
+            theme.gauge,
+        ),
+        (
+            options.kind == ModelKind::Moderation,
+            "service_model.moderation",
+            ModelCategory::Other.icon(),
             theme.text_secondary,
         ),
     ];

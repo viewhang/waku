@@ -157,7 +157,7 @@ impl Waku {
                         {
                             waku.pending_session_activation = None;
                         }
-                        waku.show_toast(tr!("errors.open_session", error = error));
+                        waku.show_error_toast(tr!("errors.open_session", error = error));
                     }
                 }
                 cx.notify();
@@ -312,7 +312,7 @@ impl Waku {
 
     pub(super) fn remove_session(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
         if self.response_fork_preparations.contains_key(&session_id) {
-            self.show_toast(tr!("session.response_fork_in_progress"));
+            self.show_info_toast(tr!("session.response_fork_in_progress"));
             cx.notify();
             return;
         }
@@ -347,7 +347,7 @@ impl Waku {
         self.remove_composer_draft(composer_draft_key, cx);
         self.state.sessions.remove(index);
         if let Err(error) = self.store.remove_session(session_id) {
-            self.show_toast(tr!("errors.save_local_state", error = error));
+            self.show_error_toast(tr!("errors.save_local_state", error = error));
         }
         if self
             .pending_session_activation
@@ -1572,7 +1572,7 @@ impl Waku {
 
     pub(super) fn add_project(&mut self, cx: &mut Context<Self>) {
         if self.daemon.is_remote() {
-            self.show_toast(tr!("errors.remote_project_picker"));
+            self.show_info_toast(tr!("errors.remote_project_picker"));
             cx.notify();
             return;
         }
@@ -1658,7 +1658,7 @@ impl Waku {
                     }
                 }
                 Err(error) => {
-                    waku.show_toast(tr!("errors.create_projectless_task", error = error));
+                    waku.show_error_toast(tr!("errors.create_projectless_task", error = error));
                     cx.notify();
                 }
             });

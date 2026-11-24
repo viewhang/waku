@@ -29,6 +29,7 @@ pub(super) struct ModelServicesPage {
     model_scroll: gpui::UniformListScrollHandle,
     pending: HashSet<Uuid>,
     model_filter: Option<(Uuid, ModelCategory)>,
+    batch: Option<(Uuid, HashSet<String>)>,
     catalog: RefCell<Option<(Uuid, ModelCategory, String, Rc<CatalogIndex>)>>,
 }
 
@@ -81,6 +82,17 @@ impl CatalogIndex {
         }
         Self { counts, rows }
     }
+
+    /// Collect only the models included in the current search and category
+    fn model_ids(&self, models: &[ServiceModel]) -> HashSet<String> {
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                CatalogRow::Model(index) => models.get(*index).map(|model| model.id.clone()),
+                CatalogRow::Group(_) => None,
+            })
+            .collect()
+    }
 }
 
 impl ModelServicesPage {
@@ -105,6 +117,7 @@ impl ModelServicesPage {
             model_scroll: gpui::UniformListScrollHandle::new(),
             pending: HashSet::new(),
             model_filter: None,
+            batch: None,
             catalog: RefCell::new(None),
         }
     }
@@ -112,6 +125,7 @@ impl ModelServicesPage {
     pub(super) fn subscribe(&self, cx: &mut Context<Waku>) {
         cx.subscribe(&self.search, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Edited) {
+                this.model_services_page.batch = None;
                 this.model_services_page.scroll_to_top();
                 cx.notify();
             }
@@ -119,6 +133,9 @@ impl ModelServicesPage {
         .detach();
         cx.subscribe(&self.model_search, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Edited) {
+                if let Some((_, models)) = &mut this.model_services_page.batch {
+                    models.clear();
+                }
                 this.model_services_page.scroll_models_to_top();
                 cx.notify();
             }
@@ -143,6 +160,25 @@ impl ModelServicesPage {
     fn scroll_models_to_top(&self) {
         self.model_scroll
             .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
+    }
+
+    fn select_service(&mut self, id: Uuid) {
+        if self
+            .batch
+            .as_ref()
+            .is_some_and(|(service, _)| *service != id)
+        {
+            self.batch = None;
+        }
+        self.selected = Some(id);
+        self.scroll_models_to_top();
+    }
+
+    fn batch_models(&self, id: Uuid) -> Option<&HashSet<String>> {
+        self.batch
+            .as_ref()
+            .filter(|(service, _)| *service == id)
+            .map(|(_, ids)| ids)
     }
 
     pub(super) fn show_saved(&mut self, id: Uuid, creating: bool, cx: &mut App) {
@@ -225,8 +261,7 @@ impl Waku {
             .selected_in(&visible)
             .and_then(|id| visible.iter().position(|entry| *entry == id));
         if let Some(next) = next_picker_highlight(current, visible.len(), key) {
-            page.selected = Some(visible[next]);
-            page.scroll_models_to_top();
+            page.select_service(visible[next]);
             page.list_scroll
                 .scroll_to_item(next, gpui::ScrollStrategy::Nearest);
             cx.notify();
@@ -235,6 +270,9 @@ impl Waku {
 
     pub(super) fn apply_saved_model_service(&mut self, service: ModelService) {
         self.model_services_page.catalog.get_mut().take();
+        if self.model_services_page.batch_models(service.id).is_some() {
+            self.model_services_page.batch = None;
+        }
         if let Some(saved) = self
             .state
             .model_services
@@ -244,6 +282,35 @@ impl Waku {
             *saved = service;
         } else {
             self.state.model_services.push(service);
+        }
+    }
+
+    fn model_service_catalog(
+        &self,
+        service: &ModelService,
+        cx: &App,
+    ) -> (ModelCategory, Rc<CatalogIndex>) {
+        let page = &self.model_services_page;
+        let filter = page.model_filter(service.id);
+        let query = page.model_search.read(cx).content().trim().to_lowercase();
+        (filter, page.catalog(service, filter, &query))
+    }
+
+    fn toggle_all_model_results(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let Some(service) = self.model_service(id) else {
+            return;
+        };
+        let (_, catalog) = self.model_service_catalog(service, cx);
+        let visible = catalog.model_ids(&service.models);
+        if let Some((service, selected)) = &mut self.model_services_page.batch
+            && *service == id
+        {
+            if *selected == visible {
+                selected.clear();
+            } else {
+                *selected = visible;
+            }
+            cx.notify();
         }
     }
 
@@ -277,8 +344,8 @@ impl Waku {
                     Ok(ResponsePayload::ModelServiceSaved { service }) => {
                         this.apply_saved_model_service(service)
                     }
-                    Ok(_) => this.show_toast(tr!("assistant.invalid_response")),
-                    Err(error) => this.show_toast(error.to_string()),
+                    Ok(_) => this.show_error_toast(tr!("assistant.invalid_response")),
+                    Err(error) => this.show_error_toast(error.to_string()),
                 }
                 cx.notify();
             });
@@ -305,18 +372,17 @@ impl Waku {
                 .await;
             let _ = view.update(cx, |this, cx| {
                 this.model_services_page.pending.remove(&id);
-                let message = match result {
+                match result {
                     Ok(ResponsePayload::ModelServiceSaved { service }) => {
                         this.apply_saved_model_service(service);
-                        tr!("model_services.synced")
+                        this.show_success_toast(tr!("model_services.synced"));
                     }
                     Ok(ResponsePayload::ModelServiceModels { .. }) => {
-                        tr!("model_services.sync_empty")
+                        this.show_warning_toast(tr!("model_services.sync_empty"));
                     }
-                    Ok(_) => tr!("assistant.invalid_response"),
-                    Err(error) => error.to_string(),
-                };
-                this.show_toast(message);
+                    Ok(_) => this.show_error_toast(tr!("assistant.invalid_response")),
+                    Err(error) => this.show_error_toast(error.to_string()),
+                }
                 cx.notify();
             });
         })
@@ -469,6 +535,7 @@ impl Waku {
                         MenuItem::new(model_service_filter_label(filter), move |_, cx| {
                             let _ = weak.update(cx, |this, cx| {
                                 this.model_services_page.enabled_filter = filter;
+                                this.model_services_page.batch = None;
                                 this.model_services_page.scroll_to_top();
                                 cx.notify();
                             });
@@ -547,8 +614,7 @@ impl Waku {
                         ),
                 )
                 .on_activation(cx, move |this, _, cx| {
-                    this.model_services_page.selected = Some(id);
-                    this.model_services_page.scroll_models_to_top();
+                    this.model_services_page.select_service(id);
                     cx.notify();
                 }),
         )
@@ -580,15 +646,8 @@ impl Waku {
             .on_activation(cx, move |this, window, cx| {
                 this.open_model_service_editor(Some(id), None, window, cx)
             });
-        let filter = self.model_services_page.model_filter(id);
-        let query = self
-            .model_services_page
-            .model_search
-            .read(cx)
-            .content()
-            .trim()
-            .to_lowercase();
-        let catalog = self.model_services_page.catalog(service, filter, &query);
+        let (filter, catalog) = self.model_service_catalog(service, cx);
+        let visible_count = catalog.counts[filter.index()];
         let filter_bar = (!service.models.is_empty())
             .then(|| Self::render_model_categories(id, filter, &catalog, cx));
         let models = Self::render_catalog_rows(
@@ -678,7 +737,7 @@ impl Waku {
                             .child(service.base_url.clone()),
                     ),
             )
-            .child(self.render_model_catalog_toolbar(service, pending, cx))
+            .child(self.render_model_catalog_toolbar(service, pending, visible_count, cx))
             .children(filter_bar)
             .child(div().w_full().flex_1().min_h_0().child(models))
     }
@@ -687,32 +746,14 @@ impl Waku {
         &self,
         service: &ModelService,
         pending: bool,
+        visible_count: usize,
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = Theme::current(cx);
         let id = service.id;
-        let sync = assistant_button_base("sync-saved-models", tr!("model_services.sync"), theme)
-            .flex_none()
-            .tab_stop(!pending)
-            .when(pending, |button| button.opacity(0.55))
-            .when(!pending, |button| {
-                button.hover(|style| style.bg(theme.overlay))
-            })
-            .on_activation(cx, move |this, _, cx| {
-                this.sync_model_service_catalog(id, cx)
-            });
-        let add = assistant_button_base("add-saved-model", tr!("model_services.add_model"), theme)
-            .flex_none()
-            .tab_stop(!pending)
-            .when(pending, |button| button.opacity(0.55))
-            .when(!pending, |button| {
-                button.hover(|style| style.bg(theme.overlay))
-            })
-            .on_activation(cx, move |this, window, cx| {
-                this.open_catalog_model(id, CatalogAction::Add, window, cx);
-            });
-        div()
+        let bar = div()
             .flex()
+            .flex_wrap()
             .flex_none()
             .items_center()
             .gap(px(8.0))
@@ -738,9 +779,83 @@ impl Waku {
                     .max_w(px(230.0))
                     .flex_1(),
                 )
-            })
-            .child(sync)
-            .child(add)
+            });
+        if let Some(selected) = self.model_services_page.batch_models(id) {
+            let count = selected.len();
+            let can_select = !pending && visible_count > 0;
+            let can_remove = !pending && count > 0;
+            return bar
+                .child(catalog_toolbar_button(
+                    "toggle-all-model-results",
+                    if can_select && count == visible_count {
+                        tr!("model_services.clear_selection")
+                    } else {
+                        tr!("model_services.select_all_results")
+                    },
+                    can_select,
+                    theme,
+                    cx,
+                    move |this, _, cx| this.toggle_all_model_results(id, cx),
+                ))
+                .child(
+                    assistant_button(
+                        "cancel-batch-model-removal",
+                        tr!("model_services.cancel"),
+                        cx,
+                        |this, _, cx| {
+                            this.model_services_page.batch = None;
+                            cx.notify();
+                        },
+                    )
+                    .flex_none(),
+                )
+                .child(
+                    catalog_toolbar_button(
+                        "remove-selected-models",
+                        tr!("model_services.remove_selected", count = count),
+                        can_remove,
+                        theme,
+                        cx,
+                        move |this, window, cx| {
+                            if let Some(ids) = this.model_services_page.batch_models(id).cloned() {
+                                this.open_catalog_model(id, CatalogAction::Remove(ids), window, cx);
+                            }
+                        },
+                    )
+                    .text_color(theme.danger),
+                );
+        }
+        bar.when(!service.models.is_empty(), |bar| {
+            bar.child(catalog_toolbar_button(
+                "batch-remove-models",
+                tr!("model_services.batch_remove"),
+                !pending && visible_count > 0,
+                theme,
+                cx,
+                move |this, _, cx| {
+                    if !this.model_services_page.is_saving(id) {
+                        this.model_services_page.batch = Some((id, HashSet::new()));
+                        cx.notify();
+                    }
+                },
+            ))
+        })
+        .child(catalog_toolbar_button(
+            "sync-saved-models",
+            tr!("model_services.sync"),
+            !pending,
+            theme,
+            cx,
+            move |this, _, cx| this.sync_model_service_catalog(id, cx),
+        ))
+        .child(catalog_toolbar_button(
+            "add-saved-model",
+            tr!("model_services.add_model"),
+            !pending,
+            theme,
+            cx,
+            move |this, window, cx| this.open_catalog_model(id, CatalogAction::Add, window, cx),
+        ))
     }
 
     fn render_model_categories(
@@ -805,6 +920,12 @@ impl Waku {
                             .child(catalog.counts[category.index()].to_string()),
                     )
                     .on_activation(cx, move |this, _, cx| {
+                        if this.model_services_page.model_filter(service_id) != category
+                            && let Some((id, selected)) = &mut this.model_services_page.batch
+                            && *id == service_id
+                        {
+                            selected.clear();
+                        }
                         this.model_services_page.model_filter = Some((service_id, category));
                         this.model_services_page.scroll_models_to_top();
                         cx.notify();
@@ -845,6 +966,7 @@ impl Waku {
                     return Vec::new();
                 };
                 let pending = this.model_services_page.is_saving(id);
+                let selected = this.model_services_page.batch_models(id);
                 catalog.rows[range]
                     .iter()
                     .filter_map(|row| match row {
@@ -871,7 +993,8 @@ impl Waku {
                                 .into_any_element(),
                         ),
                         CatalogRow::Model(index) => service.models.get(*index).map(|model| {
-                            Self::render_catalog_model(id, model, pending, theme, cx)
+                            let checked = selected.map(|ids| ids.contains(&model.id));
+                            Self::render_catalog_model(id, model, checked, pending, theme, cx)
                                 .into_any_element()
                         }),
                     })
@@ -886,15 +1009,12 @@ impl Waku {
     fn render_catalog_model(
         service_id: Uuid,
         model: &ServiceModel,
+        checked: Option<bool>,
         pending: bool,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let edit_id = model.id.clone();
-        let remove_id = model.id.clone();
-        let edit = tr!("model_services.edit_model");
-        let remove = tr!("model_services.remove_model");
-        div()
+        let row = div()
             .id(SharedString::from(model.id.clone()))
             // UniformList gives each row available width, which the row must explicitly fill
             .w_full()
@@ -905,7 +1025,35 @@ impl Waku {
             .gap(px(10.0))
             .border_b_1()
             .border_color(theme.border)
-            .child(
+            .child(if let Some(checked) = checked {
+                div()
+                    .size(px(24.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .size(px(16.0))
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(if checked {
+                                theme.inverse
+                            } else {
+                                theme.border_strong
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(checked, |checkbox| {
+                                checkbox.bg(theme.inverse).child(icon(
+                                    "icons/check.svg",
+                                    12.0,
+                                    theme.on_inverse,
+                                ))
+                            }),
+                    )
+            } else {
                 div()
                     .size(px(24.0))
                     .rounded_full()
@@ -914,8 +1062,8 @@ impl Waku {
                     .items_center()
                     .justify_center()
                     .bg(theme.overlay)
-                    .child(icon("icons/bot.svg", 14.0, theme.text_secondary)),
-            )
+                    .child(icon("icons/bot.svg", 14.0, theme.text_secondary))
+            })
             .child(
                 div()
                     .flex_1()
@@ -925,50 +1073,96 @@ impl Waku {
                     .text_color(theme.text)
                     .child(model.display_name().to_owned()),
             )
-            .child(model_capability_badges(&model.options, theme))
-            .child(
-                div()
-                    .ml(px(4.0))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(
-                        icon_button("edit-model", "icons/settings.svg", theme)
-                            .size(px(26.0))
-                            .tab_index(0)
-                            .tab_stop(!pending)
-                            .focus_visible(|button| button.bg(theme.overlay_strong))
-                            .aria_label(edit.clone())
-                            .tooltip(Tooltip::text(edit))
-                            .on_activation(cx, move |this, window, cx| {
-                                this.open_catalog_model(
-                                    service_id,
-                                    CatalogAction::Edit(edit_id.clone()),
-                                    window,
-                                    cx,
-                                );
-                            }),
-                    )
-                    .child(
-                        icon_button("remove-model", "icons/window-minimize.svg", theme)
-                            .size(px(26.0))
-                            .tab_index(0)
-                            .tab_stop(!pending)
-                            .focus_visible(|button| button.bg(theme.overlay_strong))
-                            .aria_label(remove.clone())
-                            .tooltip(Tooltip::text(remove))
-                            .on_activation(cx, move |this, window, cx| {
-                                this.open_catalog_model(
-                                    service_id,
-                                    CatalogAction::Remove(remove_id.clone()),
-                                    window,
-                                    cx,
-                                );
-                            }),
-                    ),
-            )
+            .child(model_capability_badges(&model.options, theme));
+        if let Some(checked) = checked {
+            let id = model.id.clone();
+            return row
+                .aria_label(model.display_name().to_owned())
+                .aria_selected(checked)
+                .tab_index(0)
+                .tab_stop(!pending)
+                .focus_visible(|row| row.border_1().border_color(theme.accent))
+                .when(checked, |row| row.bg(theme.sidebar_item_background))
+                .hover(|row| row.bg(theme.overlay))
+                .when(!pending, |row| {
+                    row.on_activation(cx, move |this, _, cx| {
+                        if let Some((service, selected)) = &mut this.model_services_page.batch
+                            && *service == service_id
+                        {
+                            if !selected.remove(&id) {
+                                selected.insert(id.clone());
+                            }
+                            cx.notify();
+                        }
+                    })
+                });
+        }
+        let edit_id = model.id.clone();
+        let remove_id = model.id.clone();
+        let edit = tr!("model_services.edit_model");
+        let remove = tr!("model_services.remove_model");
+        row.child(
+            div()
+                .ml(px(4.0))
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    icon_button("edit-model", "icons/settings.svg", theme)
+                        .size(px(26.0))
+                        .tab_index(0)
+                        .tab_stop(!pending)
+                        .focus_visible(|button| button.bg(theme.overlay_strong))
+                        .aria_label(edit.clone())
+                        .tooltip(Tooltip::text(edit))
+                        .on_activation(cx, move |this, window, cx| {
+                            this.open_catalog_model(
+                                service_id,
+                                CatalogAction::Edit(edit_id.clone()),
+                                window,
+                                cx,
+                            );
+                        }),
+                )
+                .child(
+                    icon_button("remove-model", "icons/window-minimize.svg", theme)
+                        .size(px(26.0))
+                        .tab_index(0)
+                        .tab_stop(!pending)
+                        .focus_visible(|button| button.bg(theme.overlay_strong))
+                        .aria_label(remove.clone())
+                        .tooltip(Tooltip::text(remove))
+                        .on_activation(cx, move |this, window, cx| {
+                            this.open_catalog_model(
+                                service_id,
+                                CatalogAction::Remove(HashSet::from([remove_id.clone()])),
+                                window,
+                                cx,
+                            );
+                        }),
+                ),
+        )
     }
+}
+
+fn catalog_toolbar_button(
+    id: &'static str,
+    label: String,
+    enabled: bool,
+    theme: Theme,
+    cx: &mut Context<Waku>,
+    action: impl Fn(&mut Waku, &mut Window, &mut Context<Waku>) + 'static,
+) -> Stateful<Div> {
+    assistant_button_base(id, label, theme)
+        .flex_none()
+        .tab_stop(enabled)
+        .when(!enabled, |button| button.opacity(0.55))
+        .when(enabled, |button| {
+            button
+                .hover(|style| style.bg(theme.overlay))
+                .on_activation(cx, action)
+        })
 }
 
 fn model_service_filter_label(enabled: Option<bool>) -> String {
@@ -1015,12 +1209,29 @@ mod tests {
         image.options.group = "Images".into();
         image.options.kind = ModelKind::Image;
         image.options.purpose = ModelPurpose::ImageEdit;
-        let models = [vision, image, multimodal];
+        let mut speech = ServiceModel::discovered("tts".into(), ModelProtocol::OpenAiChat);
+        speech.options.kind = ModelKind::Speech;
+        let mut transcription =
+            ServiceModel::discovered("transcribe".into(), ModelProtocol::OpenAiChat);
+        transcription.options.kind = ModelKind::Transcription;
+        let unknown = ServiceModel::discovered("unknown".into(), ModelProtocol::OpenAiChat);
+        let mut moderation =
+            ServiceModel::discovered("moderation".into(), ModelProtocol::OpenAiChat);
+        moderation.options.kind = ModelKind::Moderation;
+        let models = [
+            vision,
+            image,
+            multimodal,
+            speech,
+            transcription,
+            unknown,
+            moderation,
+        ];
 
         let all = CatalogIndex::new(&models, ModelCategory::All, "");
-        assert_eq!(all.counts, [3, 2, 1, 0, 1, 1, 0]);
+        assert_eq!(all.counts, [7, 2, 1, 0, 1, 1, 0, 1, 1, 2]);
         assert!(
-            matches!(all.rows.as_slice(), [CatalogRow::Group(chat), CatalogRow::Model(0), CatalogRow::Model(2), CatalogRow::Group(images), CatalogRow::Model(1)]
+            matches!(all.rows.as_slice(), [CatalogRow::Group(chat), CatalogRow::Model(0), CatalogRow::Model(2), CatalogRow::Group(images), CatalogRow::Model(1), ..]
             if chat.as_ref() == "Chat" && images.as_ref() == "Images")
         );
         let images = CatalogIndex::new(&models, ModelCategory::Image, "");
@@ -1034,8 +1245,21 @@ mod tests {
             video.rows.as_slice(),
             [CatalogRow::Group(_), CatalogRow::Model(2)]
         ));
+        let other = CatalogIndex::new(&models, ModelCategory::Other, "");
+        assert!(matches!(
+            other.rows.as_slice(),
+            [CatalogRow::Model(5), CatalogRow::Model(6)]
+        ));
         let searched = CatalogIndex::new(&models, ModelCategory::Text, "vision");
-        assert_eq!(searched.counts, [1, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(searched.counts, [1, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            searched.model_ids(&models),
+            HashSet::from(["vision-chat".into()])
+        );
+        assert_eq!(
+            other.model_ids(&models),
+            HashSet::from(["unknown".into(), "moderation".into()])
+        );
         assert!(matches!(
             searched.rows.as_slice(),
             [CatalogRow::Group(_), CatalogRow::Model(0)]

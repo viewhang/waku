@@ -4,4 +4,8 @@ import type { ServiceModelOptions } from "./ServiceModelOptions";
 /**
  * Remember old IDs so a catalog refresh and existing sessions follow an edit
  */
-export type ServiceModel = { id: string, name?: string, aliases?: Array<string>, options?: ServiceModelOptions, };
+export type ServiceModel = { id: string, name?: string, aliases?: Array<string>, options?: ServiceModelOptions,
+/**
+ * True while awaiting metadata, false once configured, absent on older structured rows
+ */
+catalog_metadata_pending?: boolean | null, };

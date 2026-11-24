@@ -314,6 +314,16 @@ impl Backend for WakuBackend {
                     .save_model_service(service, api_key.as_deref())?;
                 Ok(ResponsePayload::ModelServiceSaved { service })
             }
+            Command::RemoveModelServiceModels {
+                service_id,
+                base_url,
+                model_ids,
+            } => {
+                let service = self
+                    .settings
+                    .remove_model_service_models(service_id, &base_url, &model_ids)?;
+                Ok(ResponsePayload::ModelServiceSaved { service })
+            }
             Command::SetModelServiceEnabled {
                 service_id,
                 enabled,
@@ -338,6 +348,15 @@ impl Backend for WakuBackend {
             } => {
                 let models = driver::assistant::list_models(&base_url, &api_key, protocol)?;
                 Ok(ResponsePayload::ModelServiceModels { models })
+            }
+            Command::SyncDraftModelService {
+                base_url,
+                api_key,
+                protocol,
+            } => {
+                let models =
+                    driver::assistant::discover_model_catalog(&base_url, &api_key, protocol)?;
+                Ok(ResponsePayload::ModelServiceCatalog { models })
             }
             Command::SyncModelService { service_id } => {
                 match driver::assistant::sync_model_service(&self.settings, service_id)? {
@@ -2057,9 +2076,11 @@ fn handle_driver_command(
         | Command::SaveTavilyApiKey { .. }
         | Command::SetAssistantWebSearch { .. }
         | Command::SaveModelService { .. }
+        | Command::RemoveModelServiceModels { .. }
         | Command::SetModelServiceEnabled { .. }
         | Command::TestModelService { .. }
         | Command::ListModelServiceModels { .. }
+        | Command::SyncDraftModelService { .. }
         | Command::SyncModelService { .. }
         | Command::TranslateText { .. }
         | Command::TranslateWithGoogle { .. }

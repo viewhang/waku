@@ -476,7 +476,9 @@ impl Waku {
     ) -> impl IntoElement {
         let theme = Theme::current(cx);
         let (status_icon, status_color) = match tone {
-            ToastTone::Alert => ("icons/alert.svg", theme.danger),
+            ToastTone::Error => ("icons/alert.svg", theme.danger),
+            ToastTone::Warning => ("icons/alert.svg", theme.warning),
+            ToastTone::Info => ("icons/info.svg", theme.text_secondary),
             ToastTone::Success => ("icons/check.svg", theme.success),
         };
         let palette = MarkdownPalette::from_theme(&theme);

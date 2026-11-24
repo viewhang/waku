@@ -116,7 +116,7 @@ impl Waku {
                         this.skills_catalog = Some(Rc::new(catalog));
                         this.skills_scanned_at = Some(Instant::now());
                     }
-                    Err(error) => this.show_toast(error.to_string()),
+                    Err(error) => this.show_error_toast(error.to_string()),
                 }
                 cx.notify();
             });
@@ -206,7 +206,7 @@ impl Waku {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if let Err(error) = result {
-                    this.show_toast(tr!("skills.toggle_failed", error = error));
+                    this.show_error_toast(tr!("skills.toggle_failed", error = error));
                 }
                 this.invalidate_skills_catalog(cx);
             });
@@ -272,7 +272,7 @@ impl Waku {
                 match result {
                     Ok(_) => this.show_success_toast(tr!("skills.deleted_toast", name = name)),
                     Err(error) => {
-                        this.show_toast(tr!("skills.delete_failed", error = error));
+                        this.show_error_toast(tr!("skills.delete_failed", error = error));
                     }
                 }
                 this.invalidate_skills_catalog(cx);
@@ -989,7 +989,7 @@ impl Waku {
             let skill_file = skill_file.clone();
             move |this, _, _, cx| {
                 if this.daemon.is_remote() {
-                    this.show_toast(tr!("errors.remote_host_path"));
+                    this.show_info_toast(tr!("errors.remote_host_path"));
                     cx.notify();
                 } else {
                     crate::platform::open_with_default_app(&skill_file, cx);
@@ -1006,7 +1006,7 @@ impl Waku {
             let skill_file = skill_file.clone();
             move |this, _, _, cx| {
                 if this.daemon.is_remote() {
-                    this.show_toast(tr!("errors.remote_host_path"));
+                    this.show_info_toast(tr!("errors.remote_host_path"));
                     cx.notify();
                 } else {
                     crate::platform::reveal_in_file_manager(&skill_file, cx);

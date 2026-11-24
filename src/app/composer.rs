@@ -1998,7 +1998,7 @@ impl Waku {
                     }
                 }
                 Err(error) => {
-                    waku.show_toast(error.to_string());
+                    waku.show_error_toast(error.to_string());
                     cx.notify();
                 }
             });
@@ -2127,7 +2127,7 @@ impl Waku {
                     }
                 }
                 Err(error) => {
-                    waku.show_toast(tr!("errors.store_pasted_image", error = error));
+                    waku.show_error_toast(tr!("errors.store_pasted_image", error = error));
                     cx.notify();
                 }
             });
@@ -2857,7 +2857,9 @@ impl Waku {
                             }
                         }
                     }
-                    Err(error) => waku.show_toast(tr!("errors.save_local_state", error = error)),
+                    Err(error) => {
+                        waku.show_error_toast(tr!("errors.save_local_state", error = error))
+                    }
                 }
                 waku.drain_queued_message(session_id, cx);
                 cx.notify();
@@ -2914,7 +2916,7 @@ impl Waku {
                             || tr!("assistant.invalid_response"),
                             |error| error.to_string(),
                         );
-                        waku.show_toast(tr!("composer.clear_context_failed", error = error));
+                        waku.show_error_toast(tr!("composer.clear_context_failed", error = error));
                     }
                 }
                 cx.notify();

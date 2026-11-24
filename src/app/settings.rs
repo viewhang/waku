@@ -1169,7 +1169,8 @@ impl Waku {
                     settings
                 }
                 Err(error) => {
-                    self.show_toast(tr!("daemon.invalid_settings", error = error));
+                    self.show_warning_toast(tr!("daemon.invalid_settings", error = error));
+                    cx.notify();
                     return;
                 }
             }
@@ -1185,7 +1186,8 @@ impl Waku {
         let settings = match self.daemon_exposure_from_fields(cx) {
             Ok(settings) => settings,
             Err(error) => {
-                self.show_toast(tr!("daemon.invalid_settings", error = error));
+                self.show_warning_toast(tr!("daemon.invalid_settings", error = error));
+                cx.notify();
                 return;
             }
         };
@@ -1196,7 +1198,8 @@ impl Waku {
         let mut settings = match self.daemon_exposure_from_fields(cx) {
             Ok(settings) => settings,
             Err(error) => {
-                self.show_toast(tr!("daemon.invalid_settings", error = error));
+                self.show_warning_toast(tr!("daemon.invalid_settings", error = error));
+                cx.notify();
                 return;
             }
         };
@@ -1214,7 +1217,8 @@ impl Waku {
             return;
         }
         if self.daemon.is_remote() {
-            self.show_toast(tr!("daemon.external_description"));
+            self.show_info_toast(tr!("daemon.external_description"));
+            cx.notify();
             return;
         }
         if self
@@ -1223,7 +1227,8 @@ impl Waku {
             .iter()
             .any(|session| !matches!(session.status, SessionStatus::Idle | SessionStatus::Failed))
         {
-            self.show_toast(tr!("daemon.stop_active_tasks"));
+            self.show_info_toast(tr!("daemon.stop_active_tasks"));
+            cx.notify();
             return;
         }
 
@@ -1258,9 +1263,8 @@ impl Waku {
                         this.save();
                         this.show_success_toast(tr!("daemon.settings_applied"));
                     }
-                    Err(error) => {
-                        this.show_toast(tr!("daemon.restart_failed", error = error.to_string()))
-                    }
+                    Err(error) => this
+                        .show_error_toast(tr!("daemon.restart_failed", error = error.to_string())),
                 }
                 cx.notify();
             });
@@ -1674,8 +1678,8 @@ impl Waku {
                     Ok(ResponsePayload::TavilyApiKeyStatus { configured }) => {
                         this.set_tavily_key_mask(configured, cx);
                     }
-                    Err(error) => this.show_toast(error.to_string()),
-                    _ => this.show_toast(tr!("assistant.invalid_response")),
+                    Err(error) => this.show_error_toast(error.to_string()),
+                    _ => this.show_error_toast(tr!("assistant.invalid_response")),
                 }
                 cx.notify();
             });
@@ -1690,7 +1694,7 @@ impl Waku {
         }
         let draft = self.tavily_key_input.read(cx).content().trim().to_owned();
         if !clear && draft.is_empty() {
-            self.show_toast(tr!("search_providers.tavily_key_required"));
+            self.show_warning_toast(tr!("search_providers.tavily_key_required"));
             cx.notify();
             return;
         }
@@ -1726,11 +1730,11 @@ impl Waku {
                             tr!("search_providers.tavily_key_saved")
                         });
                     }
-                    Err(error) => this.show_toast(tr!(
+                    Err(error) => this.show_error_toast(tr!(
                         "search_providers.tavily_key_failed",
                         error = error.to_string()
                     )),
-                    _ => this.show_toast(tr!("assistant.invalid_response")),
+                    _ => this.show_error_toast(tr!("assistant.invalid_response")),
                 }
                 cx.notify();
             });

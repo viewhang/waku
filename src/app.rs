@@ -281,7 +281,9 @@ struct ToastState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ToastTone {
-    Alert,
+    Error,
+    Warning,
+    Info,
     Success,
 }
 
@@ -1821,7 +1823,7 @@ impl Waku {
             crate::updater::UpdaterEvent::Failed(error) => {
                 self.updater_status = crate::updater::UpdateStatus::Idle;
                 self.reset_updater_button_animation();
-                self.show_toast(tr!("updater.failed", error = error));
+                self.show_error_toast(tr!("updater.failed", error = error));
             }
             #[cfg(target_os = "linux")]
             crate::updater::UpdaterEvent::QuitAndInstall => {
@@ -1834,8 +1836,16 @@ impl Waku {
         cx.notify();
     }
 
-    pub(super) fn show_toast(&mut self, message: impl Into<String>) {
-        self.show_toast_with_tone(message, ToastTone::Alert);
+    pub(super) fn show_error_toast(&mut self, message: impl Into<String>) {
+        self.show_toast_with_tone(message, ToastTone::Error);
+    }
+
+    pub(super) fn show_warning_toast(&mut self, message: impl Into<String>) {
+        self.show_toast_with_tone(message, ToastTone::Warning);
+    }
+
+    pub(super) fn show_info_toast(&mut self, message: impl Into<String>) {
+        self.show_toast_with_tone(message, ToastTone::Info);
     }
 
     pub(super) fn show_success_toast(&mut self, message: impl Into<String>) {
@@ -2998,7 +3008,7 @@ impl Waku {
                 header_drag_armed: false,
                 toast: startup_toast.map(|message| ToastState {
                     message,
-                    tone: ToastTone::Alert,
+                    tone: ToastTone::Error,
                     id: 0,
                     timer_generation: 0,
                     duration_remaining: DEFAULT_TOAST_DURATION,

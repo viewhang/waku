@@ -1146,6 +1146,11 @@ model_services.edit_model: 编辑模型
 model_services.save_model: 保存模型
 model_services.remove_model: 移除
 model_services.confirm_remove_model: 要从此供应商移除「%{model}」吗？
+model_services.batch_remove: 批量移除
+model_services.select_all_results: 全选当前结果
+model_services.clear_selection: 取消全选
+model_services.remove_selected: 移除所选（%{count}）
+model_services.confirm_remove_models: 要从此供应商移除这 %{count} 个模型吗？
 model_services.test: 检测
 model_services.working: 正在处理…
 model_services.no_models: 请从已启用的供应商添加或同步模型
@@ -1183,6 +1188,12 @@ service_model.text: 文本
 service_model.image: 图片
 service_model.embedding: 嵌入
 service_model.rerank: 重排
+service_model.speech: 语音
+service_model.transcription: 转录
+service_model.realtime: 实时音频
+service_model.moderation: 内容审核
+service_model.other: 其他
+service_model.unsupported_operation: 此模型可在列表中查看，当前助手没有可用的调用方式。
 service_model.protocol: 对话协议
 service_model.capabilities: 模型能力
 service_model.reasoning: 推理

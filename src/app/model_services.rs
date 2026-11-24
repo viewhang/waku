@@ -42,7 +42,12 @@ enum ModelEdit {
 pub(super) enum CatalogAction {
     Add,
     Edit(String),
-    Remove(String),
+    Remove(HashSet<String>),
+}
+
+struct CatalogRemoval {
+    ids: Vec<String>,
+    first_name: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,7 +79,7 @@ pub(super) struct ModelServiceForm {
     selected: Option<String>,
     model_only: bool,
     reveal_added_model: bool,
-    removed_model: Option<String>,
+    removal: Option<CatalogRemoval>,
     model_edit: Option<ModelEdit>,
     model_id: Entity<TextInput>,
     model_name: Entity<TextInput>,
@@ -128,18 +133,33 @@ impl Waku {
         if service_id.is_some_and(|id| self.model_services_page.is_saving(id)) {
             return;
         }
-        let mut saved = service_id.and_then(|id| self.model_service(id)).cloned();
-        let mut removed_model = None;
-        if let Some(CatalogAction::Edit(id) | CatalogAction::Remove(id)) = &catalog_action {
-            let Some(service) = &mut saved else { return };
-            let Some(index) = service.models.iter().position(|model| model.id == *id) else {
+        let saved = service_id.and_then(|id| self.model_service(id)).cloned();
+        let removal = match &catalog_action {
+            Some(CatalogAction::Edit(id))
+                if !saved
+                    .as_ref()
+                    .is_some_and(|service| service.models.iter().any(|model| model.id == *id)) =>
+            {
                 return;
-            };
-            // Keep the removal in the draft until the model confirmation is accepted
-            if matches!(catalog_action, Some(CatalogAction::Remove(_))) {
-                removed_model = Some(service.models.remove(index).display_name().to_owned());
             }
-        }
+            Some(CatalogAction::Remove(ids)) => {
+                let Some(service) = &saved else { return };
+                let mut models = service
+                    .models
+                    .iter()
+                    .filter(|model| ids.contains(&model.id));
+                let Some(first) = models.next() else { return };
+                // Save exact IDs only after the confirmation is accepted
+                Some(CatalogRemoval {
+                    ids: std::iter::once(first)
+                        .chain(models)
+                        .map(|model| model.id.clone())
+                        .collect(),
+                    first_name: first.display_name().to_owned(),
+                })
+            }
+            _ => None,
+        };
         let model_only = catalog_action.is_some();
         let generation = Uuid::new_v4();
         let name = cx.new(|cx| {
@@ -213,7 +233,7 @@ impl Waku {
             selected: None,
             model_only,
             reveal_added_model: matches!(catalog_action, Some(CatalogAction::Add)),
-            removed_model,
+            removal,
             model_edit: None,
             model_id: cx.new(|cx| TextInput::new(window, cx)),
             model_name: cx.new(|cx| TextInput::new(window, cx)),
@@ -372,7 +392,7 @@ impl Waku {
                     ))
                 });
         }
-        let removing = form.removed_model.is_some();
+        let removing = form.removal.is_some();
         let heading = if removing {
             tr!("model_services.remove_model")
         } else if form.original.is_some() {
@@ -380,13 +400,24 @@ impl Waku {
         } else {
             tr!("model_services.add")
         };
-        let content = if let Some(model) = &form.removed_model {
+        let content = if let Some(removal) = &form.removal {
+            let confirmation = if removal.ids.len() == 1 {
+                tr!(
+                    "model_services.confirm_remove_model",
+                    model = removal.first_name.as_str()
+                )
+            } else {
+                tr!(
+                    "model_services.confirm_remove_models",
+                    count = removal.ids.len()
+                )
+            };
             div()
                 .p(px(16.0))
                 .flex()
                 .flex_col()
                 .gap(px(8.0))
-                .child(tr!("model_services.confirm_remove_model", model = model))
+                .child(confirmation)
                 .children(form.notice(NoticeAt::Catalog, theme))
                 .into_any_element()
         } else {
@@ -689,6 +720,7 @@ impl Waku {
                         let edit_id = id.clone();
                         let remove_id = id.clone();
                         let active = selected.as_deref() == Some(id.as_str());
+                        let supported = model.options.assistant_supported();
                         div()
                             .id(SharedString::from(format!("draft-model-row-{id}")))
                             .w_full()
@@ -698,21 +730,34 @@ impl Waku {
                             .gap(px(6.0))
                             .when(active, |row| row.bg(theme.overlay_strong).rounded(px(6.0)))
                             .child(
-                                assistant_button(
+                                assistant_button_base(
                                     SharedString::from(format!("pick-service-model-{id}")),
                                     [model.options.group.as_str(), model.display_name()]
                                         .into_iter()
                                         .filter(|piece| !piece.is_empty())
                                         .collect::<Vec<_>>()
                                         .join(" · "),
-                                    cx,
-                                    move |this, _, cx| {
-                                        if let Some(form) = this.model_service_form.as_mut() {
-                                            form.selected = Some(id.clone());
-                                            cx.notify();
-                                        }
-                                    },
+                                    theme,
                                 )
+                                .when(supported, |button| {
+                                    button.hover(|style| style.bg(theme.overlay)).on_activation(
+                                        cx,
+                                        move |this, _, cx| {
+                                            if let Some(form) = this.model_service_form.as_mut() {
+                                                form.selected = Some(id.clone());
+                                                cx.notify();
+                                            }
+                                        },
+                                    )
+                                })
+                                .when(!supported, |button| {
+                                    button
+                                        .tab_stop(false)
+                                        .text_color(theme.text_secondary)
+                                        .tooltip(Tooltip::text(tr!(
+                                            "service_model.unsupported_operation"
+                                        )))
+                                })
                                 .min_w_0()
                                 .flex_1()
                                 .overflow_hidden(),
@@ -841,6 +886,7 @@ impl Waku {
                 .map(|model| model.options.clone())
                 .unwrap_or_else(|| ServiceModelOptions {
                     protocol: form.catalog_protocol(form.url.read(cx).content()),
+                    tools: false,
                     ..Default::default()
                 });
         form.model_group.update(cx, |input, cx| {
@@ -907,6 +953,7 @@ impl Waku {
             return;
         };
         let edited_id = form.model_only.then(|| id.clone());
+        let supported = options.assistant_supported();
         let models = Rc::make_mut(&mut form.models);
         match edit {
             ModelEdit::Add => {
@@ -914,10 +961,12 @@ impl Waku {
                 model.name = name;
                 model.options = options;
                 models.push(model);
-                form.selected = Some(id);
+                form.selected = supported.then_some(id);
             }
             ModelEdit::Replace(previous) => {
                 if let Some(model) = models.iter_mut().find(|model| model.id == *previous) {
+                    // A saved model edit takes precedence over later public catalog metadata
+                    model.catalog_metadata_pending = Some(false);
                     model.name = name;
                     model.options = options;
                     if model.id != id {
@@ -925,9 +974,9 @@ impl Waku {
                         model
                             .aliases
                             .push(std::mem::replace(&mut model.id, id.clone()));
-                        if form.selected.as_deref() == Some(previous) {
-                            form.selected = Some(id);
-                        }
+                    }
+                    if form.selected.as_deref() == Some(previous) {
+                        form.selected = supported.then_some(id);
                     }
                 }
             }
@@ -990,7 +1039,7 @@ impl Waku {
                 },
             }
         } else {
-            Command::ListModelServiceModels {
+            Command::SyncDraftModelService {
                 base_url,
                 api_key,
                 protocol,
@@ -1025,15 +1074,16 @@ impl Waku {
                         Ok(ResponsePayload::Ack) => {
                             (NoticeAt::Key, false, tr!("assistant.test_ok"))
                         }
-                        Ok(ResponsePayload::ModelServiceModels { models })
-                            if work == Work::Sync =>
-                        {
+                        Ok(ResponsePayload::ModelServiceCatalog { models }) => {
                             let empty = models.is_empty();
-                            ServiceModel::merge_catalog(
-                                Rc::make_mut(&mut form.models),
-                                models,
-                                protocol,
-                            );
+                            ServiceModel::merge_catalog(Rc::make_mut(&mut form.models), models);
+                            if form.selected.as_deref().is_some_and(|id| {
+                                !form.models.iter().any(|model| {
+                                    model.id == id && model.options.assistant_supported()
+                                })
+                            }) {
+                                form.selected = None;
+                            }
                             if empty {
                                 (NoticeAt::Catalog, true, tr!("model_services.sync_empty"))
                             } else {
@@ -1076,17 +1126,6 @@ impl Waku {
         else {
             return;
         };
-        let Some(base_url) = form.base_url(cx) else {
-            form.status = Some((NoticeAt::Address, true, tr!("model_services.invalid_url")));
-            cx.notify();
-            return;
-        };
-        let name = form.name.read(cx).content().trim().to_owned();
-        if name.is_empty() {
-            form.status = Some((NoticeAt::Catalog, true, tr!("model_services.name_required")));
-            cx.notify();
-            return;
-        }
         let session = form.session;
         let selected = form.selected.clone();
         if session.is_some() && selected.is_none() {
@@ -1096,20 +1135,45 @@ impl Waku {
         let creating = form.original.is_none();
         let reveal_added_model = form.reveal_added_model;
         let id = form.original.as_ref().map_or(generation, |(id, _)| *id);
-        let key = form.key.read(cx).content().trim().to_owned();
-        let same_endpoint = form.same_endpoint(cx);
-        let api_key = match form.original_key.as_ref() {
-            Some(original) if same_endpoint && original.as_str() == key => None,
-            Some(_) => Some(key),
-            None => (!key.is_empty()).then_some(key),
-        };
-        let service = ModelService {
-            id,
-            name,
-            base_url,
-            enabled: form.enabled,
-            models: (*form.models).clone(),
-            legacy_key: false,
+        let command = if let Some(removal) = &form.removal {
+            let Some((_, base_url)) = &form.original else {
+                return;
+            };
+            Command::RemoveModelServiceModels {
+                service_id: id,
+                base_url: base_url.clone(),
+                model_ids: removal.ids.clone(),
+            }
+        } else {
+            let Some(base_url) = form.base_url(cx) else {
+                form.status = Some((NoticeAt::Address, true, tr!("model_services.invalid_url")));
+                cx.notify();
+                return;
+            };
+            let name = form.name.read(cx).content().trim().to_owned();
+            if name.is_empty() {
+                form.status = Some((NoticeAt::Catalog, true, tr!("model_services.name_required")));
+                cx.notify();
+                return;
+            }
+            let key = form.key.read(cx).content().trim().to_owned();
+            let same_endpoint = form.same_endpoint(cx);
+            let api_key = match form.original_key.as_ref() {
+                Some(original) if same_endpoint && original.as_str() == key => None,
+                Some(_) => Some(key),
+                None => (!key.is_empty()).then_some(key),
+            };
+            Command::SaveModelService {
+                service: ModelService {
+                    id,
+                    name,
+                    base_url,
+                    enabled: form.enabled,
+                    models: (*form.models).clone(),
+                    legacy_key: false,
+                },
+                api_key,
+            }
         };
         let daemon = self.daemon.client();
         let window_handle = window.window_handle();
@@ -1119,13 +1183,7 @@ impl Waku {
         cx.spawn(async move |view, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    daemon.request(
-                        Uuid::nil(),
-                        Uuid::nil(),
-                        Command::SaveModelService { service, api_key },
-                    )
-                })
+                .spawn(async move { daemon.request(Uuid::nil(), Uuid::nil(), command) })
                 .await;
             let focus = view
                 .update(cx, |this, cx| {
@@ -1148,7 +1206,7 @@ impl Waku {
                             this.model_service_form = None;
                             if let (Some(session), Some(model)) = (session, selected) {
                                 if !this.use_assistant_service_model(session, id, model, cx) {
-                                    this.show_toast(tr!("model_services.change_when_idle"));
+                                    this.show_info_toast(tr!("model_services.change_when_idle"));
                                 }
                             }
                             cx.notify();
@@ -1210,6 +1268,12 @@ fn render_model_options(form: &ModelServiceForm, cx: &mut Context<Waku>) -> Div 
             (ModelKind::Image, tr!("service_model.image")),
             (ModelKind::Embedding, tr!("service_model.embedding")),
             (ModelKind::Rerank, tr!("service_model.rerank")),
+            (ModelKind::Speech, tr!("service_model.speech")),
+            (ModelKind::Transcription, tr!("service_model.transcription")),
+            (ModelKind::Realtime, tr!("service_model.realtime")),
+            (ModelKind::Video, tr!("service_model.video")),
+            (ModelKind::Moderation, tr!("service_model.moderation")),
+            (ModelKind::Other, tr!("service_model.other")),
         ],
         |value| options.kind == value,
         cx,
@@ -1227,7 +1291,13 @@ fn render_model_options(form: &ModelServiceForm, cx: &mut Context<Waku>) -> Div 
             };
         },
     );
-    let mut content = div().flex().flex_col().gap(px(12.0)).child(purpose);
+    let mut content = div().flex().flex_col().gap(px(12.0)).when(
+        matches!(
+            options.kind,
+            ModelKind::Text | ModelKind::Image | ModelKind::Unknown
+        ),
+        |form| form.child(purpose),
+    );
     if dialogue {
         content = content.child(model_choices(
             "model-protocol",
@@ -1295,6 +1365,13 @@ fn render_model_options(form: &ModelServiceForm, cx: &mut Context<Waku>) -> Div 
                 }
             },
         ));
+    } else if !options.assistant_supported() {
+        content = content.child(
+            div()
+                .text_size(sp(12.0))
+                .text_color(theme.text_secondary)
+                .child(tr!("service_model.unsupported_operation")),
+        );
     } else if options.purpose == ModelPurpose::ImageEdit {
         content = content.child(
             div()
@@ -1623,13 +1700,15 @@ mod tests {
                 name: "My model".into(),
                 aliases: vec!["original".into()],
                 options: ServiceModelOptions::default(),
+                catalog_metadata_pending: Some(false),
             },
             ServiceModel::new("manual".into()),
         ];
         ServiceModel::merge_catalog(
             &mut models,
-            vec!["original".into(), "new".into()],
-            ModelProtocol::Gemini,
+            ["original", "new"]
+                .map(|id| ServiceModel::discovered(id.into(), ModelProtocol::Gemini))
+                .into(),
         );
         assert_eq!(
             models

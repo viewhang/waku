@@ -1,5 +1,6 @@
 //! Direct model sessions stream replies through Rig
 
+mod models_dev;
 mod request;
 mod search;
 mod transport;
@@ -99,6 +100,9 @@ fn bearer_auth(request: reqwest::RequestBuilder, key: &str) -> reqwest::RequestB
 pub(crate) fn test_model(base_url: &str, key: &str, model: &ServiceModel) -> anyhow::Result<()> {
     if model.id.trim().is_empty() {
         bail!("Enter the model ID first");
+    }
+    if !model.options.assistant_supported() {
+        bail!(tr!("service_model.unsupported_operation"));
     }
     if !model.options.valid_token_limits() {
         bail!("Invalid token limits");
@@ -234,13 +238,28 @@ pub(crate) fn sync_model_service(
         .or_else(|| service.models.first().map(|model| model.options.protocol))
         .unwrap_or_default();
     let key = api_key(&url, Some(&service), settings)?;
-    let models = list_models(url.as_str(), &key, protocol)?;
+    let models = discover_model_catalog(url.as_str(), &key, protocol)?;
     if models.is_empty() {
         return Ok(None);
     }
     settings
-        .merge_model_service_catalog(&service, models, protocol)
+        .merge_model_service_catalog(&service, models)
         .map(Some)
+}
+
+/// Keep the supplier's model IDs authoritative and complete metadata separately
+pub(crate) fn discover_model_catalog(
+    base_url: &str,
+    key: &str,
+    protocol: ModelProtocol,
+) -> anyhow::Result<Vec<ServiceModel>> {
+    let endpoint = service_url(base_url)?;
+    let mut models: Vec<_> = list_models(endpoint.as_str(), key, protocol)?
+        .into_iter()
+        .map(|id| ServiceModel::discovered(id, protocol))
+        .collect();
+    models_dev::enrich(&endpoint, &mut models);
+    Ok(models)
 }
 
 /// Fetch the catalog using the same authentication as the selected dialogue API
@@ -529,12 +548,15 @@ fn run(
             let request = async {
                 let (url, service) = connection_settings(&profile, &settings)?;
                 let (model, options) = if let Some(service) = &service {
-                    let model = service.model(&profile.model).with_context(|| {
-                        tr!(
-                            "assistant.model_unavailable",
-                            model = profile.model.as_str()
-                        )
-                    })?;
+                    let model = service
+                        .model(&profile.model)
+                        .filter(|model| model.options.assistant_supported())
+                        .with_context(|| {
+                            tr!(
+                                "assistant.model_unavailable",
+                                model = profile.model.as_str()
+                            )
+                        })?;
                     (model.id.as_str(), &model.options)
                 } else {
                     (profile.model.as_str(), &legacy_options)
