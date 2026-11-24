@@ -1,5 +1,7 @@
 # Waku
 
+本仓库是 egoist/waku 的修改版
+
 Waku is a fast, native desktop app for working with local coding agents. It is
 built in Rust with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)
 and keeps projects, sessions, transcripts on your machine.
