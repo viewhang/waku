@@ -218,6 +218,30 @@ pub(crate) fn translate_text(
     Ok(translated)
 }
 
+/// Discover a saved catalog without moving its API key to the desktop client
+pub(crate) fn sync_model_service(
+    settings: &DaemonSettingsStore,
+    id: Uuid,
+) -> anyhow::Result<Option<ModelService>> {
+    let service = settings
+        .model_service(id)
+        .context("Model service is missing")?;
+    let url = service_url(&service.base_url)?;
+    let protocol = url
+        .host_str()
+        .and_then(ModelProtocol::from_host)
+        .or_else(|| service.models.first().map(|model| model.options.protocol))
+        .unwrap_or_default();
+    let key = api_key(&url, Some(&service), settings)?;
+    let models = list_models(url.as_str(), &key, protocol)?;
+    if models.is_empty() {
+        return Ok(None);
+    }
+    settings
+        .merge_model_service_catalog(&service, models, protocol)
+        .map(Some)
+}
+
 /// Fetch the catalog using the same authentication as the selected dialogue API
 pub(crate) fn list_models(
     base_url: &str,
@@ -783,6 +807,52 @@ pub(crate) mod tests {
         first_server.join().unwrap();
         second_server.join().unwrap();
         std::fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn saved_catalog_sync_uses_saved_key_and_preserves_edits() {
+        let (listener, mut service) = mock_service("Fixture", "manual");
+        service.models[0].aliases.push("upstream".into());
+        let directory = std::env::temp_dir().join(format!("waku-model-sync-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("settings.json");
+        let settings = Arc::new(DaemonSettingsStore::open(path.clone()).unwrap());
+        settings
+            .save_model_service(service.clone(), Some("test-key"))
+            .unwrap();
+        let server = std::thread::spawn({
+            let settings = settings.clone();
+            let mut service = service.clone();
+            move || {
+                let (socket, method, _, auth) = request(&listener);
+                assert_eq!(method, "GET /v1/models");
+                assert_eq!(auth.as_deref(), Some("Bearer test-key"));
+                service.enabled = false;
+                service.models[0].name = "Edited during sync".into();
+                settings.save_model_service(service, None).unwrap();
+                send(
+                    socket,
+                    "application/json",
+                    r#"{"data":[{"id":"upstream"},{"id":"new"}]}"#,
+                );
+            }
+        });
+        let synced = sync_model_service(&settings, service.id).unwrap().unwrap();
+        server.join().unwrap();
+        assert!(!synced.enabled);
+        assert_eq!(synced.models.len(), 2);
+        assert_eq!(
+            synced.model("upstream").unwrap().display_name(),
+            "Edited during sync"
+        );
+        assert!(synced.model("new").is_some());
+        assert_eq!(
+            DaemonSettingsStore::open(path)
+                .unwrap()
+                .model_service(service.id),
+            Some(synced)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     pub(crate) fn mock_service(name: &str, model: &str) -> (TcpListener, ModelService) {

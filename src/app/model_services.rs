@@ -1,6 +1,7 @@
 //! Shared editor for model service settings and adding a service from a conversation
 
 use super::assistants::{assistant_button, assistant_button_base, assistant_field};
+use super::model_capabilities::model_capability_badges;
 use super::*;
 use crate::ui::ActivationExt as _;
 use anyhow::Context as _;
@@ -37,6 +38,13 @@ enum ModelEdit {
     Replace(String),
 }
 
+/// Start an operation from the saved catalog while reusing the provider draft
+pub(super) enum CatalogAction {
+    Add,
+    Edit(String),
+    Remove(String),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Work {
     LoadKey,
@@ -64,6 +72,9 @@ pub(super) struct ModelServiceForm {
     enabled: bool,
     models: Rc<Vec<ServiceModel>>,
     selected: Option<String>,
+    model_only: bool,
+    reveal_added_model: bool,
+    removed_model: Option<String>,
     model_edit: Option<ModelEdit>,
     model_id: Entity<TextInput>,
     model_name: Entity<TextInput>,
@@ -93,10 +104,43 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_model_service_form(service_id, session, None, window, cx);
+    }
+
+    pub(super) fn open_catalog_model(
+        &mut self,
+        id: Uuid,
+        action: CatalogAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_model_service_form(Some(id), None, Some(action), window, cx);
+    }
+
+    fn open_model_service_form(
+        &mut self,
+        service_id: Option<Uuid>,
+        session: Option<Uuid>,
+        catalog_action: Option<CatalogAction>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if service_id.is_some_and(|id| self.model_services_page.is_saving(id)) {
             return;
         }
-        let saved = service_id.and_then(|id| self.model_service(id)).cloned();
+        let mut saved = service_id.and_then(|id| self.model_service(id)).cloned();
+        let mut removed_model = None;
+        if let Some(CatalogAction::Edit(id) | CatalogAction::Remove(id)) = &catalog_action {
+            let Some(service) = &mut saved else { return };
+            let Some(index) = service.models.iter().position(|model| model.id == *id) else {
+                return;
+            };
+            // Keep the removal in the draft until the model confirmation is accepted
+            if matches!(catalog_action, Some(CatalogAction::Remove(_))) {
+                removed_model = Some(service.models.remove(index).display_name().to_owned());
+            }
+        }
+        let model_only = catalog_action.is_some();
         let generation = Uuid::new_v4();
         let name = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
@@ -117,7 +161,7 @@ impl Waku {
             );
             input
         });
-        let load_key = !self.daemon.is_remote() && saved.is_some();
+        let load_key = !model_only && !self.daemon.is_remote() && saved.is_some();
         cx.subscribe(&url, move |this: &mut Self, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Edited)
                 && let Some(form) = this
@@ -167,6 +211,9 @@ impl Waku {
                     .unwrap_or_default(),
             ),
             selected: None,
+            model_only,
+            reveal_added_model: matches!(catalog_action, Some(CatalogAction::Add)),
+            removed_model,
             model_edit: None,
             model_id: cx.new(|cx| TextInput::new(window, cx)),
             model_name: cx.new(|cx| TextInput::new(window, cx)),
@@ -180,6 +227,14 @@ impl Waku {
             status: None,
             scroll: gpui::UniformListScrollHandle::new(),
         });
+        if let Some(edit) = match catalog_action {
+            Some(CatalogAction::Add) => Some(ModelEdit::Add),
+            Some(CatalogAction::Edit(model)) => Some(ModelEdit::Replace(model)),
+            _ => None,
+        } {
+            self.edit_service_model(edit, window, cx);
+            return;
+        }
         window.on_next_frame(move |window, _| {
             window.on_next_frame(move |window, cx| window.focus(&focus, cx));
         });
@@ -317,58 +372,54 @@ impl Waku {
                     ))
                 });
         }
-        let heading = if form.original.is_some() {
+        let removing = form.removed_model.is_some();
+        let heading = if removing {
+            tr!("model_services.remove_model")
+        } else if form.original.is_some() {
             tr!("model_services.edit")
         } else {
             tr!("model_services.add")
         };
-        let content = div()
-            .id("model-service-editor-scroll")
-            .p(px(16.0))
-            .flex()
-            .flex_col()
-            .gap(px(12.0))
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .when(form.original.is_none(), |body| body.child(presets))
-            .child(assistant_field(
-                tr!("assistant.name"),
-                TextField::new("model-service-name", form.name.clone()),
-                theme,
-            ))
-            .child(assistant_field(
-                tr!("model_services.endpoint"),
-                TextField::new("model-service-url", form.url.clone()),
-                theme,
-            ))
-            .children(form.notice(NoticeAt::Address, theme))
-            .child(assistant_field(api_key_label, key_row, theme))
-            .children(form.notice(NoticeAt::Key, theme))
-            .when(form.session.is_none(), |body| {
-                body.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(tr!("model_services.enabled"))
-                        .child(toggle_switch(
-                            "model-service-enabled",
-                            form.enabled,
-                            !can_request,
-                            theme,
-                            cx,
-                            |this, _, cx| {
-                                if let Some(form) = this.model_service_form.as_mut() {
-                                    form.enabled = !form.enabled;
-                                    cx.notify();
-                                }
-                            },
-                        )),
-                )
-            })
-            .child(self.render_model_service_catalog(form, cx))
-            .children(form.notice(NoticeAt::Catalog, theme));
+        let content = if let Some(model) = &form.removed_model {
+            div()
+                .p(px(16.0))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(tr!("model_services.confirm_remove_model", model = model))
+                .children(form.notice(NoticeAt::Catalog, theme))
+                .into_any_element()
+        } else {
+            div()
+                .id("model-service-editor-scroll")
+                .p(px(16.0))
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .when(form.original.is_none(), |body| body.child(presets))
+                .child(assistant_field(
+                    tr!("assistant.name"),
+                    TextField::new("model-service-name", form.name.clone()),
+                    theme,
+                ))
+                .child(assistant_field(
+                    tr!("model_services.endpoint"),
+                    TextField::new("model-service-url", form.url.clone()),
+                    theme,
+                ))
+                .children(form.notice(NoticeAt::Address, theme))
+                .child(assistant_field(api_key_label, key_row, theme))
+                .children(form.notice(NoticeAt::Key, theme))
+                // Adding from chat still supports discovery and selecting a model before saving
+                .when(form.session.is_some(), |body| {
+                    body.child(self.render_model_service_catalog(form, cx))
+                })
+                .children(form.notice(NoticeAt::Catalog, theme))
+                .into_any_element()
+        };
 
         let card = div()
             .id("model-service-editor")
@@ -426,17 +477,26 @@ impl Waku {
                             .justify_end()
                             .gap(px(8.0))
                             .when(form.work != Some(Work::Save), |row| {
-                                row.child(assistant_button(
-                                    "cancel-model-service",
-                                    tr!("model_services.cancel"),
-                                    cx,
-                                    |this, window, cx| this.close_model_service_editor(window, cx),
-                                ))
+                                row.child(
+                                    assistant_button(
+                                        "cancel-model-service",
+                                        tr!("model_services.cancel"),
+                                        cx,
+                                        |this, window, cx| {
+                                            this.close_model_service_editor(window, cx)
+                                        },
+                                    )
+                                    .when(removing, |button| {
+                                        button.track_focus(&form.name.read(cx).focus_handle(cx))
+                                    }),
+                                )
                             })
                             .child(
                                 model_service_save_button(
                                     if form.session.is_some() {
                                         tr!("model_services.add_and_use")
+                                    } else if removing {
+                                        tr!("model_services.remove_model")
                                     } else {
                                         tr!("model_services.save")
                                     },
@@ -588,7 +648,7 @@ impl Waku {
                             },
                         ))
                         .child(
-                            model_service_save_button(action, true, theme)
+                            model_service_save_button(action, form.work.is_none(), theme)
                                 .on_activation(cx, |this, window, cx| {
                                     this.finish_service_model(window, cx)
                                 }),
@@ -630,6 +690,8 @@ impl Waku {
                         let remove_id = id.clone();
                         let active = selected.as_deref() == Some(id.as_str());
                         div()
+                            .id(SharedString::from(format!("draft-model-row-{id}")))
+                            .w_full()
                             .h(px(34.0))
                             .flex()
                             .items_center()
@@ -658,6 +720,7 @@ impl Waku {
                             .when(active, |row| {
                                 row.child(icon("icons/check.svg", 13.0, theme.accent))
                             })
+                            .child(model_capability_badges(&model.options, theme))
                             .when(ready, |row| {
                                 row.child(assistant_button(
                                     SharedString::from(format!("edit-service-model-{edit_id}")),
@@ -741,7 +804,7 @@ impl Waku {
         if form.work == Some(Work::Save) {
             return;
         }
-        if form.model_edit.is_some() {
+        if form.model_edit.is_some() && !form.model_only {
             form.close_model_editor(window, cx);
             return;
         }
@@ -843,6 +906,7 @@ impl Waku {
             cx.notify();
             return;
         };
+        let edited_id = form.model_only.then(|| id.clone());
         let models = Rc::make_mut(&mut form.models);
         match edit {
             ModelEdit::Add => {
@@ -869,7 +933,13 @@ impl Waku {
             }
         }
         models.sort_by(|a, b| a.options.group.cmp(&b.options.group).then(a.id.cmp(&b.id)));
-        form.close_model_editor(window, cx);
+        if let Some(id) = edited_id {
+            // Keep the renamed row editable if the daemon rejects the save
+            form.model_edit = Some(ModelEdit::Replace(id));
+            self.save_model_service(window, cx);
+        } else {
+            form.close_model_editor(window, cx);
+        }
     }
 
     fn remove_service_model(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -959,7 +1029,11 @@ impl Waku {
                             if work == Work::Sync =>
                         {
                             let empty = models.is_empty();
-                            merge_service_models(Rc::make_mut(&mut form.models), models, protocol);
+                            ServiceModel::merge_catalog(
+                                Rc::make_mut(&mut form.models),
+                                models,
+                                protocol,
+                            );
                             if empty {
                                 (NoticeAt::Catalog, true, tr!("model_services.sync_empty"))
                             } else {
@@ -998,7 +1072,7 @@ impl Waku {
         let Some(form) = self
             .model_service_form
             .as_mut()
-            .filter(|form| form.work.is_none() && form.model_edit.is_none())
+            .filter(|form| form.work.is_none() && (form.model_only || form.model_edit.is_none()))
         else {
             return;
         };
@@ -1020,6 +1094,7 @@ impl Waku {
         }
         let generation = form.generation;
         let creating = form.original.is_none();
+        let reveal_added_model = form.reveal_added_model;
         let id = form.original.as_ref().map_or(generation, |(id, _)| *id);
         let key = form.key.read(cx).content().trim().to_owned();
         let same_endpoint = form.same_endpoint(cx);
@@ -1066,6 +1141,9 @@ impl Waku {
                                 && this.settings_page == Some(SettingsPage::ModelServices)
                             {
                                 this.model_services_page.show_saved(id, creating, cx);
+                                if reveal_added_model {
+                                    this.model_services_page.reveal_added_model(cx);
+                                }
                             }
                             this.model_service_form = None;
                             if let (Some(session), Some(model)) = (session, selected) {
@@ -1446,31 +1524,6 @@ impl ModelServiceForm {
     }
 }
 
-/// Keep existing names, aliases and capabilities when the upstream catalog is refreshed
-fn merge_service_models(
-    existing: &mut Vec<ServiceModel>,
-    incoming: Vec<String>,
-    protocol: ModelProtocol,
-) {
-    let known: HashSet<_> = existing
-        .iter()
-        .flat_map(|model| {
-            std::iter::once(model.id.as_str()).chain(model.aliases.iter().map(String::as_str))
-        })
-        .collect();
-    let new: Vec<_> = incoming
-        .into_iter()
-        .filter(|id| !known.contains(id.as_str()))
-        .map(|id| {
-            let mut model = ServiceModel::new(id);
-            model.options.protocol = protocol;
-            model
-        })
-        .collect();
-    existing.extend(new);
-    existing.sort_by(|a, b| a.options.group.cmp(&b.options.group).then(a.id.cmp(&b.id)));
-}
-
 /// Accept an API root or a complete request endpoint
 fn model_service_base_url(input: &str) -> Option<String> {
     let mut url = url::Url::parse(input).ok()?;
@@ -1573,7 +1626,7 @@ mod tests {
             },
             ServiceModel::new("manual".into()),
         ];
-        merge_service_models(
+        ServiceModel::merge_catalog(
             &mut models,
             vec!["original".into(), "new".into()],
             ModelProtocol::Gemini,

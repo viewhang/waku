@@ -65,6 +65,14 @@ impl WakuBackend {
             .load()
             .context("could not load Waku task database")?;
         migrate_projectless_state(&task_store, &mut task_state)?;
+        if let Err(error) =
+            recover_orphaned_assistant_projects(&task_store, &mut task_state, || {
+                crate::projectless::workspace_root()
+                    .context("could not locate projectless workspaces")
+            })
+        {
+            eprintln!("Waku could not restore an assistant workspace: {error:#}");
+        }
         let composer_drafts = ComposerDraftStore::for_state_path(task_store.path());
         let attachments = AttachmentStore::new(
             task_store
@@ -222,6 +230,56 @@ fn migrate_projectless_state(
     Ok(())
 }
 
+/// Restore missing project rows for local assistant sessions without rewriting their history
+fn recover_orphaned_assistant_projects(
+    store: &StateStore,
+    state: &mut PersistedState,
+    workspace_root: impl FnOnce() -> anyhow::Result<PathBuf>,
+) -> anyhow::Result<()> {
+    let known: HashSet<_> = state.projects.iter().map(|project| project.id).collect();
+    let mut excluded = HashSet::new();
+    let mut recoverable = HashMap::new();
+    for session in state
+        .sessions
+        .iter()
+        .filter(|session| !known.contains(&session.project_id))
+    {
+        if session.provider != ProviderKind::Assistant {
+            excluded.insert(session.project_id);
+            continue;
+        }
+        let mut session = session.clone();
+        store.hydrate(&mut session)?;
+        if session.workspace.is_local() {
+            recoverable
+                .entry(session.project_id)
+                .or_insert(session.created_at);
+        } else {
+            // A missing Git project cannot be reconstructed from assistant history
+            excluded.insert(session.project_id);
+        }
+    }
+    recoverable.retain(|id, _| !excluded.contains(id));
+    if recoverable.is_empty() {
+        return Ok(());
+    }
+    let root = workspace_root()?;
+    for (id, created_at) in recoverable {
+        let path = crate::projectless::recover_workspace(&root, id)
+            .context("could not restore the assistant workspace")?;
+        let project = store
+            .restore_missing_project(Project {
+                id,
+                name: Project::PROJECTLESS_NAME.to_owned(),
+                path,
+                created_at,
+            })
+            .context("could not persist restored assistant workspace")?;
+        state.projects.push(project);
+    }
+    Ok(())
+}
+
 impl Backend for WakuBackend {
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
         let session_id = request.session_id;
@@ -273,6 +331,12 @@ impl Backend for WakuBackend {
             } => {
                 let models = driver::assistant::list_models(&base_url, &api_key, protocol)?;
                 Ok(ResponsePayload::ModelServiceModels { models })
+            }
+            Command::SyncModelService { service_id } => {
+                match driver::assistant::sync_model_service(&self.settings, service_id)? {
+                    Some(service) => Ok(ResponsePayload::ModelServiceSaved { service }),
+                    None => Ok(ResponsePayload::ModelServiceModels { models: Vec::new() }),
+                }
             }
             Command::TranslateText {
                 service_id,
@@ -1943,6 +2007,7 @@ fn handle_driver_command(
         | Command::SetModelServiceEnabled { .. }
         | Command::TestModelService { .. }
         | Command::ListModelServiceModels { .. }
+        | Command::SyncModelService { .. }
         | Command::TranslateText { .. }
         | Command::TranslateWithGoogle { .. }
         | Command::GetSettings
@@ -2281,6 +2346,34 @@ struct TurnFinishedWire {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assistant_workspace_recovery_preserves_the_existing_conversation() {
+        let directory =
+            std::env::temp_dir().join(format!("waku-workspace-recovery-{}", Uuid::new_v4()));
+        let store = StateStore::daemon(directory.join("app.db"));
+        let mut state = PersistedState::empty();
+        let project_id = Uuid::new_v4();
+        let mut session = AgentSession::new(project_id, ProviderKind::Assistant);
+        session.push_message(crate::model::MessageRole::User, "Original message");
+        let session_id = session.id;
+        state.push_session(session);
+        store.save(&mut state).unwrap();
+
+        let mut state = store.load().unwrap();
+        let root = directory.join("workspaces");
+        recover_orphaned_assistant_projects(&store, &mut state, || Ok(root.clone())).unwrap();
+        let mut restored = store.load().unwrap();
+        assert_eq!(restored.projects[0].id, project_id);
+        assert!(restored.projects[0].path.starts_with(root));
+        assert!(restored.projects[0].path.is_dir());
+        assert_eq!(restored.sessions[0].id, session_id);
+        store.hydrate(&mut restored.sessions[0]).unwrap();
+        assert_eq!(restored.sessions[0].messages[0].content, "Original message");
+        recover_orphaned_assistant_projects(&store, &mut restored, || panic!("already restored"))
+            .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn stale_runtime_projection_keeps_newer_transcript_cursor() {

@@ -2308,6 +2308,8 @@ model_services.save_model:
   en: Save model
 model_services.remove_model:
   en: Remove
+model_services.confirm_remove_model:
+  en: 'Remove “%{model}” from this provider?'
 model_services.test:
   en: Test
 model_services.working:
@@ -2356,6 +2358,14 @@ model_services.key_rejected:
   en: The provider rejected the request. Check the API key and its permissions
 service_model.group:
   en: Group name
+service_model.ungrouped:
+  en: Ungrouped
+service_model.all:
+  en: All
+service_model.audio_input:
+  en: Audio input
+service_model.video_input:
+  en: Video input
 service_model.purpose:
   en: Model purpose
 service_model.chat:

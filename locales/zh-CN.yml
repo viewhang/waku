@@ -1127,6 +1127,7 @@ model_services.add_model: 添加模型
 model_services.edit_model: 编辑模型
 model_services.save_model: 保存模型
 model_services.remove_model: 移除
+model_services.confirm_remove_model: 要从此供应商移除「%{model}」吗？
 model_services.test: 检测
 model_services.working: 正在处理…
 model_services.no_models: 请从已启用的供应商添加或同步模型
@@ -1151,6 +1152,10 @@ model_services.change_when_idle: 供应商已添加，请在当前回复结束�
 model_services.search_models: 搜索模型
 model_services.key_rejected: 供应商拒绝请求，请检查 API 密钥及其权限
 service_model.group: 分组名称
+service_model.ungrouped: 未分组
+service_model.all: 全部
+service_model.audio_input: 音频输入
+service_model.video_input: 视频输入
 service_model.purpose: 模型用途
 service_model.chat: 对话
 service_model.generate: 图像生成

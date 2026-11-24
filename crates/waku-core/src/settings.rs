@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 pub use waku_protocol::settings::DaemonSettings;
-use waku_protocol::settings::{ModelService, ServiceModel};
+use waku_protocol::settings::{ModelProtocol, ModelService, ServiceModel};
 
 pub struct DaemonSettingsStore {
     path: PathBuf,
@@ -209,6 +209,30 @@ impl DaemonSettingsStore {
             return Ok(service.clone());
         }
         service.enabled = enabled;
+        let saved = service.clone();
+        write_atomic(&self.path, &next)?;
+        *current = next;
+        Ok(saved)
+    }
+
+    /// Merge into the latest catalog so edits made during discovery survive
+    pub(crate) fn merge_model_service_catalog(
+        &self,
+        source: &ModelService,
+        models: Vec<String>,
+        protocol: ModelProtocol,
+    ) -> anyhow::Result<ModelService> {
+        let mut current = self.settings.lock();
+        let mut next = current.clone();
+        let service = next
+            .model_services
+            .iter_mut()
+            .find(|service| service.id == source.id)
+            .context("Model service is missing")?;
+        if service.base_url != source.base_url {
+            bail!("The API address changed during model sync. Try again with the new address");
+        }
+        ServiceModel::merge_catalog(&mut service.models, models, protocol);
         let saved = service.clone();
         write_atomic(&self.path, &next)?;
         *current = next;

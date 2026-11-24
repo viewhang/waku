@@ -873,6 +873,7 @@ struct Storage {
     /// wrote it, so a save only touches the messages that actually changed.
     /// See [`write_messages`].
     written_messages: HashMap<Uuid, HashMap<Uuid, u64>>,
+    persisted_projects: HashSet<Uuid>,
     saved_projects: u64,
     saved_app_settings: u64,
     saved_app_state: u64,
@@ -1189,6 +1190,7 @@ impl StateStore {
             // A fresh connection has written nothing yet. Sessions loaded here
             // are skeletons anyway, so the first save of one is a full write.
             written_messages: HashMap::new(),
+            persisted_projects: state.projects.iter().map(|project| project.id).collect(),
             saved_projects: 0,
             saved_app_settings: if app_settings_are_saved {
                 fingerprint(&serde_json::to_string(&app_settings).map_err(to_io_error)?)
@@ -1219,6 +1221,7 @@ impl StateStore {
                 connection: self.open()?,
                 persisted_sessions: HashSet::new(),
                 written_messages: HashMap::new(),
+                persisted_projects: HashSet::new(),
                 saved_projects: 0,
                 saved_app_settings: 0,
                 saved_app_state: 0,
@@ -1284,6 +1287,40 @@ impl StateStore {
         Ok(())
     }
 
+    /// Insert a recovered project only while its original row is absent
+    pub(crate) fn restore_missing_project(&self, project: Project) -> io::Result<Project> {
+        let connection = self.open()?;
+        let id = project.id.to_string();
+        connection
+            .execute(
+                "INSERT INTO projects(id, name, path, position, created_at)
+             VALUES(?1, ?2, ?3, (SELECT COALESCE(MAX(position) + 1, 0) FROM projects), ?4)
+             ON CONFLICT(id) DO NOTHING",
+                params![
+                    id,
+                    project.name,
+                    project.path.to_string_lossy(),
+                    project.created_at as i64
+                ],
+            )
+            .map_err(to_io_error)?;
+        // Another instance may have already written the original path or completed recovery
+        connection
+            .query_row(
+                "SELECT name, path, created_at FROM projects WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(Project {
+                        id: project.id,
+                        name: row.get(0)?,
+                        path: PathBuf::from(row.get::<_, String>(1)?),
+                        created_at: row.get::<_, i64>(2)? as u64,
+                    })
+                },
+            )
+            .map_err(to_io_error)
+    }
+
     /// Persists whatever the app marked as changed, so a streaming turn writes
     /// one session row and a selection change writes no rows at all.
     pub fn save(&self, state: &mut PersistedState) -> io::Result<()> {
@@ -1304,6 +1341,7 @@ impl StateStore {
                 connection: self.open()?,
                 persisted_sessions: HashSet::new(),
                 written_messages: HashMap::new(),
+                persisted_projects: HashSet::new(),
                 saved_projects: 0,
                 saved_app_settings: 0,
                 saved_app_state: 0,
@@ -1336,10 +1374,14 @@ impl StateStore {
 
         let projects = serde_json::to_string(&state.projects).map_err(to_io_error)?;
         let projects_fingerprint = fingerprint(&projects);
-        if projects_fingerprint != storage.saved_projects {
-            transaction
-                .execute("DELETE FROM projects", [])
-                .map_err(to_io_error)?;
+        let project_ids = (projects_fingerprint != storage.saved_projects).then(|| {
+            state
+                .projects
+                .iter()
+                .map(|project| project.id)
+                .collect::<HashSet<_>>()
+        });
+        if project_ids.is_some() {
             for (position, project) in state.projects.iter().enumerate() {
                 transaction
                     .execute(
@@ -1354,7 +1396,6 @@ impl StateStore {
                     )
                     .map_err(to_io_error)?;
             }
-            storage.saved_projects = projects_fingerprint;
         }
 
         // Only sessions the app reported as changed are written. A draft that
@@ -1436,7 +1477,23 @@ impl StateStore {
             storage.written_messages.remove(&id);
         }
 
+        if let Some(project_ids) = &project_ids {
+            // Other daemon instances may have created projects or saved sessions since this snapshot loaded
+            for id in storage.persisted_projects.difference(project_ids) {
+                transaction
+                    .execute(
+                        "DELETE FROM projects WHERE id = ?1
+                     AND NOT EXISTS (SELECT 1 FROM sessions WHERE project_id = ?1)",
+                        params![id.to_string()],
+                    )
+                    .map_err(to_io_error)?;
+            }
+        }
         transaction.commit().map_err(to_io_error)?;
+        if let Some(project_ids) = project_ids {
+            storage.saved_projects = projects_fingerprint;
+            storage.persisted_projects = project_ids;
+        }
         // Now that the rows are durable, and not before.
         for (session_id, fingerprints) in written_messages {
             storage.written_messages.insert(session_id, fingerprints);
@@ -2127,6 +2184,46 @@ mod tests {
         assert_eq!(restored.projects[0].path, project.path);
         assert_eq!(restored.projects[0].created_at, project.created_at);
 
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn assistant_workspace_survives_an_older_project_snapshot() {
+        let directory = temporary_directory();
+        let older_store = store_in(&directory);
+        let mut older = older_store.load().unwrap();
+        let mut newer = PersistedState::fresh(directory.join("assistant-workspace"));
+        let project_id = newer.projects[0].id;
+        newer.sessions[0].provider = ProviderKind::Assistant;
+        newer.sessions[0].push_message(MessageRole::User, "Hello");
+        store_in(&directory).save(&mut newer).unwrap();
+
+        older_store.save(&mut older).unwrap();
+        let saved = older_store.load().unwrap();
+        assert!(
+            saved
+                .projects
+                .iter()
+                .any(|project| project.id == project_id)
+        );
+        assert!(
+            saved
+                .sessions
+                .iter()
+                .any(|session| session.project_id == project_id)
+        );
+
+        let mut without_project = saved;
+        without_project.projects.clear();
+        older_store.save(&mut without_project).unwrap();
+        assert!(
+            older_store
+                .load()
+                .unwrap()
+                .projects
+                .iter()
+                .any(|project| project.id == project_id)
+        );
         fs::remove_dir_all(directory).ok();
     }
 

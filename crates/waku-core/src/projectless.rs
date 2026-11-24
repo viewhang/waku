@@ -105,6 +105,16 @@ pub fn create_workspace(prompt: Option<&str>) -> io::Result<Workspace> {
     create_workspace_in(&root, Local::now().date_naive(), None, prompt)
 }
 
+/// Recreate the private workspace for a saved assistant whose project row was lost
+pub(crate) fn recover_workspace(root: &Path, project_id: Uuid) -> io::Result<PathBuf> {
+    ensure_real_directory(root)?;
+    let recovery = root.join("recovered");
+    ensure_real_directory(&recovery)?;
+    let cwd = recovery.join(project_id.to_string());
+    ensure_real_directory(&cwd)?;
+    Ok(cwd)
+}
+
 /// Move one old dated workspace from `~/.waku/<date>/<slug>` into
 /// `~/.waku/projects/<date>/<slug>` without copying its contents through the
 /// client. The oldest layout used `~/.waku` itself; that path contains Waku's

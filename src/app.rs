@@ -1635,6 +1635,7 @@ mod drafts;
 mod file_search;
 mod goal_dialog;
 mod image_preview;
+mod model_capabilities;
 mod model_services;
 mod model_services_page;
 mod project_picker;

@@ -213,6 +213,10 @@ pub enum Command {
         #[serde(default)]
         protocol: crate::settings::ModelProtocol,
     },
+    /// Fetch and merge the saved provider's catalog on the daemon that owns its key
+    SyncModelService {
+        service_id: Uuid,
+    },
     /// Translate text with a saved model service independently of any conversation
     TranslateText {
         service_id: Uuid,

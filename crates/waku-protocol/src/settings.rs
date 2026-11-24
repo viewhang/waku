@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -188,6 +188,27 @@ impl ModelProtocol {
 }
 
 impl ServiceModel {
+    /// Add newly discovered models while preserving existing edits, aliases and manual entries
+    pub fn merge_catalog(existing: &mut Vec<Self>, incoming: Vec<String>, protocol: ModelProtocol) {
+        let known: HashSet<_> = existing
+            .iter()
+            .flat_map(|model| {
+                std::iter::once(model.id.as_str()).chain(model.aliases.iter().map(String::as_str))
+            })
+            .collect();
+        let new: Vec<_> = incoming
+            .into_iter()
+            .filter(|id| !known.contains(id.as_str()))
+            .map(|id| {
+                let mut model = Self::new(id);
+                model.options.protocol = protocol;
+                model
+            })
+            .collect();
+        existing.extend(new);
+        existing.sort_by(|a, b| a.options.group.cmp(&b.options.group).then(a.id.cmp(&b.id)));
+    }
+
     pub fn new(id: String) -> Self {
         Self {
             id,
