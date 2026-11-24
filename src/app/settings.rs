@@ -2,6 +2,7 @@ use super::composer::next_picker_highlight;
 use super::*;
 
 const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
+pub(super) const SETTINGS_SPLIT_LIST_WIDTH: f32 = 264.0;
 
 /// The Usage page is a dashboard, not a form; it mirrors T3 Code's wide
 /// two-column layout and needs the extra room for the chart.
@@ -78,6 +79,7 @@ const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 9] = [
 
 /// Bind the search field's list-navigation keys. Called once at startup.
 pub fn init(cx: &mut App) {
+    super::assistants::init(cx);
     super::model_services::init(cx);
     super::model_services_page::init(cx);
     super::translation::init(cx);
@@ -315,7 +317,10 @@ impl Waku {
             cx,
         );
         // List and detail views fill the settings column and own their own scroll positions
-        if matches!(page, SettingsPage::Skills | SettingsPage::ModelServices) {
+        if matches!(
+            page,
+            SettingsPage::Skills | SettingsPage::ModelServices | SettingsPage::Assistants
+        ) {
             return div()
                 .flex_1()
                 .h_full()
@@ -334,7 +339,9 @@ impl Waku {
                 }))
                 .child(div().flex_1().min_h_0().child(match page {
                     SettingsPage::Skills => self.render_skills_settings(cx),
-                    _ => self.render_model_services_settings(cx),
+                    SettingsPage::ModelServices => self.render_model_services_settings(cx),
+                    SettingsPage::Assistants => self.render_assistants_settings(cx),
+                    _ => unreachable!("only split settings pages reach this branch"),
                 }));
         }
         // The Monthly and Projects list views own their own scrolling, so
@@ -381,8 +388,9 @@ impl Waku {
             )
             .child(match page {
                 SettingsPage::General => self.render_general_settings(cx),
-                SettingsPage::Assistants => self.render_assistants_settings(cx),
-                SettingsPage::ModelServices | SettingsPage::Skills => unreachable!(),
+                SettingsPage::Assistants | SettingsPage::ModelServices | SettingsPage::Skills => {
+                    unreachable!()
+                }
                 SettingsPage::Providers => self.render_providers_settings(cx),
                 SettingsPage::Usage => self.render_usage_settings(cx),
                 SettingsPage::Daemon => self.render_daemon_settings(cx),
@@ -2449,6 +2457,7 @@ impl Waku {
             input.set_placeholder(tr!("skills.search"), cx)
         });
         self.model_services_page.refresh_localized_text(cx);
+        self.assistant_form.refresh_localized_text(cx);
         self.provider_path_input.update(cx, |input, cx| {
             input.set_placeholder(tr!("input.detected_automatically"), cx)
         });

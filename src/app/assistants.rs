@@ -1,5 +1,7 @@
 //! Desktop profile editor and entry point for native model sessions
 
+use super::composer::next_picker_highlight;
+use super::settings::SETTINGS_SPLIT_LIST_WIDTH;
 use super::*;
 use crate::ui::{ActivationExt as _, text_field::TextField};
 use gpui::ElementId;
@@ -7,6 +9,15 @@ use waku_protocol::settings::{AssistantProfile, ServiceModel};
 
 pub(super) const ASSISTANT_MODEL_MENU_ID: &str = "assistant-model-picker";
 const ASSISTANT_DEFAULT_MODEL_MENU_ID: &str = "assistant-default-model-picker";
+const ASSISTANTS_PANE_CONTEXT: &str = "AssistantsPane";
+const ASSISTANTS_SEARCH_CONTEXT: &str = "AssistantsPane > TextInput";
+
+pub(super) fn init(cx: &mut App) {
+    cx.bind_keys([
+        gpui::KeyBinding::new("down", SelectNextEntry, Some(ASSISTANTS_SEARCH_CONTEXT)),
+        gpui::KeyBinding::new("up", SelectPreviousEntry, Some(ASSISTANTS_SEARCH_CONTEXT)),
+    ]);
+}
 pub(super) const TRANSLATION_MODEL_MENU_ID: &str = "translation-model-picker";
 
 /// A default belongs to a profile and an override belongs to one conversation
@@ -37,25 +48,65 @@ pub(super) struct ModelSelection {
     pub(super) model: String,
 }
 
-/// Keep editable text in input entities and keep credentials outside the form
+/// Keep the selected profile's draft and its list state while switching settings pages
 pub(super) struct AssistantForm {
     editing: Option<Uuid>,
     name: Entity<TextInput>,
     default_model: Option<ModelSelection>,
     prompt: Entity<TextInput>,
+    search: Entity<TextInput>,
+    list_scroll: gpui::UniformListScrollHandle,
+    detail_scroll: ScrollHandle,
 }
 
 impl AssistantForm {
-    pub(super) fn new(window: &mut Window, cx: &mut App) -> Self {
-        Self {
+    pub(super) fn new(
+        window: &mut Window,
+        cx: &mut App,
+        profile: Option<&AssistantProfile>,
+    ) -> Self {
+        let mut form = Self {
             editing: None,
-            name: cx.new(|cx| TextInput::new(window, cx)),
+            name: cx.new(|cx| TextInput::new(window, cx).tab_stop()),
             default_model: None,
-            prompt: cx.new(|cx| TextInput::new(window, cx).multi_line().auto_height()),
-        }
+            prompt: cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .multi_line()
+                    .auto_height()
+                    .tab_stop()
+            }),
+            search: cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .clear_on_escape()
+                    .tab_stop()
+                    .placeholder(tr!("assistant.search"))
+            }),
+            list_scroll: gpui::UniformListScrollHandle::new(),
+            detail_scroll: ScrollHandle::new(),
+        };
+        form.load(profile, cx);
+        form
     }
 
-    fn load(&mut self, profile: Option<&AssistantProfile>, cx: &mut Context<Waku>) {
+    pub(super) fn subscribe(&self, cx: &mut Context<Waku>) {
+        cx.subscribe(&self.search, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Edited) {
+                this.assistant_form
+                    .list_scroll
+                    .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
+                cx.notify();
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn refresh_localized_text(&self, cx: &mut App) {
+        self.search.update(cx, |input, cx| {
+            input.set_placeholder(tr!("assistant.search"), cx)
+        });
+    }
+
+    fn load(&mut self, profile: Option<&AssistantProfile>, cx: &mut App) {
         self.editing = profile.map(|profile| profile.id);
         self.default_model = profile.and_then(|profile| {
             profile.model_service_id.map(|service_id| ModelSelection {
@@ -72,7 +123,6 @@ impl AssistantForm {
         ] {
             input.update(cx, |field, cx| field.set_content(value.to_owned(), cx));
         }
-        cx.notify();
     }
 }
 
@@ -83,71 +133,288 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         self.open_settings_page(SettingsPage::Assistants, cx);
+        self.new_assistant_draft(window, cx);
+    }
+
+    fn new_assistant_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.assistant_form.load(None, cx);
-        window.focus(&self.assistant_form.name.read(cx).focus_handle(cx), cx);
+        self.assistant_form
+            .detail_scroll
+            .set_offset(gpui::Point::default());
+        let focus = self.assistant_form.name.read(cx).focus_handle(cx);
+        window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+        cx.notify();
+    }
+
+    fn select_assistant_profile(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        // Clicking the selected row keeps the current draft in the editor
+        if self.assistant_form.editing != Some(id)
+            && let Some(profile) = self
+                .state
+                .assistant_profiles
+                .iter()
+                .find(|profile| profile.id == id)
+        {
+            self.assistant_form.load(Some(profile), cx);
+            self.assistant_form
+                .detail_scroll
+                .set_offset(gpui::Point::default());
+            cx.notify();
+        }
+    }
+
+    fn visible_assistants(&self, cx: &App) -> Vec<usize> {
+        let query = self
+            .assistant_form
+            .search
+            .read(cx)
+            .content()
+            .trim()
+            .to_lowercase();
+        self.state
+            .assistant_profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, profile)| {
+                query.is_empty()
+                    || profile.name.to_lowercase().contains(&query)
+                    || profile.model.to_lowercase().contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn step_assistant_selection(&mut self, key: &str, cx: &mut Context<Self>) {
+        let visible = self.visible_assistants(cx);
+        let current = visible.iter().position(|index| {
+            self.assistant_form.editing == Some(self.state.assistant_profiles[*index].id)
+        });
+        if let Some(next) = next_picker_highlight(current, visible.len(), key) {
+            self.select_assistant_profile(self.state.assistant_profiles[visible[next]].id, cx);
+            self.assistant_form
+                .list_scroll
+                .scroll_to_item(next, gpui::ScrollStrategy::Nearest);
+        }
     }
 
     pub(super) fn render_assistants_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::current(cx);
         let form = &self.assistant_form;
+        let visible = self.visible_assistants(cx);
+        let list = if visible.is_empty() {
+            div()
+                .px(px(8.0))
+                .pt(px(12.0))
+                .text_size(sp(12.5))
+                .text_color(theme.text_secondary)
+                .child(if self.state.assistant_profiles.is_empty() {
+                    tr!("assistant.empty")
+                } else {
+                    tr!("assistant.no_match")
+                })
+                .into_any_element()
+        } else {
+            gpui::uniform_list(
+                "assistants-settings-list",
+                visible.len(),
+                cx.processor(move |this, range: Range<usize>, _, cx| {
+                    visible[range]
+                        .iter()
+                        .filter_map(|index| this.state.assistant_profiles.get(*index))
+                        .map(|profile| this.render_assistant_profile_row(profile, cx))
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .track_scroll(&form.list_scroll)
+            .size_full()
+            .into_any_element()
+        };
+        let add = assistant_button(
+            "assistant-new",
+            tr!("assistant.new"),
+            cx,
+            Self::new_assistant_draft,
+        )
+        .w_full()
+        .justify_center();
+        let left = div()
+            .key_context(ASSISTANTS_PANE_CONTEXT)
+            .on_action(cx.listener(|this, _: &SelectNextEntry, _, cx| {
+                this.step_assistant_selection("down", cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectPreviousEntry, _, cx| {
+                this.step_assistant_selection("up", cx);
+            }))
+            .w(px(SETTINGS_SPLIT_LIST_WIDTH))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(10.0))
+                    .pt(px(22.0))
+                    .pb(px(8.0))
+                    .child(
+                        TextField::new("assistant-search", form.search.clone())
+                            .icon("icons/search.svg", 13.0)
+                            .w_full(),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().px(px(8.0)).child(list))
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(add),
+            );
+        div()
+            .size_full()
+            .min_h_0()
+            .flex()
+            .child(left)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(self.render_assistant_detail(cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_assistant_profile_row(
+        &self,
+        profile: &AssistantProfile,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = Theme::current(cx);
+        let id = profile.id;
+        let selected = self.assistant_form.editing == Some(id);
+        div().h(px(56.0)).py(px(2.0)).w_full().child(
+            div()
+                .id(SharedString::from(format!("assistant-profile-{id}")))
+                .tab_index(0)
+                .focus_visible(|style| style.border_1().border_color(theme.accent))
+                .size_full()
+                .px(px(9.0))
+                .rounded(px(8.0))
+                .cursor_default()
+                .flex()
+                .items_center()
+                .gap(px(9.0))
+                .when(selected, |row| row.bg(theme.sidebar_item_background))
+                .when(!selected, |row| row.hover(|style| style.bg(theme.overlay)))
+                .child(assistant_profile_icon(theme, 26.0, 13.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(sp(12.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(profile.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(sp(12.5))
+                                .text_color(theme.text_tertiary)
+                                .child(profile.model.clone()),
+                        ),
+                )
+                .on_activation(cx, move |this, _, cx| this.select_assistant_profile(id, cx)),
+        )
+    }
+
+    fn render_assistant_detail(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = Theme::current(cx);
+        let form = &self.assistant_form;
+        let profile = form.editing.and_then(|id| {
+            self.state
+                .assistant_profiles
+                .iter()
+                .find(|profile| profile.id == id)
+        });
         let project = self
             .selected_project()
             .filter(|project| !project.is_projectless());
-        let mut list = div().flex().flex_col().gap(px(8.0));
-        for profile in &self.state.assistant_profiles {
-            let edit_profile = profile.clone();
-            let start_profile = profile.clone();
-            list = list.child(
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .child(assistant_profile_icon(theme, 38.0, 18.0))
+            .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
+                    .flex_1()
+                    .min_w_0()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
                             .truncate()
-                            .child(profile.name.clone())
-                            .child(
-                                div()
-                                    .text_size(sp(12.0))
-                                    .text_color(theme.text_secondary)
-                                    .child(profile.model.clone()),
-                            ),
+                            .text_size(sp(15.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(profile.map_or_else(
+                                || tr!("assistant.new"),
+                                |profile| profile.name.clone(),
+                            )),
                     )
-                    .child(assistant_button(
-                        SharedString::from(format!("assistant-edit-{}", profile.id)),
-                        tr!("assistant.edit"),
-                        cx,
-                        move |this, _, cx| this.assistant_form.load(Some(&edit_profile), cx),
-                    ))
-                    .child(assistant_button(
-                        SharedString::from(format!("assistant-start-{}", profile.id)),
-                        tr!("assistant.start"),
-                        cx,
-                        move |this, window, cx| {
-                            this.start_assistant(start_profile.clone(), window, cx)
-                        },
-                    )),
-            );
-        }
+                    .when_some(project, |title, project| {
+                        title.child(
+                            div()
+                                .mt(px(3.0))
+                                .truncate()
+                                .text_size(sp(12.5))
+                                .text_color(theme.text_tertiary)
+                                .child(tr!(
+                                    "assistant.current_project",
+                                    project = project.name.as_str()
+                                )),
+                        )
+                    }),
+            )
+            .when_some(profile.map(|profile| profile.id), |header, id| {
+                header.child(assistant_button(
+                    "assistant-start",
+                    tr!("assistant.start"),
+                    cx,
+                    move |this, window, cx| {
+                        if let Some(profile) = this
+                            .state
+                            .assistant_profiles
+                            .iter()
+                            .find(|item| item.id == id)
+                            .cloned()
+                        {
+                            this.start_assistant(profile, window, cx);
+                        }
+                    },
+                ))
+            });
         div()
-            .mt(px(16.0))
+            .id("assistant-detail-scroll")
+            .size_full()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&form.detail_scroll)
+            .px(px(24.0))
+            .pt(px(18.0))
+            .pb(px(20.0))
             .flex()
             .flex_col()
             .gap(px(12.0))
-            .when_some(project, |body, project| {
-                body.child(
-                    div()
-                        .text_size(sp(12.0))
-                        .text_color(theme.text_secondary)
-                        .child(tr!(
-                            "assistant.current_project",
-                            project = project.name.as_str()
-                        )),
-                )
-            })
-            .child(list)
+            .child(header)
             .child(assistant_field(
                 tr!("assistant.name"),
                 TextField::new("assistant-name", form.name.clone()),
@@ -178,28 +445,12 @@ impl Waku {
                     .child(form.prompt.clone()),
                 theme,
             ))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(8.0))
-                    .child(assistant_button(
-                        "assistant-save",
-                        tr!("assistant.save"),
-                        cx,
-                        |this, _, cx| {
-                            this.save_assistant(cx);
-                        },
-                    ))
-                    .when(form.editing.is_some(), |element| {
-                        element.child(assistant_button(
-                            "assistant-new",
-                            tr!("assistant.new"),
-                            cx,
-                            |this, _, cx| this.assistant_form.load(None, cx),
-                        ))
-                    }),
-            )
-            .into_any_element()
+            .child(assistant_button(
+                "assistant-save",
+                tr!("assistant.save"),
+                cx,
+                |this, _, cx| this.save_assistant(cx),
+            ))
     }
 
     pub(super) fn assistant_model_picker_open(&self) -> bool {
@@ -658,6 +909,13 @@ impl Waku {
             cx.notify();
             return;
         }
+        let creating = form.editing.is_none();
+        self.assistant_form.load(Some(&profile), cx);
+        if creating {
+            self.assistant_form
+                .search
+                .update(cx, |input, cx| input.clear(cx));
+        }
         if let Some(saved) = self
             .state
             .assistant_profiles
@@ -668,7 +926,6 @@ impl Waku {
         } else {
             self.state.assistant_profiles.push(profile);
         }
-        self.assistant_form.load(None, cx);
         self.save();
         cx.notify();
     }
@@ -710,6 +967,18 @@ impl Waku {
         self.state.push_session(session);
         self.select_session(id, cx);
     }
+}
+
+fn assistant_profile_icon(theme: Theme, size: f32, icon_size: f32) -> Div {
+    div()
+        .size(px(size))
+        .flex_none()
+        .rounded(px(size * 0.24))
+        .bg(theme.overlay)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(icon("icons/bot.svg", icon_size, theme.text_secondary))
 }
 
 pub(super) fn assistant_field(label: String, input: impl IntoElement, theme: Theme) -> Div {

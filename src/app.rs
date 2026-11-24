@@ -2012,7 +2012,8 @@ impl Waku {
                 .clear_on_escape()
                 .placeholder(tr!("settings.search"))
         });
-        let assistant_form = assistants::AssistantForm::new(window, cx);
+        let assistant_form =
+            assistants::AssistantForm::new(window, cx, state.assistant_profiles.first());
         let model_services_page = model_services_page::ModelServicesPage::new(window, cx);
         let assistant_model_scroll = gpui::UniformListScrollHandle::new();
         let daemon_port = state.daemon_exposure.port.to_string();
@@ -2604,6 +2605,7 @@ impl Waku {
             })
             .detach();
             model_services_page.subscribe(cx);
+            assistant_form.subscribe(cx);
             cx.subscribe(
                 &session_rename_input,
                 |this: &mut Self, _, event: &InputEvent, cx| match event {

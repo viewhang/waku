@@ -2226,6 +2226,12 @@ assistant.keywords:
   en: "assistant agent react direct model api system prompt"
 assistant.name:
   en: Name
+assistant.search:
+  en: Search assistants…
+assistant.empty:
+  en: No assistants yet
+assistant.no_match:
+  en: No matching assistants
 assistant.model:
   en: Model ID
 assistant.prompt:

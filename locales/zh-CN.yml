@@ -1086,6 +1086,9 @@ usage_error.curl_no_status: curl 未返回 HTTP 状态行
 assistant.settings: 助手
 assistant.keywords: 助手 智能体 ReAct 模型 API 系统提示词
 assistant.name: 名称
+assistant.search: 搜索助手…
+assistant.empty: 暂无助手
+assistant.no_match: 没有匹配的助手
 assistant.model: 模型 ID
 assistant.prompt: 系统提示词
 assistant.save: 保存助手

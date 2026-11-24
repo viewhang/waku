@@ -2,6 +2,7 @@
 
 use super::assistants::{assistant_button, assistant_button_base};
 use super::composer::next_picker_highlight;
+use super::settings::SETTINGS_SPLIT_LIST_WIDTH;
 use super::*;
 use crate::ui::ActivationExt as _;
 use waku_client::{Command, ResponsePayload};
@@ -9,7 +10,6 @@ use waku_protocol::settings::ModelService;
 
 const PAGE_CONTEXT: &str = "ModelServicesPane";
 const SEARCH_CONTEXT: &str = "ModelServicesPane > TextInput";
-const LIST_WIDTH: f32 = 264.0;
 
 pub(super) fn init(cx: &mut App) {
     cx.bind_keys([
@@ -258,7 +258,7 @@ impl Waku {
             .on_action(cx.listener(|this, _: &SelectPreviousEntry, _, cx| {
                 this.step_model_service_selection("up", cx);
             }))
-            .w(px(LIST_WIDTH))
+            .w(px(SETTINGS_SPLIT_LIST_WIDTH))
             .flex_none()
             .flex()
             .flex_col()

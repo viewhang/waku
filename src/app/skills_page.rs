@@ -14,6 +14,7 @@ use std::path::Path;
 use gpui::KeyBinding;
 
 use super::composer::next_picker_highlight;
+use super::settings::SETTINGS_SPLIT_LIST_WIDTH;
 use crate::skills::{SkillEntry, SkillSource, SkillsCatalog};
 
 use super::*;
@@ -25,8 +26,6 @@ const SKILLS_PANE_CONTEXT: &str = "SkillsPane";
 /// while `up`/`down` walk the list selection, the same claim-from-under-it
 /// arrangement the settings sidebar uses.
 const SKILLS_SEARCH_CONTEXT: &str = "SkillsPane > TextInput";
-
-const SKILLS_LIST_WIDTH: f32 = 264.0;
 
 fn skill_source_icon(source: SkillSource) -> &'static str {
     match source {
@@ -471,7 +470,7 @@ impl Waku {
             .on_action(cx.listener(|this, _: &SelectPreviousEntry, _, cx| {
                 this.step_skill_selection("up", cx);
             }))
-            .w(px(SKILLS_LIST_WIDTH))
+            .w(px(SETTINGS_SPLIT_LIST_WIDTH))
             .flex_none()
             .flex()
             .flex_col()
