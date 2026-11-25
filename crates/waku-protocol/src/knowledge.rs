@@ -84,6 +84,13 @@ pub struct LibraryDocument {
 )]
 pub enum KnowledgeOperation {
     Status,
+    /// Allocate a localized default name inside the directory that opened the create menu
+    CreateUntitled {
+        root: String,
+        parent: String,
+        stem: String,
+        folder: bool,
+    },
     /// Apply the same note-management operation used by desktop and assistant tools
     Manage {
         action: LibraryAction,
@@ -165,6 +172,12 @@ pub enum DocumentFileAction {
     rename_all_fields = "camelCase"
 )]
 pub enum KnowledgeResult {
+    /// The document identity and initial revision let the editor save its first change safely
+    CreatedDocument {
+        id: Uuid,
+        path: String,
+        revision: String,
+    },
     Managed {
         paths: Vec<String>,
     },

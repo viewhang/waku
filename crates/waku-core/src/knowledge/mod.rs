@@ -128,6 +128,12 @@ impl KnowledgeLibrary {
                 })
             }
             Op::Manage { action } => self.manage(action),
+            Op::CreateUntitled {
+                root,
+                parent,
+                stem,
+                folder,
+            } => self.create_untitled(&root, &parent, &stem, folder),
             Op::ManageTree { root, id, action } => self.manage_tree(&root, id, action),
             Op::DocumentFile { id, action } => self.document_file(id, action),
             op => {
@@ -222,6 +228,7 @@ impl KnowledgeLibrary {
                     | Op::ActivateDocumentLibrary { .. }
                     | Op::RemoveLibrary { .. }
                     | Op::ManageTree { .. }
+                    | Op::CreateUntitled { .. }
                     | Op::Manage { .. }
                     | Op::DocumentFile { .. }
                     | Op::Status

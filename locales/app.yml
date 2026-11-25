@@ -2578,8 +2578,14 @@ knowledge.new:
   en: "New document"
 knowledge.new_folder:
   en: "New folder"
-knowledge.folder_path:
-  en: "Folder name or path, e.g. Projects/Meetings"
+knowledge.untitled_document:
+  en: "untitled"
+knowledge.untitled_folder:
+  en: "untitled folder"
+knowledge.enter_title:
+  en: "Enter a title"
+knowledge.start_writing:
+  en: "Start writing…"
 knowledge.create_folder_failed:
   en: "Could not create folder “%{path}” (%{error})"
 

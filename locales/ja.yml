@@ -1221,7 +1221,10 @@ knowledge.open_in_file_manager: "ファイルマネージャーで開く"
 
 knowledge.new: "新規ドキュメント"
 knowledge.new_folder: "新規フォルダ"
-knowledge.folder_path: "フォルダ名またはパス（例：プロジェクト/会議）"
+knowledge.untitled_document: "無題のドキュメント"
+knowledge.untitled_folder: "無題のフォルダ"
+knowledge.enter_title: "タイトルを入力"
+knowledge.start_writing: "本文を入力…"
 knowledge.create_folder_failed: "フォルダ「%{path}」を作成できません（%{error}）"
 
 knowledge.add: "新規作成または取り込み"

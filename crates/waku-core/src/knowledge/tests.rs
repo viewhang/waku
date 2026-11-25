@@ -868,6 +868,67 @@ fn tree_fixture() -> Result<(tempfile::TempDir, PathBuf, KnowledgeLibrary)> {
     Ok((tmp, root, lib))
 }
 
+/// Creation reserves names on disk and returns the exact document and revision to edit
+#[test]
+fn untitled_entries_create_in_place_and_preserve_existing_siblings() -> Result<()> {
+    use KnowledgeOperation as Op;
+    let (_tmp, root, library) = tree_fixture()?;
+    let create = |parent: &str, stem: &str, folder| {
+        library.execute(Op::CreateUntitled {
+            root: root.to_str().unwrap().into(),
+            parent: parent.into(),
+            stem: stem.into(),
+            folder,
+        })
+    };
+    for expected in ["未命名文件夹", "未命名文件夹 2"] {
+        assert!(
+            matches!(create("", "未命名文件夹", true)?, KnowledgeResult::Managed { paths } if paths == [expected])
+        );
+        assert!(root.join(expected).is_dir());
+    }
+    let parent = "未命名文件夹";
+    fs::write(root.join(parent).join("untitled.md"), "existing")?;
+    let (first, second) = thread::scope(|scope| {
+        let first = scope.spawn(|| create(parent, "untitled", false));
+        (create(parent, "untitled", false), first.join().unwrap())
+    });
+    let mut paths = Vec::new();
+    for created in [first?, second?] {
+        let KnowledgeResult::CreatedDocument { id, path, revision } = created else {
+            panic!("expected an editable document")
+        };
+        assert_eq!(fs::read(root.join(&path))?, b"");
+        library.execute(Op::ManageTree {
+            root: root.to_str().unwrap().into(),
+            id: Some(id),
+            action: LibraryAction::Update {
+                path: path.clone(),
+                content: "# 标题\n\n正文".into(),
+                revision: Some(revision),
+                mode: UpdateMode::Replace,
+            },
+        })?;
+        assert_eq!(fs::read_to_string(root.join(&path))?, "# 标题\n\n正文");
+        paths.push(path);
+    }
+    paths.sort();
+    assert_eq!(
+        paths,
+        ["未命名文件夹/untitled 2.md", "未命名文件夹/untitled 3.md"]
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(parent).join("untitled.md"))?,
+        "existing"
+    );
+    assert!(
+        matches!(create("", "無題", false)?, KnowledgeResult::CreatedDocument { path, .. } if path == "無題.md")
+    );
+    assert!(create("missing", "untitled", true).is_err());
+    assert!(create("", "nested/name", false).is_err());
+    Ok(())
+}
+
 /// Moving a directory preserves notes, attachments, empty children and historical citation IDs
 #[test]
 fn knowledge_tree_moves_subtrees_and_persists_sibling_order() -> Result<()> {

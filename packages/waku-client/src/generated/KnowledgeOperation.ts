@@ -4,7 +4,7 @@ import type { KnowledgeModel } from "./KnowledgeModel";
 import type { LibraryAction } from "./LibraryAction";
 import type { LibraryConfig } from "./LibraryConfig";
 
-export type KnowledgeOperation = { "type": "status" } | { "type": "manage", action: LibraryAction, } | { "type": "manageTree", root: string, id: string | null, action: LibraryAction, } | { "type": "documentFile", id: string, action: DocumentFileAction, } | { "type": "history", path: string, } | { "type": "source", path: string, } | { "type": "configure", config: LibraryConfig, } | { "type": "addLibraries", roots: Array<string>, embedding: KnowledgeModel, } | { "type": "activateLibrary", root: string, } | { "type": "activateDocumentLibrary", id: string, } | { "type": "removeLibrary", root: string, } | { "type": "rebuild" } | { "type": "list", offset: number,
+export type KnowledgeOperation = { "type": "status" } | { "type": "createUntitled", root: string, parent: string, stem: string, folder: boolean, } | { "type": "manage", action: LibraryAction, } | { "type": "manageTree", root: string, id: string | null, action: LibraryAction, } | { "type": "documentFile", id: string, action: DocumentFileAction, } | { "type": "history", path: string, } | { "type": "source", path: string, } | { "type": "configure", config: LibraryConfig, } | { "type": "addLibraries", roots: Array<string>, embedding: KnowledgeModel, } | { "type": "activateLibrary", root: string, } | { "type": "activateDocumentLibrary", id: string, } | { "type": "removeLibrary", root: string, } | { "type": "rebuild" } | { "type": "list", offset: number,
 /**
  * Include directory entries when paging the desktop tree
  */

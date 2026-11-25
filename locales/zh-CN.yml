@@ -1279,7 +1279,10 @@ knowledge.open_in_file_manager: "文件管理器打开"
 
 knowledge.new: "新建文档"
 knowledge.new_folder: "新建文件夹"
-knowledge.folder_path: "文件夹名称或路径，如 项目/会议"
+knowledge.untitled_document: "未命名文档"
+knowledge.untitled_folder: "未命名文件夹"
+knowledge.enter_title: "请输入标题"
+knowledge.start_writing: "开始写正文…"
 knowledge.create_folder_failed: "无法创建文件夹「%{path}」：%{error}"
 
 knowledge.add: "新建或导入"

@@ -241,6 +241,66 @@ impl KnowledgeLibrary {
         self.apply_action(config, action, article)
     }
 
+    /// Allocate and publish the name under the same lock so simultaneous creates get separate entries
+    pub(super) fn create_untitled(
+        &self,
+        root: &str,
+        parent: &str,
+        stem: &str,
+        folder: bool,
+    ) -> Result<KnowledgeResult> {
+        let _serial = self.writes.lock();
+        let (_, config) = self.active()?;
+        ensure!(config.root == root, "The active knowledge library changed");
+        ensure!(
+            relative_path(stem)?.components().count() == 1,
+            "Expected a filename"
+        );
+        let dir = root_dir(Path::new(root))?;
+        if !parent.is_empty() {
+            let parent = relative_path(parent)?;
+            check_ancestors(&dir, parent)?;
+            ensure!(dir.is_dir(parent), "Destination folder no longer exists");
+        }
+        let extension = if folder { "" } else { ".md" };
+        for number in 1u64.. {
+            let name = if number == 1 {
+                format!("{stem}{extension}")
+            } else {
+                format!("{stem} {number}{extension}")
+            };
+            let path = if parent.is_empty() {
+                name
+            } else {
+                format!("{parent}/{name}")
+            };
+            match dir.symlink_metadata(&path) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            if folder {
+                return self.apply_action(config, LibraryAction::CreateFolder { path }, None);
+            }
+            self.apply_action(
+                config,
+                LibraryAction::Create {
+                    path: path.clone(),
+                    content: String::new(),
+                    metadata: None,
+                    format: None,
+                },
+                None,
+            )?;
+            return Ok(KnowledgeResult::CreatedDocument {
+                id: self.document_id(&path)?,
+                path,
+                revision: index::revision(""),
+            });
+        }
+        anyhow::bail!("No available filename")
+    }
+
     /// Validate the menu target under the same lock as the filesystem and catalog changes
     pub(super) fn manage_tree(
         &self,
@@ -261,6 +321,7 @@ impl KnowledgeLibrary {
                 from
             }
             LibraryAction::Reorder { path, .. } | LibraryAction::DeleteFolder { path } => path,
+            LibraryAction::Update { path, .. } if id.is_some() => path,
             _ => anyhow::bail!("Expected a directory operation"),
         };
         if let Some(id) = id {

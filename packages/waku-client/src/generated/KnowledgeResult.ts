@@ -4,7 +4,7 @@ import type { LibraryDocument } from "./LibraryDocument";
 import type { LibraryStatus } from "./LibraryStatus";
 import type { LibraryVersion } from "./LibraryVersion";
 
-export type KnowledgeResult = { "type": "managed", paths: Array<string>, } | { "type": "versions", versions: Array<LibraryVersion>, } | { "type": "source", path: string, revision: string, text: string, } | { "type": "status", status: LibraryStatus, } | { "type": "documents", documents: Array<LibraryDocument>, folders: Array<string>,
+export type KnowledgeResult = { "type": "createdDocument", id: string, path: string, revision: string, } | { "type": "managed", paths: Array<string>, } | { "type": "versions", versions: Array<LibraryVersion>, } | { "type": "source", path: string, revision: string, text: string, } | { "type": "status", status: LibraryStatus, } | { "type": "documents", documents: Array<LibraryDocument>, folders: Array<string>,
 /**
  * Only entries with a saved sibling position are included in this page
  */

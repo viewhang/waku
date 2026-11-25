@@ -13,6 +13,7 @@ mod settings;
 use reader::{DocumentPreview, PreparedDocument};
 
 pub(super) struct KnowledgePage {
+    window: gpui::AnyWindowHandle,
     root: Entity<TextInput>,
     /// Folder picker selection staged until its embedding model is confirmed
     selected_roots: Vec<String>,
@@ -46,6 +47,7 @@ pub(super) struct KnowledgePage {
     rename_save: Option<gpui::Task<()>>,
     rename_input: Entity<TextInput>,
     url_input: Entity<TextInput>,
+    title_input: Entity<TextInput>,
     editor: Entity<TextInput>,
     versions: Vec<LibraryVersion>,
     edit_revision: Option<String>,
@@ -61,8 +63,7 @@ pub(super) struct KnowledgePage {
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Panel {
     Preview,
-    Create,
-    CreateFolder,
+    EditNew,
     Import,
     Move,
     Edit,
@@ -133,14 +134,16 @@ impl KnowledgePage {
                 .submit_on_enter()
                 .placeholder(tr!("knowledge.note_path"))
         });
-        cx.subscribe(&path_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::Submit(_)) && this.knowledge.panel == Panel::CreateFolder
-            {
-                this.save_library_form(cx);
+        let editor = cx.new(|cx| TextInput::new(window, cx).multi_line().tab_stop());
+        let title_input = cx.new(|cx| TextInput::new(window, cx).tab_stop().submit_on_enter());
+        cx.subscribe_in(&title_input, window, |this, _, event, window, cx| {
+            if matches!(event, InputEvent::Submit(_)) && this.knowledge.panel == Panel::EditNew {
+                window.focus(&this.knowledge.editor.read(cx).focus(), cx);
             }
         })
         .detach();
         Self {
+            window: window.window_handle(),
             root,
             adding_library: false,
             new_embedding: None,
@@ -173,7 +176,8 @@ impl KnowledgePage {
                     .tab_stop()
                     .placeholder("https://…")
             }),
-            editor: cx.new(|cx| TextInput::new(window, cx).multi_line().tab_stop()),
+            title_input,
+            editor,
             versions: vec![],
             edit_revision: None,
             edit_original: "".into(),
@@ -183,6 +187,15 @@ impl KnowledgePage {
             poll_error: None,
             location: None,
         }
+    }
+}
+
+/// Write the optional title as a Markdown heading and keep the body exactly as entered
+fn new_note_markdown(title: &str, body: &str) -> String {
+    match (title.trim(), body) {
+        ("", _) => body.into(),
+        (title, "") => format!("# {title}"),
+        (title, _) => format!("# {title}\n\n{body}"),
     }
 }
 
@@ -364,8 +377,9 @@ impl Waku {
                                     .visible
                                     .get(page.cursor)
                                     .map(|i| (page.tree[*i].id, page.tree[*i].path.clone()));
-                                page.tree = tree;
+                                let root = stamp.0.clone();
                                 page.loaded = Some(stamp);
+                                page.tree = tree;
                                 page.refresh_visible();
                                 if let Some((id, path)) = cursor_row
                                     && let Some(pos) = page.visible.iter().position(|i| {
@@ -397,15 +411,17 @@ impl Waku {
                                 {
                                     page.reveal_tree_row(i);
                                 }
-                                if let Some(path) = page.after_create.as_ref()
+                                if let Some(path) = page.after_create.take()
                                     && let Some(i) =
-                                        page.tree.iter().position(|row| &row.path == path)
+                                        page.tree.iter().position(|row| row.path == path)
                                 {
-                                    page.after_create = None;
                                     if let Some(id) = page.tree[i].id {
                                         this.read_library_document(id, cx);
                                     } else {
+                                        let item = TreeItem::new(&page.tree[i], &root);
                                         page.reveal_tree_row(i);
+                                        let focus = page.prepare_rename(item, cx);
+                                        this.focus_library_input(focus, cx);
                                     }
                                 }
                                 cx.notify();
@@ -431,7 +447,9 @@ impl Waku {
                                         );
                                     }
                                 } else if this.knowledge.location.is_none()
+                                    && this.knowledge.after_create.is_none()
                                     && this.knowledge.panel == Panel::Preview
+                                    && this.knowledge.rename_target.is_none()
                                     && this.knowledge.error.is_none()
                                     && let Some(id) = this.knowledge.tree.iter().find_map(|r| r.id)
                                 {
@@ -590,11 +608,10 @@ impl Waku {
         let p = &self.knowledge;
         let dirty = match p.panel {
             Panel::Edit => p.editor.read(cx).content() != p.edit_original.as_ref(),
-            Panel::Create => {
-                !p.editor.read(cx).content().is_empty()
-                    || !p.path_input.read(cx).content().is_empty()
+            Panel::EditNew => {
+                !p.title_input.read(cx).content().is_empty()
+                    || !p.editor.read(cx).content().is_empty()
             }
-            Panel::CreateFolder => !p.path_input.read(cx).content().is_empty(),
             Panel::Import => {
                 !p.url_input.read(cx).content().is_empty()
                     || !p.path_input.read(cx).content().is_empty()
@@ -639,17 +656,19 @@ impl Waku {
             self.knowledge.changing_libraries = true;
             self.knowledge.poll = None;
         }
-        let created_folder = match &operation {
-            KnowledgeOperation::Manage {
-                action: LibraryAction::CreateFolder { path },
-            } => Some(path.clone()),
-            _ => None,
-        };
+        let created_folder = matches!(
+            operation,
+            KnowledgeOperation::CreateUntitled { folder: true, .. }
+        );
         let managed_path = match &operation {
             KnowledgeOperation::DocumentFile {
                 action: DocumentFileAction::Duplicate { to } | DocumentFileAction::Move { to },
                 ..
             } => Some(to.clone()),
+            KnowledgeOperation::ManageTree {
+                action: LibraryAction::Update { path, .. },
+                ..
+            } => Some(path.clone()),
             KnowledgeOperation::Manage {
                 action:
                     LibraryAction::Create { path, .. }
@@ -684,6 +703,7 @@ impl Waku {
             _ => None,
         };
         self.knowledge.revision += 1;
+        self.knowledge.after_create = None;
         let revision = self.knowledge.revision;
         self.knowledge.busy = true;
         self.knowledge.error = None;
@@ -724,7 +744,34 @@ impl Waku {
                             this.library_action(read, cx);
                         }
                     }
-                    Ok(LibraryResponse::Command(KnowledgeResult::Managed { .. })) => {
+                    Ok(LibraryResponse::Command(KnowledgeResult::CreatedDocument {
+                        id,
+                        path,
+                        revision,
+                    })) => {
+                        page.location = Some(PreviewLocation {
+                            id,
+                            path,
+                            changed: false,
+                            document: DocumentPreview::new(PreparedDocument::new("", 0), cx),
+                        });
+                        page.edit_revision = Some(revision);
+                        page.edit_original = "".into();
+                        page.title_input.update(cx, |input, cx| {
+                            input.clear(cx);
+                            input.set_placeholder(tr!("knowledge.enter_title"), cx);
+                        });
+                        page.editor.update(cx, |input, cx| {
+                            input.clear(cx);
+                            input.set_placeholder(tr!("knowledge.start_writing"), cx);
+                        });
+                        page.panel = Panel::EditNew;
+                        page.loaded = None;
+                        let focus = page.title_input.read(cx).focus();
+                        this.focus_library_input(focus, cx);
+                        this.poll_library(cx);
+                    }
+                    Ok(LibraryResponse::Command(KnowledgeResult::Managed { paths })) => {
                         page.loaded = None;
                         page.move_picker = None;
                         page.panel = Panel::Preview;
@@ -744,8 +791,8 @@ impl Waku {
                             cx.notify();
                             return;
                         }
-                        if let Some(path) = created_folder {
-                            page.after_create = Some(path);
+                        if created_folder {
+                            page.after_create = paths.into_iter().next();
                         } else if let Some(path) = managed_path {
                             if let Some(id) = page
                                 .tree
@@ -772,6 +819,7 @@ impl Waku {
                     })) => {
                         page.edit_original = text.into();
                         page.editor.update(cx, |input, cx| {
+                            input.set_placeholder("", cx);
                             input.set_content(page.edit_original.clone(), cx)
                         });
                         page.edit_revision = Some(revision);
@@ -916,6 +964,15 @@ impl KnowledgePage {
 }
 
 impl Waku {
+    /// Mount the fresh editor or directory row before sending keyboard input to it
+    fn focus_library_input(&self, focus: FocusHandle, cx: &mut Context<Self>) {
+        if self.knowledge.open && self.settings_page.is_none() {
+            let _ = self.knowledge.window.update(cx, |_, window, _| {
+                window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+            });
+        }
+    }
+
     fn library_visible(&self) -> bool {
         self.settings_page == Some(SettingsPage::Knowledge)
             || (self.settings_page.is_none() && self.knowledge.open)
@@ -1028,24 +1085,40 @@ impl Waku {
         }
         self.knowledge.revision += 1;
         self.knowledge.error = None;
-        if matches!(mode, Panel::Create | Panel::CreateFolder | Panel::Import) {
+        self.knowledge.after_create = None;
+        if mode == Panel::Import {
             self.knowledge.path_input.update(cx, |i, cx| {
-                i.set_placeholder(
-                    tr!(if mode == Panel::CreateFolder {
-                        "knowledge.folder_path"
-                    } else {
-                        "knowledge.note_path"
-                    }),
-                    cx,
-                );
+                i.set_placeholder(tr!("knowledge.note_path"), cx);
                 i.clear(cx);
             });
             self.knowledge.url_input.update(cx, |i, cx| i.clear(cx));
-            self.knowledge.editor.update(cx, |i, cx| i.clear(cx));
         }
         self.knowledge.panel = mode;
         self.knowledge.move_picker = None;
         cx.notify();
+    }
+
+    /// Both the root menu and a folder menu allocate the default name on the daemon
+    fn create_library_entry(&mut self, parent: &str, folder: bool, cx: &mut Context<Self>) {
+        if !self.tree_editable(cx) {
+            return;
+        }
+        let Some(config) = &self.knowledge.status.config else {
+            return;
+        };
+        self.library_action(
+            KnowledgeOperation::CreateUntitled {
+                root: config.root.clone(),
+                parent: parent.into(),
+                stem: tr!(if folder {
+                    "knowledge.untitled_folder"
+                } else {
+                    "knowledge.untitled_document"
+                }),
+                folder,
+            },
+            cx,
+        );
     }
 
     fn save_library_form(&mut self, cx: &mut Context<Self>) {
@@ -1053,32 +1126,40 @@ impl Waku {
             return;
         }
         let p = &self.knowledge;
-        let path = p.path_input.read(cx).content().trim().to_owned();
-        let action = match p.panel {
-            Panel::CreateFolder => LibraryAction::CreateFolder { path },
-            Panel::Create => LibraryAction::Create {
-                path,
-                content: p.editor.read(cx).content().to_owned(),
-                format: None,
-                metadata: None,
+        let operation = match p.panel {
+            Panel::Import => KnowledgeOperation::Manage {
+                action: LibraryAction::ImportUrl {
+                    path: p.path_input.read(cx).content().trim().into(),
+                    url: p.url_input.read(cx).content().trim().into(),
+                    options: Default::default(),
+                },
             },
-            Panel::Import => LibraryAction::ImportUrl {
-                path,
-                url: p.url_input.read(cx).content().trim().into(),
-                options: Default::default(),
-            },
-            Panel::Edit => {
+            Panel::Edit | Panel::EditNew => {
                 let Some(loc) = &p.location else { return };
-                LibraryAction::Update {
-                    path: loc.path.clone(),
-                    content: p.editor.read(cx).content().into(),
-                    revision: p.edit_revision.clone(),
-                    mode: UpdateMode::Replace,
+                let Some(config) = &p.status.config else {
+                    return;
+                };
+                KnowledgeOperation::ManageTree {
+                    root: config.root.clone(),
+                    id: Some(loc.id),
+                    action: LibraryAction::Update {
+                        path: loc.path.clone(),
+                        content: if p.panel == Panel::EditNew {
+                            new_note_markdown(
+                                p.title_input.read(cx).content(),
+                                p.editor.read(cx).content(),
+                            )
+                        } else {
+                            p.editor.read(cx).content().into()
+                        },
+                        revision: p.edit_revision.clone(),
+                        mode: UpdateMode::Replace,
+                    },
                 }
             }
             _ => return,
         };
-        self.library_action(KnowledgeOperation::Manage { action }, cx);
+        self.library_action(operation, cx);
     }
 
     /// Start a manual index rebuild from the knowledge settings
@@ -1180,17 +1261,13 @@ impl Waku {
                 let url = weak.clone();
                 vec![
                     MenuItem::new(tr!("knowledge.new"), move |_, cx| {
-                        let _ = create.update(cx, |this, cx| this.library_mode(Panel::Create, cx));
+                        let _ =
+                            create.update(cx, |this, cx| this.create_library_entry("", false, cx));
                     })
                     .icon("icons/file.svg"),
-                    MenuItem::new(tr!("knowledge.new_folder"), move |window, cx| {
-                        let _ = folder.update(cx, |this, cx| {
-                            this.library_mode(Panel::CreateFolder, cx);
-                            if this.knowledge.panel == Panel::CreateFolder {
-                                let focus = this.knowledge.path_input.read(cx).focus();
-                                window.on_next_frame(move |window, cx| window.focus(&focus, cx));
-                            }
-                        });
+                    MenuItem::new(tr!("knowledge.new_folder"), move |_, cx| {
+                        let _ =
+                            folder.update(cx, |this, cx| this.create_library_entry("", true, cx));
                     })
                     .icon("icons/folder.svg"),
                     MenuItem::Separator,
@@ -1509,29 +1586,37 @@ impl Waku {
         {
             return self.render_move_picker(base, picker, cx);
         }
-        if matches!(
-            p.panel,
-            Panel::Create | Panel::CreateFolder | Panel::Edit | Panel::Import
-        ) {
-            let mut editor = base.p(px(14.)).gap(px(8.)).child(tr!(match p.panel {
-                Panel::Create => "knowledge.new",
-                Panel::CreateFolder => "knowledge.new_folder",
-                Panel::Import => "knowledge.import",
-                _ => "knowledge.edit",
-            }));
-            if p.panel != Panel::Edit {
-                editor = editor.child(TextField::new("note-path", p.path_input.clone()).w_full());
-            }
+        if matches!(p.panel, Panel::EditNew | Panel::Edit | Panel::Import) {
+            let mut editor = base.p(px(14.)).gap(px(8.));
             if p.panel == Panel::Import {
-                editor = editor.child(TextField::new("article-url", p.url_input.clone()).w_full());
-            } else if matches!(p.panel, Panel::Create | Panel::Edit) {
+                editor = editor
+                    .child(tr!("knowledge.import"))
+                    .child(TextField::new("note-path", p.path_input.clone()).w_full())
+                    .child(TextField::new("article-url", p.url_input.clone()).w_full());
+            } else {
+                if p.panel == Panel::EditNew {
+                    editor = editor.px(px(30.)).pt(px(28.)).gap(px(16.)).child(
+                        div()
+                            .text_size(sp(28.))
+                            .line_height(sp(38.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(p.title_input.clone()),
+                    );
+                } else {
+                    editor = editor.child(tr!("knowledge.edit"));
+                }
                 editor = editor.child(
                     div()
                         .id("note-editor")
-                        .border_1()
-                        .border_color(theme.border)
-                        .rounded(px(6.))
-                        .p(px(10.))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            window.focus(&this.knowledge.editor.read(cx).focus(), cx);
+                        }))
+                        .when(p.panel == Panel::Edit, |el| {
+                            el.border_1()
+                                .border_color(theme.border)
+                                .rounded(px(6.))
+                                .p(px(10.))
+                        })
                         .overflow_y_scroll()
                         .flex_1()
                         .min_h_0()
@@ -1625,6 +1710,15 @@ impl Waku {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Skipping either input must not inject an empty heading or strip Markdown whitespace
+    #[test]
+    fn new_document_title_and_body_are_optional() {
+        assert_eq!(new_note_markdown("", ""), "");
+        assert_eq!(new_note_markdown(" 标题 ", ""), "# 标题");
+        assert_eq!(new_note_markdown("", "    code\n"), "    code\n");
+        assert_eq!(new_note_markdown("予定", "明日\n"), "# 予定\n\n明日\n");
+    }
 
     /// Pinning promotes documents within their own directory while preserving the hierarchy
     #[test]

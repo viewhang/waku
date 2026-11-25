@@ -36,6 +36,21 @@ fn edit_filename(input: &mut TextInput, name: &str, cx: &mut Context<TextInput>)
     input.select_range(0..stem.len(), cx);
 }
 
+impl KnowledgePage {
+    /// New folders and the rename command share the same inline selection and commit behavior
+    pub(super) fn prepare_rename(&mut self, item: TreeItem, cx: &mut Context<Waku>) -> FocusHandle {
+        let (_, name) = document_parts(&item.path);
+        self.rename_input.update(cx, |input, cx| {
+            edit_filename(input, name, cx);
+            if item.id.is_none() {
+                input.select_all_text(cx);
+            }
+        });
+        self.rename_target = Some(item);
+        self.rename_input.read(cx).focus()
+    }
+}
+
 impl Waku {
     /// The row and its ellipsis share a single menu and document target
     pub(super) fn with_library_row_menu(
@@ -203,16 +218,11 @@ impl Waku {
         }
         match action {
             RowAction::Create | RowAction::CreateFolder => {
-                let mode = if matches!(action, RowAction::Create) {
-                    Panel::Create
-                } else {
-                    Panel::CreateFolder
-                };
-                self.library_mode(mode, cx);
-                self.knowledge.path_input.update(cx, |input, cx| {
-                    input.set_content(format!("{}/", item.path), cx)
-                });
-                window.focus(&self.knowledge.path_input.read(cx).focus(), cx);
+                self.create_library_entry(
+                    &item.path,
+                    matches!(action, RowAction::CreateFolder),
+                    cx,
+                );
                 return;
             }
             RowAction::Up | RowAction::Down => {
@@ -224,18 +234,10 @@ impl Waku {
             }
             RowAction::Rename => {
                 let page = &mut self.knowledge;
-                page.rename_target = Some(item.clone());
                 if let Some(i) = page.tree.iter().position(|row| row.path == item.path) {
                     page.reveal_tree_row(i);
                 }
-                let (_, name) = document_parts(&item.path);
-                page.rename_input.update(cx, |input, cx| {
-                    edit_filename(input, name, cx);
-                    if item.id.is_none() {
-                        input.select_all_text(cx);
-                    }
-                });
-                let focus = page.rename_input.read(cx).focus();
+                let focus = page.prepare_rename(item.clone(), cx);
                 window.on_next_frame(move |window, cx| window.focus(&focus, cx));
                 cx.notify();
                 return;
