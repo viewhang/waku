@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::model::AssistantTool;
 use crate::ui::ActivationExt;
 use anyhow::Context as _;
 use base64::Engine as _;
@@ -2153,6 +2154,21 @@ impl Waku {
         if !native && self.model_picker_has_no_providers() {
             return None;
         }
+        // Keep the draft editable if it still contains a retired knowledge attachment
+        if self.composer_attachments.iter().any(|a| {
+            a.blob_reference.is_none()
+                && a.mention
+                    .starts_with(waku_protocol::knowledge::LEGACY_NOTE_PREFIX)
+        }) {
+            // Keyboard submission clears the field before delivering the prompt
+            if !prompt.is_empty() && self.composer.read(cx).content(cx).is_empty() {
+                self.composer
+                    .update(cx, |input, cx| input.set_content(prompt.to_owned(), cx));
+            }
+            self.show_info_toast(tr!("composer.remove_legacy_note"));
+            cx.notify();
+            return None;
+        }
         for attachment in &self.composer_attachments {
             if let (Some(reference), Some(image)) = (
                 attachment.blob_reference.as_ref(),
@@ -2707,29 +2723,59 @@ impl Waku {
         )
     }
 
-    fn render_assistant_web_search(
+    /// Tool switches share keyboard behavior and only affect the selected conversation
+    fn render_assistant_tool_switch(
         &self,
         session: &AgentSession,
+        tool: AssistantTool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = Theme::current(cx);
-        let enabled = session.assistant_web_search.unwrap_or_else(|| {
-            self.state.assistant_profiles.iter().any(|profile| {
-                Some(profile.id) == session.assistant_profile_id() && profile.web_search
-            })
-        });
-        let disabled = !session.detail_loaded
-            || self.submission_preparations.contains(&session.id)
-            || self.assistant_web_search_pending.contains(&session.id);
-        let focus = self.transcript_control_focus("assistant-web-search", cx);
-        let session_id = session.id;
-        let label = if enabled {
-            tr!("composer.disable_web_search")
-        } else {
-            tr!("composer.enable_web_search")
+        let (id, glyph, enabled, on_label, off_label) = match tool {
+            AssistantTool::WebSearch => (
+                "assistant-web-search",
+                "icons/globe.svg",
+                session.assistant_web_search.unwrap_or_else(|| {
+                    self.state.assistant_profiles.iter().any(|profile| {
+                        Some(profile.id) == session.assistant_profile_id() && profile.web_search
+                    })
+                }),
+                "composer.enable_web_search",
+                "composer.disable_web_search",
+            ),
+            AssistantTool::Knowledge => (
+                "assistant-knowledge-library",
+                "icons/library.svg",
+                session.assistant_knowledge.unwrap_or(false),
+                "composer.enable_knowledge",
+                "composer.disable_knowledge",
+            ),
         };
+        let lacks_tools = tool == AssistantTool::Knowledge
+            && !enabled
+            && session
+                .assistant
+                .as_ref()
+                .and_then(|profile| {
+                    self.model_service(profile.model_service_id?)?
+                        .model(&profile.model)
+                })
+                .is_some_and(|model| !model.options.dialogue() || !model.options.tools);
+        let disabled = lacks_tools
+            || !session.detail_loaded
+            || self.submission_preparations.contains(&session.id)
+            || self.assistant_tool_choice_pending.contains(&session.id);
+        let focus = self.transcript_control_focus(id, cx);
+        let session_id = session.id;
+        let label = tr!(if lacks_tools {
+            "knowledge.model_requires_tools"
+        } else if enabled {
+            off_label
+        } else {
+            on_label
+        });
         div()
-            .id("assistant-web-search")
+            .id(id)
             .size(px(26.0))
             .flex_none()
             .rounded(px(6.0))
@@ -2744,7 +2790,7 @@ impl Waku {
                     .bg(theme.accent.opacity(0.10))
             })
             .child(icon(
-                "icons/globe.svg",
+                glyph,
                 14.0,
                 if enabled {
                     theme.accent
@@ -2770,15 +2816,16 @@ impl Waku {
                     })
                     .active(|button| button.bg(theme.overlay_strong))
                     .on_activation(cx, move |this, _, cx| {
-                        this.set_assistant_web_search(session_id, !enabled, cx);
+                        this.set_assistant_tool_choice(session_id, tool, !enabled, cx);
                     })
             })
     }
 
     /// Wait for the daemon to persist the choice before accepting a prompt
-    fn set_assistant_web_search(
+    fn set_assistant_tool_choice(
         &mut self,
         session_id: Uuid,
+        tool: AssistantTool,
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
@@ -2803,7 +2850,7 @@ impl Waku {
                 .collect();
             (session.clone(), projects)
         });
-        if !self.assistant_web_search_pending.insert(session_id) {
+        if !self.assistant_tool_choice_pending.insert(session_id) {
             return;
         }
         let was_draft = draft.is_some();
@@ -2832,7 +2879,7 @@ impl Waku {
                     let response = client.request(
                         session_id,
                         Uuid::nil(),
-                        Command::SetAssistantWebSearch { enabled },
+                        Command::SetAssistantTool { tool, enabled },
                     )?;
                     anyhow::ensure!(
                         matches!(response, ResponsePayload::Ack),
@@ -2842,7 +2889,7 @@ impl Waku {
                 })
                 .await;
             let _ = waku.update(cx, |waku, cx| {
-                waku.assistant_web_search_pending.remove(&session_id);
+                waku.assistant_tool_choice_pending.remove(&session_id);
                 match result {
                     Ok(()) => {
                         if let Some(session) = waku
@@ -2851,7 +2898,7 @@ impl Waku {
                             .iter_mut()
                             .find(|session| session.id == session_id)
                         {
-                            session.assistant_web_search = Some(enabled);
+                            *session.assistant_tool_choice_mut(tool) = Some(enabled);
                             if was_draft {
                                 waku.save();
                             }
@@ -2946,9 +2993,9 @@ impl Waku {
         let no_providers = !native && self.model_picker_has_no_providers();
         let resetting_context = session
             .is_some_and(|session| self.assistant_context_resets_pending.contains(&session.id));
-        let saving_search =
-            session.is_some_and(|session| self.assistant_web_search_pending.contains(&session.id));
-        let can_send = has_draft && !no_providers && !resetting_context && !saving_search;
+        let saving_tool_choice =
+            session.is_some_and(|session| self.assistant_tool_choice_pending.contains(&session.id));
+        let can_send = has_draft && !no_providers && !resetting_context && !saving_tool_choice;
         let (autocomplete, autocomplete_actionable) =
             match self.render_composer_autocomplete(window, cx) {
                 Some((element, actionable)) => (Some(element), actionable),
@@ -3030,7 +3077,24 @@ impl Waku {
                         .when(!native, |row| row.child(self.render_access_control(cx)))
                         .children(self.render_goal_control(cx))
                         .when_some(session.filter(|_| native), |row, session| {
-                            row.child(self.render_assistant_web_search(session, cx))
+                            row.child(self.render_assistant_tool_switch(
+                                session,
+                                AssistantTool::WebSearch,
+                                cx,
+                            ))
+                            .when(
+                                self.state.assistant_profiles.iter().any(|a| {
+                                    Some(a.id) == session.assistant_profile_id()
+                                        && a.knowledge_tools
+                                }),
+                                |row| {
+                                    row.child(self.render_assistant_tool_switch(
+                                        session,
+                                        AssistantTool::Knowledge,
+                                        cx,
+                                    ))
+                                },
+                            )
                         })
                         .when(native, |row| {
                             let enabled = !resetting_context

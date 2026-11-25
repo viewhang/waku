@@ -22,7 +22,7 @@ const SETTINGS_SEARCH_CONTEXT: &str = "SettingsSidebar > TextInput";
 
 /// The sidebar's rows in display order, each with the keyword haystack the
 /// search field filters against.
-const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 10] = [
+const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 11] = [
     (
         SettingsPage::General,
         "settings.general",
@@ -58,6 +58,12 @@ const SETTINGS_PAGES: [(SettingsPage, &str, &str, &str); 10] = [
         "assistant.settings",
         "icons/bot.svg",
         "assistant.keywords",
+    ),
+    (
+        SettingsPage::Knowledge,
+        "knowledge.title",
+        "icons/library.svg",
+        "knowledge.keywords",
     ),
     (
         SettingsPage::Skills,
@@ -225,10 +231,7 @@ impl Waku {
                         .child(tr!("settings.back"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.settings_page = None;
-                            let focus_handle = this
-                                .translation_source_focus(cx)
-                                .unwrap_or_else(|| this.composer_focus(cx));
-                            window.focus(&focus_handle, cx);
+                            this.focus_active_workspace(window, cx);
                             cx.notify();
                         })),
                 ),
@@ -390,6 +393,7 @@ impl Waku {
                         SettingsPage::ModelServices => tr!("model_services.settings"),
                         SettingsPage::SearchProviders => tr!("search_providers.settings"),
                         SettingsPage::Providers => tr!("settings.providers"),
+                        SettingsPage::Knowledge => tr!("knowledge.title"),
                         SettingsPage::Skills => tr!("settings.skills"),
                         SettingsPage::Usage => tr!("settings.usage"),
                         SettingsPage::Daemon => tr!("settings.daemon"),
@@ -402,6 +406,7 @@ impl Waku {
                 SettingsPage::Assistants | SettingsPage::ModelServices | SettingsPage::Skills => {
                     unreachable!()
                 }
+                SettingsPage::Knowledge => self.render_library_settings(cx),
                 SettingsPage::Providers => self.render_providers_settings(cx),
                 SettingsPage::SearchProviders => self.render_search_providers_settings(cx),
                 SettingsPage::Usage => self.render_usage_settings(cx),

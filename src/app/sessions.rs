@@ -167,6 +167,7 @@ impl Waku {
     }
 
     fn activate_session(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        self.knowledge.open = false;
         self.leave_translation();
         let session_changed = self.state.selected_session != Some(session_id);
         if session_changed {
@@ -696,11 +697,12 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         if self.settings_page.take().is_some() {
-            let focus_handle = self
-                .translation_source_focus(cx)
-                .unwrap_or_else(|| self.composer_focus(cx));
-            window.focus(&focus_handle, cx);
+            self.focus_active_workspace(window, cx);
             cx.notify();
+            return;
+        }
+        if self.knowledge.open {
+            self.close_library(window, cx);
             return;
         }
         if self.translation_is_open() {
@@ -770,10 +772,7 @@ impl Waku {
         cx: &mut Context<Self>,
     ) {
         self.settings_page = None;
-        let focus_handle = self
-            .translation_source_focus(cx)
-            .unwrap_or_else(|| self.composer_focus(cx));
-        window.focus(&focus_handle, cx);
+        self.focus_active_workspace(window, cx);
         cx.notify();
     }
 
@@ -791,11 +790,12 @@ impl Waku {
             return;
         }
         if self.settings_page.take().is_some() {
-            let focus_handle = self
-                .translation_source_focus(cx)
-                .unwrap_or_else(|| self.composer_focus(cx));
-            window.focus(&focus_handle, cx);
+            self.focus_active_workspace(window, cx);
             cx.notify();
+            return;
+        }
+        if self.knowledge.open {
+            self.close_library(window, cx);
             return;
         }
         if self.translation_is_open() {
@@ -993,7 +993,7 @@ impl Waku {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.settings_page.is_some() {
+        if self.settings_page.is_some() || self.knowledge.open {
             return;
         }
         let (menu_id, align) = if self.translation_is_open() {

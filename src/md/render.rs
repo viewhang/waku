@@ -476,6 +476,22 @@ impl Default for MarkdownView {
 }
 
 impl MarkdownView {
+    /// Adopt a complete document parsed on a background executor
+    pub(crate) fn from_parser(parser: IncrementalParser) -> Self {
+        Self {
+            parser,
+            ..Self::new()
+        }
+    }
+
+    /// Render a visible block with the same selection and cache keys as the complete document
+    pub(crate) fn document_block(&self, index: usize, ctx: &Ctx<'_>) -> AnyElement {
+        self.sync_style(ctx.palette, &ctx.metrics);
+        let ctx = ctx.with_cache(self);
+        ctx.next_ordinal.set(block_ordinal_base(index));
+        render_block(&self.parser.tree().blocks[index].block, &ctx)
+    }
+
     pub fn new() -> Self {
         Self {
             parser: IncrementalParser::new(),

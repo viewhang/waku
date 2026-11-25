@@ -26,6 +26,7 @@ enum ModelPickerTarget {
     Default,
     Session(Uuid),
     Translation,
+    KnowledgeEmbedding,
 }
 
 impl ModelPickerTarget {
@@ -34,26 +35,28 @@ impl ModelPickerTarget {
             Self::Default => ASSISTANT_DEFAULT_MODEL_MENU_ID,
             Self::Session(_) => ASSISTANT_MODEL_MENU_ID,
             Self::Translation => TRANSLATION_MODEL_MENU_ID,
+            Self::KnowledgeEmbedding => "knowledge-embedding-picker",
         }
     }
 
     fn accepts(self, model: &ServiceModel) -> bool {
         match self {
+            Self::KnowledgeEmbedding => {
+                model.options.kind == waku_protocol::settings::ModelKind::Embedding
+                    && model.options.assistant_supported()
+            }
             Self::Translation => model.options.dialogue(),
             Self::Default | Self::Session(_) => model.options.assistant_supported(),
         }
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub(super) struct ModelSelection {
-    pub(super) service_id: Uuid,
-    pub(super) model: String,
-}
+pub(super) use waku_protocol::knowledge::KnowledgeModel as ModelSelection;
 
 /// Keep the selected profile's draft and its list state while switching settings pages
 pub(super) struct AssistantForm {
     editing: Option<Uuid>,
+    knowledge_tools: bool,
     name: Entity<TextInput>,
     default_model: Option<ModelSelection>,
     prompt: Entity<TextInput>,
@@ -70,6 +73,7 @@ impl AssistantForm {
     ) -> Self {
         let mut form = Self {
             editing: None,
+            knowledge_tools: true,
             name: cx.new(|cx| TextInput::new(window, cx).tab_stop()),
             default_model: None,
             prompt: cx.new(|cx| {
@@ -111,6 +115,7 @@ impl AssistantForm {
 
     fn load(&mut self, profile: Option<&AssistantProfile>, cx: &mut App) {
         self.editing = profile.map(|profile| profile.id);
+        self.knowledge_tools = profile.is_none_or(|p| p.knowledge_tools);
         self.default_model = profile.and_then(|profile| {
             profile.model_service_id.map(|service_id| ModelSelection {
                 service_id,
@@ -353,6 +358,14 @@ impl Waku {
         let project = self
             .selected_project()
             .filter(|project| !project.is_projectless());
+        let model_lacks_tools = form
+            .default_model
+            .as_ref()
+            .and_then(|selected| {
+                self.model_service(selected.service_id)?
+                    .model(&selected.model)
+            })
+            .is_some_and(|model| !model.options.dialogue() || !model.options.tools);
         let header = div()
             .flex()
             .items_center()
@@ -448,6 +461,29 @@ impl Waku {
                     .child(form.prompt.clone()),
                 theme,
             ))
+            .child(assistant_field(
+                tr!("knowledge.agent_tools"),
+                toggle_switch(
+                    "assistant-knowledge",
+                    form.knowledge_tools,
+                    false,
+                    theme,
+                    cx,
+                    |this, _, cx| {
+                        this.assistant_form.knowledge_tools = !this.assistant_form.knowledge_tools;
+                        cx.notify();
+                    },
+                ),
+                theme,
+            ))
+            .when(form.knowledge_tools && model_lacks_tools, |pane| {
+                pane.child(
+                    div()
+                        .text_size(sp(12.))
+                        .text_color(theme.text_secondary)
+                        .child(tr!("knowledge.model_requires_tools")),
+                )
+            })
             .child(assistant_button(
                 "assistant-save",
                 tr!("assistant.save"),
@@ -462,6 +498,8 @@ impl Waku {
             ASSISTANT_MODEL_MENU_ID,
             ASSISTANT_DEFAULT_MODEL_MENU_ID,
             TRANSLATION_MODEL_MENU_ID,
+            "knowledge-embedding-picker",
+            "knowledge-chat-picker",
         ]
         .into_iter()
         .any(|id| menus.get(id).is_some_and(ContextMenuHandle::is_open))
@@ -521,6 +559,17 @@ impl Waku {
         self.render_assistant_model_picker(ModelPickerTarget::Translation, model, label, cx)
     }
 
+    /// Restrict the library's model catalog to supported embedding models
+    pub(super) fn knowledge_embedding_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let selection = self.knowledge.settings_model();
+        self.render_assistant_model_picker(
+            ModelPickerTarget::KnowledgeEmbedding,
+            selection,
+            self.model_selection_label(selection),
+            cx,
+        )
+    }
+
     fn model_selection_label(&self, selection: Option<&ModelSelection>) -> String {
         let Some(selection) = selection else {
             return tr!("assistant.choose_model");
@@ -564,7 +613,9 @@ impl Waku {
                         scroll.scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
                     } else {
                         let focus = match target {
-                            ModelPickerTarget::Default => this.settings_focus.clone(),
+                            ModelPickerTarget::KnowledgeEmbedding | ModelPickerTarget::Default => {
+                                this.settings_focus.clone()
+                            }
                             ModelPickerTarget::Session(_) => this.composer_focus(cx),
                             ModelPickerTarget::Translation => this
                                 .translation_source_focus(cx)
@@ -636,7 +687,9 @@ impl Waku {
             .label(label)
             .selected(handle.is_open());
         let align = match target {
-            ModelPickerTarget::Default | ModelPickerTarget::Translation => MenuAlign::BelowLeft,
+            ModelPickerTarget::KnowledgeEmbedding
+            | ModelPickerTarget::Default
+            | ModelPickerTarget::Translation => MenuAlign::BelowLeft,
             ModelPickerTarget::Session(_) => MenuAlign::AboveLeft,
         };
         popover(trigger, &handle, align, move |popover, _, _| {
@@ -681,6 +734,7 @@ impl Waku {
                             let select = choose.clone();
                             div()
                                 .id(index)
+                                .w_full()
                                 .h(px(46.0))
                                 .px(px(10.0))
                                 .rounded(px(6.0))
@@ -736,7 +790,9 @@ impl Waku {
                         ModelPickerTarget::Session(id) => {
                             this.open_model_service_editor(None, Some(id), window, cx)
                         }
-                        ModelPickerTarget::Default | ModelPickerTarget::Translation => {
+                        ModelPickerTarget::KnowledgeEmbedding
+                        | ModelPickerTarget::Default
+                        | ModelPickerTarget::Translation => {
                             this.open_settings_page(SettingsPage::ModelServices, cx)
                         }
                     });
@@ -802,7 +858,9 @@ impl Waku {
                         .hover(|row| row.bg(theme.overlay))
                         .child(match target {
                             ModelPickerTarget::Session(_) => tr!("model_services.add"),
-                            ModelPickerTarget::Default | ModelPickerTarget::Translation => {
+                            ModelPickerTarget::KnowledgeEmbedding
+                            | ModelPickerTarget::Default
+                            | ModelPickerTarget::Translation => {
                                 tr!("model_services.manage")
                             }
                         })
@@ -852,6 +910,9 @@ impl Waku {
             return false;
         }
         match target {
+            ModelPickerTarget::KnowledgeEmbedding => {
+                self.knowledge.select_settings_model(selection)
+            }
             ModelPickerTarget::Default => self.assistant_form.default_model = Some(selection),
             ModelPickerTarget::Translation => {
                 let Some(page) = self.translation.as_mut().filter(|page| !page.busy()) else {
@@ -904,6 +965,7 @@ impl Waku {
             id: form.editing.unwrap_or_else(Uuid::new_v4),
             name: form.name.read(cx).content().trim().to_owned(),
             model: selection.model,
+            knowledge_tools: form.knowledge_tools,
             web_search: self
                 .state
                 .assistant_profiles

@@ -52,6 +52,9 @@ const MENU_CONTEXT: &str = "WakuMenu";
 /// Vertical gap between a trigger and its anchored card.
 const TRIGGER_GAP: f32 = 4.0;
 
+/// Vertical padding inside each menu card's one-pixel border
+const MENU_PADDING_Y: Pixels = px(4.0);
+
 /// A text field inside an open panel, such as a picker's filter box.
 ///
 /// The field holds real focus the whole time — the list's selection is drawn,
@@ -95,6 +98,8 @@ pub enum MenuItem {
         /// Shown greyed and inert. Preferred over omitting the row when the
         /// action is temporarily unavailable, so the menu keeps a stable shape.
         disabled: bool,
+        /// Marks an irreversible or destructive action with the theme's danger color
+        destructive: bool,
         #[allow(clippy::type_complexity)]
         on_click: Rc<dyn Fn(&mut Window, &mut App)>,
     },
@@ -103,6 +108,7 @@ pub enum MenuItem {
     /// menus whose submenu is a preference rather than an action.
     Submenu {
         label: SharedString,
+        icon: Option<&'static str>,
         value: Option<SharedString>,
         #[allow(clippy::type_complexity)]
         items: Rc<dyn Fn(&mut App) -> Vec<MenuItem>>,
@@ -131,6 +137,7 @@ impl MenuItem {
             image: None,
             selected: false,
             disabled: false,
+            destructive: false,
             on_click: Rc::new(on_click),
         }
     }
@@ -151,6 +158,20 @@ impl MenuItem {
         Self::Submenu {
             label: label.into(),
             value: Some(value.into()),
+            icon: None,
+            items: Rc::new(items),
+        }
+    }
+
+    /// A flyout without a trailing setting value
+    pub fn submenu(
+        label: impl Into<SharedString>,
+        items: impl Fn(&mut App) -> Vec<MenuItem> + 'static,
+    ) -> Self {
+        Self::Submenu {
+            label: label.into(),
+            value: None,
+            icon: None,
             items: Rc::new(items),
         }
     }
@@ -176,8 +197,15 @@ impl MenuItem {
         self
     }
 
+    pub fn destructive(mut self) -> Self {
+        if let Self::Entry { destructive, .. } = &mut self {
+            *destructive = true;
+        }
+        self
+    }
+
     pub fn icon(mut self, path: &'static str) -> Self {
-        if let Self::Entry { icon, .. } = &mut self {
+        if let Self::Entry { icon, .. } | Self::Submenu { icon, .. } = &mut self {
             *icon = Some(path);
         }
         self
@@ -306,6 +334,11 @@ impl ContextMenuHandle {
             .get()
             .map(|bounds| Point::new(bounds.left() + px(8.0), bounds.bottom()))
             .unwrap_or_else(|| window.mouse_position());
+        self.open_context_menu_at(position, window, cx);
+    }
+
+    /// Open the same menu at the pointer when its owning row receives a secondary click
+    pub fn open_context_menu_at(&self, position: Point<Pixels>, window: &mut Window, cx: &mut App) {
         open_menu(self, position, SurfaceFocus::Card, false, window, cx);
     }
 
@@ -583,38 +616,51 @@ fn resolve_floating_placement(
     }
 }
 
-/// A measured, trigger-aware deferred surface. This mirrors GPUI's
-/// `Anchored` element lifecycle, but resolves placement from the trigger's
-/// rectangle instead of a single point so vertical flips remain attached to
-/// the correct edge.
+/// Both rectangles are measured in window coordinates during the current frame
+#[derive(Default)]
+struct SubmenuBounds {
+    row: Cell<Bounds<Pixels>>,
+    card: Cell<Bounds<Pixels>>,
+}
+
+/// Align the first submenu item with its parent row and flip left if that side has more room
+fn submenu_origin(
+    row: Bounds<Pixels>,
+    size: Size<Pixels>,
+    viewport: Size<Pixels>,
+    margin: Pixels,
+) -> Point<Pixels> {
+    let right_space = viewport.width - margin - row.right();
+    let left_space = row.left() - margin;
+    let x = if size.width > right_space && left_space > right_space {
+        row.left() - size.width
+    } else {
+        row.right()
+    };
+    let y = row.top() - MENU_PADDING_Y - px(1.0);
+    Point::new(
+        x.clamp(margin, (viewport.width - margin - size.width).max(margin)),
+        y.clamp(margin, (viewport.height - margin - size.height).max(margin)),
+    )
+}
+
+enum SurfaceAnchor {
+    Trigger {
+        bounds: Bounds<Pixels>,
+        align: MenuAlign,
+        gap: Pixels,
+    },
+    Submenu(Rc<SubmenuBounds>),
+}
+
+/// Measure the card outside its parent's layout before placing it against the anchor
 struct FloatingSurface {
     child: AnyElement,
-    trigger: Bounds<Pixels>,
-    preferred: MenuAlign,
-    gap: Pixels,
-    margin: Pixels,
+    anchor: SurfaceAnchor,
 }
 
 struct FloatingSurfaceState {
     child_layout_id: LayoutId,
-}
-
-impl FloatingSurface {
-    fn new(
-        child: AnyElement,
-        trigger: Bounds<Pixels>,
-        preferred: MenuAlign,
-        gap: Pixels,
-        margin: Pixels,
-    ) -> Self {
-        Self {
-            child,
-            trigger,
-            preferred,
-            gap,
-            margin,
-        }
-    }
 }
 
 impl Element for FloatingSurface {
@@ -660,16 +706,20 @@ impl Element for FloatingSurface {
     ) {
         let surface_size = window.layout_bounds(request_layout.child_layout_id).size;
         let viewport = Bounds::new(Point::default(), window.viewport_size());
-        let margin = self.margin + window.client_inset().unwrap_or(px(0.0));
-        let placement = resolve_floating_placement(
-            self.trigger,
-            surface_size,
-            viewport,
-            self.preferred,
-            self.gap,
-            margin,
-        );
-        let offset = placement.bounds.origin - bounds.origin;
+        let margin = px(8.0) + window.client_inset().unwrap_or(px(0.0));
+        let origin = match &self.anchor {
+            SurfaceAnchor::Trigger { bounds, align, gap } => {
+                resolve_floating_placement(*bounds, surface_size, viewport, *align, *gap, margin)
+                    .bounds
+                    .origin
+            }
+            SurfaceAnchor::Submenu(submenu) => {
+                let origin = submenu_origin(submenu.row.get(), surface_size, viewport.size, margin);
+                submenu.card.set(Bounds::new(origin, surface_size));
+                origin
+            }
+        };
+        let offset = origin - bounds.origin;
         let offset = Point::new(offset.x.round(), offset.y.round());
         window.with_element_offset(offset, |window| self.child.prepaint(window, cx));
     }
@@ -825,20 +875,27 @@ where
     let Some(position) = open_at else {
         return trigger.into_any_element();
     };
-    let trigger_bounds = handle
-        .trigger_bounds
-        .get()
-        .unwrap_or_else(|| Bounds::new(position, Size::default()));
+    let point_bounds = Bounds::new(position, Size::default());
+    // The ellipsis anchors below its button while a row context click anchors at the pointer
+    let (trigger_bounds, gap) = if handle.state.borrow().trigger_click_toggles {
+        (
+            handle.trigger_bounds.get().unwrap_or(point_bounds),
+            px(TRIGGER_GAP),
+        )
+    } else {
+        (point_bounds, px(0.0))
+    };
 
     trigger
         .child(
-            deferred(FloatingSurface::new(
-                card(handle),
-                trigger_bounds,
-                align,
-                px(TRIGGER_GAP),
-                px(8.0),
-            ))
+            deferred(FloatingSurface {
+                child: card(handle),
+                anchor: SurfaceAnchor::Trigger {
+                    bounds: trigger_bounds,
+                    align,
+                    gap,
+                },
+            })
             .with_priority(1),
         )
         .into_any_element()
@@ -928,14 +985,7 @@ where
                 {
                     return;
                 }
-                open_menu(
-                    &handle_for_down,
-                    event.position,
-                    SurfaceFocus::Card,
-                    false,
-                    window,
-                    cx,
-                );
+                handle_for_down.open_context_menu_at(event.position, window, cx);
                 cx.stop_propagation();
                 window.prevent_default();
             },
@@ -996,14 +1046,14 @@ impl RenderOnce for MenuCard {
             let MenuItem::Submenu { items, .. } = items.get(index)? else {
                 return None;
             };
-            Some((index, items(cx)))
+            Some((index, items(cx), Rc::new(SubmenuBounds::default())))
         });
 
         let mut root_card = div()
             .id(self.id)
             .min_w(px(176.0))
             .max_w(px(320.0))
-            .py(px(4.0))
+            .py(MENU_PADDING_Y)
             .rounded(px(9.0))
             .border_1()
             .border_color(theme.border_strong)
@@ -1013,7 +1063,7 @@ impl RenderOnce for MenuCard {
             .flex_col();
 
         for (index, item) in items.into_iter().enumerate() {
-            root_card = root_card.child(render_menu_item(
+            let row = render_menu_item(
                 item,
                 index,
                 highlighted == Some(index) || active_submenu == Some(index),
@@ -1022,7 +1072,21 @@ impl RenderOnce for MenuCard {
                 self.handle.clone(),
                 window,
                 cx,
-            ));
+            );
+            root_card = if let Some((parent, _, bounds)) = &submenu
+                && index == *parent
+            {
+                let bounds = bounds.clone();
+                root_card.child(
+                    div().relative().flex().flex_col().child(row).child(
+                        canvas(move |row, _, _| bounds.row.set(row), |_, _, _, _| ())
+                            .absolute()
+                            .inset_0(),
+                    ),
+                )
+            } else {
+                root_card.child(row)
+            };
         }
 
         let mut surface = div()
@@ -1040,7 +1104,15 @@ impl RenderOnce for MenuCard {
             })
             .on_mouse_down_out({
                 let handle = self.handle.clone();
-                move |event, window, cx| handle.dismiss_on_down_out(event, window, cx)
+                let submenu = submenu.as_ref().map(|(_, _, bounds)| bounds.clone());
+                move |event, window, cx| {
+                    if !submenu
+                        .as_ref()
+                        .is_some_and(|bounds| bounds.card.get().contains(&event.position))
+                    {
+                        handle.dismiss_on_down_out(event, window, cx);
+                    }
+                }
             })
             .on_key_down({
                 let handle = self.handle.clone();
@@ -1052,13 +1124,13 @@ impl RenderOnce for MenuCard {
             })
             .child(root_card);
 
-        if let Some((parent_index, submenu_items)) = submenu {
+        if let Some((parent_index, submenu_items, bounds)) = submenu {
             let mut submenu_card = div()
                 .id(SharedString::from(format!("submenu-{parent_index}")))
-                .ml(px(-4.0))
+                .occlude()
                 .min_w(px(176.0))
                 .max_w(px(320.0))
-                .py(px(4.0))
+                .py(MENU_PADDING_Y)
                 .rounded(px(9.0))
                 .border_1()
                 .border_color(theme.border_strong)
@@ -1078,7 +1150,10 @@ impl RenderOnce for MenuCard {
                     cx,
                 ));
             }
-            surface = surface.child(submenu_card);
+            surface = surface.child(FloatingSurface {
+                child: submenu_card.into_any_element(),
+                anchor: SurfaceAnchor::Submenu(bounds),
+            });
         }
         surface
     }
@@ -1117,12 +1192,14 @@ fn render_menu_item(
             image,
             selected,
             disabled,
+            destructive,
             on_click,
         } => {
-            let color = match (disabled, selected) {
-                (true, _) => theme.text_ghost,
-                (false, true) => theme.text,
-                (false, false) => theme.text_secondary,
+            let color = match (disabled, destructive, selected) {
+                (true, _, _) => theme.text_ghost,
+                (_, true, _) => theme.danger,
+                (_, _, true) => theme.text,
+                _ => theme.text_secondary,
             };
             let entry = row(
                 index,
@@ -1148,6 +1225,7 @@ fn render_menu_item(
         MenuItem::Submenu {
             label,
             value,
+            icon: item_icon,
             items: _,
         } => {
             // Waku currently exposes one flyout level. Keeping a nested
@@ -1177,6 +1255,9 @@ fn render_menu_item(
                     open_submenu(&click_handle, index, false);
                     window.refresh();
                     cx.stop_propagation();
+                })
+                .when_some(item_icon, |entry, path| {
+                    entry.child(icon(path, 12.0, theme.text_secondary))
                 })
                 .child(div().flex_1().min_w_0().truncate().child(label))
                 .when_some(value, |element, value| {
@@ -1476,6 +1557,16 @@ mod tests {
     }
 
     #[test]
+    fn submenu_flips_left_and_stays_above_the_bottom_margin() {
+        let viewport = size(px(800.), px(600.));
+        let row = Bounds::new(point(px(600.), px(540.)), size(px(176.), px(26.)));
+        assert_eq!(
+            submenu_origin(row, size(px(200.), px(100.)), viewport, px(8.)),
+            point(px(400.), px(492.))
+        );
+    }
+
+    #[test]
     fn floating_surface_keeps_a_preferred_side_that_fits() {
         let placement = resolve_floating_placement(
             Bounds::new(point(px(600.0), px(200.0)), size(px(100.0), px(20.0))),
@@ -1592,16 +1683,16 @@ mod tests {
                 MenuAlign::BelowLeft,
                 move |_| {
                     let activated = activated.clone();
-                    vec![MenuItem::submenu_with_value(
-                        "Grouping",
-                        "Updated",
-                        move |_| {
+                    vec![
+                        MenuItem::new("Edit", |_, _| {}),
+                        MenuItem::Separator,
+                        MenuItem::submenu_with_value("Grouping", "Updated", move |_| {
                             let activated = activated.clone();
                             vec![MenuItem::new("Project", move |_, _| {
                                 activated.set(true);
                             })]
-                        },
-                    )]
+                        }),
+                    ]
                 },
             )
         }
@@ -1712,6 +1803,29 @@ mod tests {
     }
 
     #[gpui::test]
+    fn submenu_opens_beside_its_own_row_and_accepts_a_click(cx: &mut TestAppContext) {
+        let activated = Rc::new(Cell::new(false));
+        let handle = cx.update(ContextMenuHandle::new);
+        let harness = SubmenuHarness {
+            handle: handle.clone(),
+            activated: activated.clone(),
+        };
+        let (_, cx) = cx.add_window_view(|_, _| harness);
+        cx.simulate_mouse_down(
+            point(px(10.), px(10.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        // The second item is below a 26-pixel entry and a separator
+        let row = point(px(100.), px(90.));
+        cx.simulate_mouse_move(row, None, Modifiers::none());
+        assert!(handle.state.borrow().active_submenu.is_some());
+        cx.simulate_mouse_down(point(px(215.), row.y), MouseButton::Left, Modifiers::none());
+        assert!(activated.get());
+        assert!(!handle.is_open());
+    }
+
+    #[gpui::test]
     fn submenu_is_keyboard_operable(cx: &mut TestAppContext) {
         let handle = cx.update(ContextMenuHandle::new);
         let activated = Rc::new(Cell::new(false));
@@ -1728,6 +1842,7 @@ mod tests {
         );
         cx.run_until_parked();
         cx.update(|window, cx| window.focus(&handle.focus, cx));
+        cx.simulate_keystrokes("down");
         cx.simulate_keystrokes("down");
         cx.simulate_keystrokes("right");
         assert!(handle.state.borrow().submenu_focused);

@@ -285,7 +285,7 @@ impl Render for Waku {
         let goal_dialog = self.render_goal_dialog(window, cx);
         let toast = self.render_active_toast(cx);
         let translation = self.open_translation_page();
-        let translating = translation.is_some();
+        let tool_open = translation.is_some() || self.knowledge.open;
         let content = div()
             .key_context("Waku")
             .on_action(cx.listener(Self::close_window_or_right_panel_tab_action))
@@ -361,11 +361,14 @@ impl Render for Waku {
                     .when(panels.sidebar > 0.0, |element| {
                         element.border_l_1().border_color(theme.sidebar_border)
                     })
-                    .child(self.render_header(window, translating, cx))
+                    .child(self.render_header(window, tool_open, cx))
                     .when_some(translation, |element, page| {
                         element.child(self.render_translation(page, window, cx))
                     })
-                    .when(!translating, |element| {
+                    .when(self.knowledge.open, |el| {
+                        el.child(self.render_knowledge_workspace(cx))
+                    })
+                    .when(!tool_open, |element| {
                         element
                             .child(if empty {
                                 self.render_empty_state(cx).into_any_element()
@@ -395,7 +398,7 @@ impl Render for Waku {
                         ))
                     }),
             )
-            .when(!translating && panels.right_panel > 0.0, |root| {
+            .when(!tool_open && panels.right_panel > 0.0, |root| {
                 root.child(
                     div()
                         .h_full()

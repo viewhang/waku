@@ -53,6 +53,9 @@ impl Waku {
         // Each page starts at its own top; a scroll position carried over
         // from the previous page would land mid-content.
         self.settings_scroll.set_offset(gpui::Point::default());
+        if page == SettingsPage::Knowledge {
+            self.poll_library(cx);
+        }
         if page == SettingsPage::Usage {
             self.ensure_usage_history(false, cx);
         }

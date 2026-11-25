@@ -795,6 +795,7 @@ fn command_targets_runtime(command: &Command) -> bool {
             | Command::RewindSessionToMessage { .. }
             | Command::ClearAssistantContext { .. }
             | Command::SetAssistantWebSearch { .. }
+            | Command::SetAssistantTool { .. }
             | Command::OpenTerminal { .. }
             | Command::WriteTerminal { .. }
             | Command::ResizeTerminal { .. }
@@ -1007,6 +1008,7 @@ fn task_catalog_action(command: &Command) -> TaskCatalogAction {
         | Command::ForkSessionFromResponse { .. }
         | Command::RewindSessionToMessage { .. }
         | Command::SetAssistantWebSearch { .. }
+        | Command::SetAssistantTool { .. }
         | Command::ClearAssistantContext { .. } => TaskCatalogAction::Changed,
         _ => TaskCatalogAction::None,
     }
@@ -1434,8 +1436,9 @@ mod tests {
     #[cfg(unix)]
     fn assistant_context_reset_and_search_choice_survive_reopen() {
         use crate::driver::assistant::tests::{mock_service, request, stream};
-        use crate::model::{ContextUsage, MessageRole, TurnStatus};
-        use waku_protocol::settings::AssistantProfile;
+        use crate::model::{AssistantTool, ContextUsage, MessageRole, TurnStatus};
+        use waku_protocol::knowledge::{KnowledgeModel, KnowledgeOperation, LibraryConfig};
+        use waku_protocol::settings::{AssistantProfile, ModelKind, ServiceModel};
 
         let root = std::env::temp_dir().join(format!("waku-clear-context-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -1444,34 +1447,30 @@ mod tests {
             settings.save_tavily_api_key("fixture-key").unwrap();
             WakuBackend::new(settings, StateStore::daemon(root.join("app.db"))).unwrap()
         };
-        let (listener, service) = mock_service("Test provider", "test-chat");
+        let (listener, mut service) = mock_service("Test provider", "test-chat");
         let mock_provider = std::thread::spawn(move || {
-            for (web_search, expected) in [
-                (true, vec!["Test preamble", "first new prompt"]),
-                (
-                    true,
-                    vec![
-                        "Test preamble",
-                        "first new prompt",
-                        "reply",
-                        "second new prompt",
-                    ],
-                ),
-                (
-                    false,
-                    vec![
-                        "Test preamble",
-                        "first new prompt",
-                        "reply",
-                        "second new prompt",
-                        "reply",
-                        "search off",
-                    ],
-                ),
+            let mut expected = Vec::new();
+            for (prompt, web_search, knowledge) in [
+                ("first new prompt", true, false),
+                ("second new prompt", true, true),
+                ("search off", false, true),
+                ("knowledge off", false, false),
             ] {
+                expected.push(prompt);
                 let (socket, _, body, _) = request(&listener);
-                let tools = body["tools"].as_array();
-                assert_eq!(tools.is_some_and(|tools| !tools.is_empty()), web_search);
+                let tools: Vec<_> = body["tools"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|tool| tool["function"]["name"].as_str().unwrap())
+                    .collect();
+                assert_eq!(tools.contains(&"tavily_search"), web_search);
+                assert_eq!(tools.contains(&"knowledge_search"), knowledge);
+                assert_eq!(tools.contains(&"knowledge_create"), knowledge);
+                assert_eq!(
+                    tools.iter().any(|name| name.starts_with("knowledge_")),
+                    knowledge
+                );
                 let text = body["messages"]
                     .as_array()
                     .unwrap()
@@ -1484,7 +1483,10 @@ mod tests {
                             .unwrap()
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(text, expected);
+                assert_eq!(text[0].lines().next(), Some("Test preamble"));
+                assert_eq!(text[0].contains("knowledge tools"), knowledge);
+                assert_eq!(&text[1..], expected);
+                expected.push("reply");
                 stream(socket, json!({"content": "reply"}), "stop");
             }
         });
@@ -1504,11 +1506,26 @@ mod tests {
             name: "Test assistant".into(),
             system_prompt: "Test preamble".into(),
             model: "test-chat".into(),
+            knowledge_tools: true,
             web_search: false,
-            model_service_id: None,
-            base_url: service.base_url,
+            model_service_id: Some(service.id),
+            base_url: String::new(),
         };
         session.assistant = Some(profile.clone());
+        let settings = DaemonSettingsStore::open(root.join("settings.json")).unwrap();
+        let mut encoder = ServiceModel::new("test-encoder".into());
+        encoder.options.kind = ModelKind::Embedding;
+        service.models.push(encoder);
+        let embedding = KnowledgeModel {
+            service_id: service.id,
+            model: "test-encoder".into(),
+        };
+        settings.save_model_service(service, None).unwrap();
+        let mut config = settings.get();
+        config.assistants.push(profile.clone());
+        settings.replace(config).unwrap();
+        let notes = root.join("notes");
+        std::fs::create_dir(&notes).unwrap();
 
         let hub = Arc::new(Hub::default());
         let (outgoing, events) = unbounded();
@@ -1588,6 +1605,18 @@ mod tests {
         let backend = open_backend();
         let runtime_id = Uuid::new_v4();
         save(&backend, &session);
+        call(
+            &backend,
+            Uuid::nil(),
+            Command::Knowledge {
+                operation: KnowledgeOperation::Configure {
+                    config: LibraryConfig {
+                        root: notes.to_str().unwrap().into(),
+                        embedding,
+                    },
+                },
+            },
+        );
         start(&backend, runtime_id);
         let mut other = AgentSession::new(project.id, ProviderKind::Assistant);
         other.assistant = Some(profile.clone());
@@ -1631,6 +1660,11 @@ mod tests {
         );
         session = cleared;
         prompt(&backend, runtime_id, "first new prompt");
+        let knowledge = |enabled| Command::SetAssistantTool {
+            tool: AssistantTool::Knowledge,
+            enabled,
+        };
+        call(&backend, Uuid::nil(), knowledge(true));
         session.begin_turn("first new prompt");
         session.push_message(MessageRole::Assistant, "reply");
         session.finish_active_turn(TurnStatus::Completed);
@@ -1650,6 +1684,7 @@ mod tests {
         };
         assert_eq!(restored.assistant_context_resets, vec![turn_id]);
         assert_eq!(restored.assistant_web_search, Some(true));
+        assert_eq!(restored.assistant_knowledge, Some(true));
         assert_eq!(restored.messages.len(), 4);
         assert_eq!(restored.messages[0].content, "old context");
         let ResponsePayload::Session {
@@ -1665,7 +1700,7 @@ mod tests {
             panic!("expected the unsent conversation with its own search choice");
         };
         assert_eq!(other.assistant_web_search, Some(false));
-        assert!(other.messages.is_empty());
+        assert!(other.assistant_knowledge.is_none() && other.messages.is_empty());
         let new_runtime_id = Uuid::new_v4();
         start(&backend, new_runtime_id);
         prompt(&backend, new_runtime_id, "second new prompt");
@@ -1675,6 +1710,8 @@ mod tests {
             Command::SetAssistantWebSearch { enabled: false },
         );
         prompt(&backend, new_runtime_id, "search off");
+        call(&backend, Uuid::nil(), knowledge(false));
+        prompt(&backend, new_runtime_id, "knowledge off");
         mock_provider.join().unwrap();
         drop(backend);
         std::fs::remove_dir_all(root).unwrap();

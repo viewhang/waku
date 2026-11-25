@@ -160,6 +160,7 @@ enum PaletteAction {
     ToggleSidebar,
     ToggleRightPanel,
     OpenSettings(SettingsPage),
+    OpenLibrary,
     SelectTask(Uuid),
 }
 
@@ -808,6 +809,15 @@ impl Waku {
             ),
         ]);
 
+        commands.push(CommandPaletteItem::command(
+            PaletteSection::Commands,
+            tr!("knowledge.open"),
+            "icons/library.svg",
+            None,
+            PaletteAction::OpenLibrary,
+            "personal knowledge library notes RAG 知识库",
+            next(),
+        ));
         for (page, label_key, icon, keywords) in [
             (
                 SettingsPage::General,
@@ -1585,6 +1595,7 @@ impl Waku {
             PaletteAction::ToggleRightPanel => {
                 self.toggle_right_panel_action(&ToggleRightPanel, window, cx)
             }
+            PaletteAction::OpenLibrary => self.open_library(window, cx),
             PaletteAction::OpenSettings(page) => {
                 self.open_settings_action(&OpenSettings, window, cx);
                 self.open_settings_page(page, cx);

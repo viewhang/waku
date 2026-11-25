@@ -19,8 +19,9 @@ use crate::attachments::AttachmentStore;
 use crate::computer_use::{ComputerTarget, ComputerUsePhase, ComputerUseState};
 use crate::driver::{self, DriverHandle, DriverStartOptions, SessionOptions};
 use crate::model::{
-    ActivityKind, AgentSession, Checkpoint, CheckpointStatus, DriverEvent, MessageAttachment,
-    PermissionOption, Project, ProviderKind, ProviderResumeCursor, SessionStatus,
+    ActivityKind, AgentSession, AssistantTool, Checkpoint, CheckpointStatus, DriverEvent,
+    MessageAttachment, PermissionOption, Project, ProviderKind, ProviderResumeCursor,
+    SessionStatus,
 };
 use crate::persistence::{ComposerDraftStore, PersistedState, StateStore};
 use crate::settings::DaemonSettingsStore;
@@ -48,6 +49,7 @@ pub struct WakuBackend {
     #[cfg(all(test, unix))]
     terminal_shell: Option<alacritty_terminal::tty::Shell>,
     settings: Arc<DaemonSettingsStore>,
+    knowledge: Arc<crate::knowledge::KnowledgeLibrary>,
     task_store: StateStore,
     task_state: Mutex<PersistedState>,
     removed_session_ids: Mutex<HashSet<Uuid>>,
@@ -86,12 +88,18 @@ impl WakuBackend {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .to_owned();
+        let settings = Arc::new(settings);
+        let knowledge = crate::knowledge::KnowledgeLibrary::open(
+            usage_rates_dir.join("knowledge.sqlite"),
+            settings.clone(),
+        )?;
         Ok(Self {
             sessions: Mutex::new(HashMap::new()),
             terminals: Mutex::new(HashMap::new()),
             #[cfg(all(test, unix))]
             terminal_shell: None,
-            settings: Arc::new(settings),
+            settings,
+            knowledge,
             task_store,
             task_state: Mutex::new(task_state),
             removed_session_ids: Mutex::new(HashSet::new()),
@@ -312,7 +320,7 @@ impl Backend for WakuBackend {
                 let service = self
                     .settings
                     .save_model_service(service, api_key.as_deref())?;
-                Ok(ResponsePayload::ModelServiceSaved { service })
+                Ok(self.saved_model_service(service))
             }
             Command::RemoveModelServiceModels {
                 service_id,
@@ -322,7 +330,7 @@ impl Backend for WakuBackend {
                 let service = self
                     .settings
                     .remove_model_service_models(service_id, &base_url, &model_ids)?;
-                Ok(ResponsePayload::ModelServiceSaved { service })
+                Ok(self.saved_model_service(service))
             }
             Command::SetModelServiceEnabled {
                 service_id,
@@ -331,7 +339,7 @@ impl Backend for WakuBackend {
                 let service = self
                     .settings
                     .set_model_service_enabled(service_id, enabled)?;
-                Ok(ResponsePayload::ModelServiceSaved { service })
+                Ok(self.saved_model_service(service))
             }
             Command::TestModelService {
                 base_url,
@@ -360,10 +368,13 @@ impl Backend for WakuBackend {
             }
             Command::SyncModelService { service_id } => {
                 match driver::assistant::sync_model_service(&self.settings, service_id)? {
-                    Some(service) => Ok(ResponsePayload::ModelServiceSaved { service }),
+                    Some(service) => Ok(self.saved_model_service(service)),
                     None => Ok(ResponsePayload::ModelServiceModels { models: Vec::new() }),
                 }
             }
+            Command::Knowledge { operation } => Ok(ResponsePayload::Knowledge {
+                result: self.knowledge.execute(operation)?,
+            }),
             Command::TranslateText {
                 service_id,
                 model,
@@ -548,6 +559,7 @@ impl Backend for WakuBackend {
                             if existing.provider == ProviderKind::Assistant {
                                 self.task_store.hydrate(existing)?;
                                 session.assistant_web_search = existing.assistant_web_search;
+                                session.assistant_knowledge = existing.assistant_knowledge;
                                 session.assistant_context_resets =
                                     existing.assistant_context_resets.clone();
                                 // A projection ending at the reset boundary cannot retain old usage
@@ -869,31 +881,10 @@ impl Backend for WakuBackend {
                 })
             }
             Command::SetAssistantWebSearch { enabled } => {
-                let driver = self
-                    .sessions
-                    .lock()
-                    .get(&session_id)
-                    .map(|(_, driver)| driver.clone());
-                let mut state = self.task_state.lock();
-                let index = state
-                    .sessions
-                    .iter()
-                    .position(|session| {
-                        session.id == session_id && session.provider == ProviderKind::Assistant
-                    })
-                    .context("Assistant session no longer exists")?;
-                let session = &mut state.sessions[index];
-                self.task_store.hydrate(session)?;
-                let previous = session.assistant_web_search.replace(enabled);
-                state.mark_session_dirty(session_id);
-                if let Err(error) = self.task_store.save(&mut state) {
-                    state.sessions[index].assistant_web_search = previous;
-                    return Err(error.into());
-                }
-                if let Some(driver) = driver {
-                    driver.set_assistant_web_search(enabled);
-                }
-                Ok(ResponsePayload::Ack)
+                self.set_assistant_tool(session_id, AssistantTool::WebSearch, enabled)
+            }
+            Command::SetAssistantTool { tool, enabled } => {
+                self.set_assistant_tool(session_id, tool, enabled)
             }
             Command::ClearAssistantContext { turn_id } => {
                 let driver = self
@@ -1044,8 +1035,15 @@ impl Backend for WakuBackend {
                         .unwrap_or_else(|| self.settings.assistant_web_search(profile.id));
                     driver::assistant::start(
                         profile,
-                        web_search,
+                        driver::assistant::TurnTools {
+                            web_search,
+                            knowledge: stored
+                                .as_ref()
+                                .and_then(|session| session.assistant_knowledge)
+                                .unwrap_or(false),
+                        },
                         self.settings.clone(),
+                        Some(self.knowledge.clone()),
                         self.attachments.clone(),
                         stored
                             .map(|mut session| {
@@ -1240,6 +1238,52 @@ fn preserve_daemon_checkpoints(existing: &AgentSession, incoming: &mut AgentSess
 }
 
 impl WakuBackend {
+    /// Persist the chat preference before applying it to a running assistant
+    fn set_assistant_tool(
+        &self,
+        session_id: Uuid,
+        tool: AssistantTool,
+        enabled: bool,
+    ) -> anyhow::Result<ResponsePayload> {
+        let driver = self
+            .sessions
+            .lock()
+            .get(&session_id)
+            .map(|(_, driver)| driver.clone());
+        let mut state = self.task_state.lock();
+        let index = state
+            .sessions
+            .iter()
+            .position(|session| {
+                session.id == session_id && session.provider == ProviderKind::Assistant
+            })
+            .context("Assistant session no longer exists")?;
+        let session = &mut state.sessions[index];
+        self.task_store.hydrate(session)?;
+        if tool == AssistantTool::Knowledge && enabled && !self.knowledge.configured() {
+            bail!(tr!("knowledge.add_before_chat"));
+        }
+        let previous = session.assistant_tool_choice_mut(tool).replace(enabled);
+        state.mark_session_dirty(session_id);
+        if let Err(error) = self.task_store.save(&mut state) {
+            *state.sessions[index].assistant_tool_choice_mut(tool) = previous;
+            return Err(error.into());
+        }
+        if let Some(driver) = driver {
+            driver.set_assistant_tool(tool, enabled);
+        }
+        Ok(ResponsePayload::Ack)
+    }
+
+    /// Interrupt outstanding indexing work when the selected service changes
+    fn saved_model_service(
+        &self,
+        service: waku_protocol::settings::ModelService,
+    ) -> ResponsePayload {
+        self.knowledge.service_changed(service.id);
+        ResponsePayload::ModelServiceSaved { service }
+    }
+
     /// Fork a response using only daemon-host state.
     ///
     /// A browser must never reconstruct or persist this operation itself:
@@ -2075,6 +2119,7 @@ fn handle_driver_command(
         | Command::GetTavilyApiKeyStatus
         | Command::SaveTavilyApiKey { .. }
         | Command::SetAssistantWebSearch { .. }
+        | Command::SetAssistantTool { .. }
         | Command::SaveModelService { .. }
         | Command::RemoveModelServiceModels { .. }
         | Command::SetModelServiceEnabled { .. }
@@ -2082,6 +2127,7 @@ fn handle_driver_command(
         | Command::ListModelServiceModels { .. }
         | Command::SyncDraftModelService { .. }
         | Command::SyncModelService { .. }
+        | Command::Knowledge { .. }
         | Command::TranslateText { .. }
         | Command::TranslateWithGoogle { .. }
         | Command::GetSettings

@@ -115,8 +115,8 @@ impl DriverHandle {
         self.inner.clear_assistant_context();
     }
 
-    pub(crate) fn set_assistant_web_search(&self, enabled: bool) {
-        self.inner.set_assistant_web_search(enabled);
+    pub(crate) fn set_assistant_tool(&self, tool: crate::model::AssistantTool, enabled: bool) {
+        self.inner.set_assistant_tool(tool, enabled);
     }
 
     pub fn cancel_computer_use(&self) {
@@ -183,7 +183,7 @@ pub trait DriverControl: Send + Sync {
         false
     }
     fn clear_assistant_context(&self) {}
-    fn set_assistant_web_search(&self, _enabled: bool) {}
+    fn set_assistant_tool(&self, _tool: crate::model::AssistantTool, _enabled: bool) {}
     fn cancel_computer_use(&self) {}
     fn refresh_background_work(&self) {}
     fn stop_background_work(&self, _key: BackgroundWorkKey, _control_id: String) {}

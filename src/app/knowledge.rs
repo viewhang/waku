@@ -1,0 +1,1617 @@
+//! Personal library configuration, document browsing and indexing use the daemon transport
+
+use super::assistants::{assistant_button, assistant_button_base};
+use super::*;
+use crate::ui::ActivationExt;
+use waku_protocol::knowledge::*;
+use waku_protocol::{Command, ResponsePayload};
+mod reader;
+mod row_actions;
+mod settings;
+use reader::{DocumentPreview, PreparedDocument};
+
+pub(super) struct KnowledgePage {
+    root: Entity<TextInput>,
+    /// Folder picker selection staged until its embedding model is confirmed
+    selected_roots: Vec<String>,
+    changing_libraries: bool,
+    /// Model edits for the current library survive opening and cancelling the add form
+    embedding: Option<KnowledgeModel>,
+    adding_library: bool,
+    new_embedding: Option<KnowledgeModel>,
+    status: LibraryStatus,
+    poll: Option<gpui::Task<()>>,
+    tree: Vec<TreeRow>,
+    visible: Vec<usize>,
+    collapsed: HashSet<String>,
+    tree_scroll: gpui::UniformListScrollHandle,
+    tree_focus: FocusHandle,
+    cursor: usize,
+    loaded: Option<(String, String)>,
+    pub(super) open: bool,
+    pending_source: Option<KnowledgeOperation>,
+    after_create: Option<String>,
+    panel: Panel,
+    path_input: Entity<TextInput>,
+    /// The move form and the inline filename editor each target their own document
+    file_target: Option<LibraryDocument>,
+    rename_target: Option<Uuid>,
+    /// Keep the pending rename valid when the same mouse click opens another preview
+    rename_save: Option<gpui::Task<()>>,
+    rename_input: Entity<TextInput>,
+    url_input: Entity<TextInput>,
+    editor: Entity<TextInput>,
+    versions: Vec<LibraryVersion>,
+    edit_revision: Option<String>,
+    edit_original: SharedString,
+
+    revision: u64,
+    busy: bool,
+    error: Option<String>,
+    poll_error: Option<String>,
+    location: Option<PreviewLocation>,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Panel {
+    Preview,
+    Create,
+    CreateFolder,
+    Import,
+    Move,
+    Edit,
+    History,
+}
+
+/// Parents precede their children in the cached flattened tree
+struct TreeRow {
+    path: String,
+    name: String,
+    id: Option<Uuid>,
+    depth: usize,
+}
+
+struct PreviewLocation {
+    id: Uuid,
+    path: String,
+    changed: bool,
+    document: DocumentPreview,
+}
+
+/// Only desktop previews replace a passage request with a parsed full document
+enum LibraryResponse {
+    Command(KnowledgeResult),
+    Preview {
+        id: Uuid,
+        path: String,
+        changed: bool,
+        document: PreparedDocument,
+    },
+}
+
+impl KnowledgePage {
+    pub(super) fn new(window: &mut Window, cx: &mut Context<Waku>) -> Self {
+        let rename_input = cx.new(|cx| TextInput::new(window, cx).submit_on_enter().tab_stop());
+        cx.subscribe_in(&rename_input, window, |this, _, event, window, cx| {
+            if let InputEvent::Submit(name) = event {
+                this.submit_document_rename(name, window, cx);
+            }
+        })
+        .detach();
+        cx.on_blur(&rename_input.read(cx).focus(), window, |this, _, cx| {
+            if this.knowledge.rename_save.is_none() && this.knowledge.rename_target.take().is_some()
+            {
+                cx.notify();
+            }
+        })
+        .detach();
+        let root = cx.new(|cx| {
+            TextInput::new(window, cx)
+                .tab_stop()
+                .placeholder(tr!("knowledge.path"))
+        });
+        cx.subscribe(&root, |this, _, event, cx| {
+            if matches!(event, InputEvent::Edited)
+                && this.settings_page == Some(SettingsPage::Knowledge)
+            {
+                cx.notify();
+            }
+        })
+        .detach();
+        let path_input = cx.new(|cx| {
+            TextInput::new(window, cx)
+                .tab_stop()
+                .submit_on_enter()
+                .placeholder(tr!("knowledge.note_path"))
+        });
+        cx.subscribe(&path_input, |this, _, event, cx| {
+            if matches!(event, InputEvent::Submit(_)) && this.knowledge.panel == Panel::CreateFolder
+            {
+                this.save_library_form(cx);
+            }
+        })
+        .detach();
+        Self {
+            root,
+            adding_library: false,
+            new_embedding: None,
+            selected_roots: Vec::new(),
+            changing_libraries: false,
+            embedding: None,
+            status: Default::default(),
+            poll: None,
+            tree: Vec::new(),
+            visible: Vec::new(),
+            collapsed: HashSet::new(),
+            tree_scroll: gpui::UniformListScrollHandle::new(),
+            tree_focus: cx.focus_handle(),
+            cursor: 0,
+            loaded: None,
+            open: false,
+            pending_source: None,
+            after_create: None,
+            panel: Panel::Preview,
+            file_target: None,
+            rename_target: None,
+            rename_save: None,
+            rename_input,
+            path_input,
+            url_input: cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .tab_stop()
+                    .placeholder("https://…")
+            }),
+            editor: cx.new(|cx| TextInput::new(window, cx).multi_line().tab_stop()),
+            versions: vec![],
+            edit_revision: None,
+            edit_original: "".into(),
+            revision: 0,
+            busy: false,
+            error: None,
+            poll_error: None,
+            location: None,
+        }
+    }
+}
+
+/// The daemon host may use a different path separator from the desktop
+fn library_folder_name(root: &str) -> &str {
+    root.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(root)
+}
+
+/// Keep IPC and directory enumeration off the GPUI thread
+fn request(
+    client: &waku_client::DaemonClient,
+    operation: KnowledgeOperation,
+) -> anyhow::Result<KnowledgeResult> {
+    match client.request(Uuid::nil(), Uuid::nil(), Command::Knowledge { operation })? {
+        ResponsePayload::Knowledge { result } => Ok(result),
+        _ => anyhow::bail!(tr!("assistant.invalid_response")),
+    }
+}
+
+/// Read the selected local file before sending its contents to the current library
+fn local_document_action(source: &Path) -> anyhow::Result<LibraryAction> {
+    use anyhow::Context as _;
+    use std::io::Read;
+
+    let invalid_document = || tr!("knowledge.import_requirements");
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(invalid_document)?;
+    anyhow::ensure!(is_document(source), invalid_document());
+    let metadata = std::fs::metadata(source)?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= MAX_NOTE_BYTES,
+        invalid_document()
+    );
+    let mut content = String::new();
+    std::fs::File::open(source)?
+        .take(MAX_NOTE_BYTES + 1)
+        .read_to_string(&mut content)?;
+    anyhow::ensure!(content.len() as u64 <= MAX_NOTE_BYTES, invalid_document());
+    Ok(LibraryAction::Create {
+        path: name.to_owned(),
+        content,
+        format: None,
+        metadata: None,
+    })
+}
+
+impl Waku {
+    pub(super) fn focus_knowledge(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.knowledge.tree_focus, cx);
+    }
+
+    /// Restore the active pane and its refresh loop when returning from settings
+    pub(super) fn focus_active_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.knowledge.open {
+            self.poll_library(cx);
+            self.focus_knowledge(window, cx);
+        } else {
+            let focus = self
+                .translation_source_focus(cx)
+                .unwrap_or_else(|| self.composer_focus(cx));
+            window.focus(&focus, cx);
+        }
+    }
+
+    pub(super) fn open_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_page = None;
+        self.leave_translation();
+        self.knowledge.open = true;
+        self.poll_library(cx);
+        self.focus_knowledge(window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn close_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.knowledge.open = false;
+        window.focus(&self.composer_focus(cx), cx);
+        cx.notify();
+    }
+
+    /// Poll only while visible and refresh the tree when the catalog revision changes
+    pub(super) fn poll_library(&mut self, cx: &mut Context<Self>) {
+        if self.knowledge.changing_libraries {
+            return;
+        }
+        self.knowledge.poll = Some(cx.spawn(async move |view, cx| {
+            loop {
+                let Ok(Some((client, browse, loaded, pins))) = view.update(cx, |this, _| {
+                    (this.library_visible()).then(|| {
+                        (
+                            this.daemon.client(),
+                            this.settings_page.is_none(),
+                            this.knowledge.loaded.clone(),
+                            this.state.pinned_documents.clone(),
+                        )
+                    })
+                }) else {
+                    return;
+                };
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let KnowledgeResult::Status { status } =
+                            request(&client, KnowledgeOperation::Status)?
+                        else {
+                            anyhow::bail!(tr!("assistant.invalid_response"))
+                        };
+                        let stamp = status
+                            .config
+                            .as_ref()
+                            .map(|c| (c.root.clone(), status.catalog_revision.clone()));
+                        let rows = if browse
+                            && let Some(stamp) =
+                                stamp.filter(|stamp| loaded.as_ref() != Some(stamp))
+                        {
+                            let mut docs = Vec::new();
+                            let mut folders = Vec::new();
+                            loop {
+                                let KnowledgeResult::Documents {
+                                    documents,
+                                    folders: page_folders,
+                                    more,
+                                } = request(
+                                    &client,
+                                    KnowledgeOperation::List {
+                                        offset: docs.len() + folders.len(),
+                                        include_folders: Some(true),
+                                    },
+                                )?
+                                else {
+                                    anyhow::bail!(tr!("assistant.invalid_response"))
+                                };
+                                docs.extend(documents);
+                                folders.extend(page_folders);
+                                if !more {
+                                    break;
+                                }
+                            }
+                            // Another client can switch the active library while its directory is being listed
+                            let KnowledgeResult::Status { status: latest } =
+                                request(&client, KnowledgeOperation::Status)?
+                            else {
+                                anyhow::bail!(tr!("assistant.invalid_response"))
+                            };
+                            if latest.config != status.config || latest.catalog_revision != stamp.1
+                            {
+                                return Ok((latest, None));
+                            }
+                            Some((document_tree(docs, folders, &pins), stamp))
+                        } else {
+                            None
+                        };
+                        Ok::<_, anyhow::Error>((status, rows))
+                    })
+                    .await;
+                let Ok(keep) = view.update(cx, |this, cx| {
+                    if !this.library_visible() {
+                        return false;
+                    }
+                    match result {
+                        Ok((status, rows)) => {
+                            if this.knowledge.poll_error.take().is_some() {
+                                cx.notify();
+                            }
+                            this.apply_library_status(status, false, cx);
+                            if let Some((tree, stamp)) = rows {
+                                let page = &mut this.knowledge;
+                                let first_load = page.loaded.is_none();
+                                // Renaming and pinning can reorder siblings, so follow documents by ID
+                                let cursor_row = page
+                                    .visible
+                                    .get(page.cursor)
+                                    .map(|i| (page.tree[*i].id, page.tree[*i].path.clone()));
+                                page.tree = tree;
+                                page.loaded = Some(stamp);
+                                page.refresh_visible();
+                                if let Some((id, path)) = cursor_row
+                                    && let Some(pos) = page.visible.iter().position(|i| {
+                                        let row = &page.tree[*i];
+                                        row.id == id && (id.is_some() || row.path == path)
+                                    })
+                                {
+                                    page.cursor = pos;
+                                }
+                                if page.panel == Panel::Preview
+                                    && let Some(loc) = page.location.as_mut()
+                                {
+                                    if let Some(row) =
+                                        page.tree.iter().find(|row| row.id == Some(loc.id))
+                                    {
+                                        loc.path.clone_from(&row.path);
+                                    } else {
+                                        page.location = None;
+                                    }
+                                }
+                                // A cross-library preview may finish before its directory arrives
+                                if first_load
+                                    && let Some(id) = page.location.as_ref().map(|loc| loc.id)
+                                {
+                                    page.select_document(id);
+                                }
+                                if let Some(path) = page.after_create.as_ref()
+                                    && let Some(i) =
+                                        page.tree.iter().position(|row| &row.path == path)
+                                {
+                                    page.after_create = None;
+                                    if let Some(id) = page.tree[i].id {
+                                        this.read_library_document(id, cx);
+                                    } else {
+                                        page.reveal_tree_row(i);
+                                    }
+                                }
+                                cx.notify();
+                            }
+                            if this.settings_page.is_none()
+                                && this.knowledge.open
+                                && !this.knowledge.busy
+                                && this.knowledge.rename_save.is_none()
+                            {
+                                if let Some(KnowledgeOperation::Read { id, .. }) =
+                                    &this.knowledge.pending_source
+                                {
+                                    let id = *id;
+                                    // Only opening a citation changes the displayed library
+                                    if this.knowledge.tree.iter().any(|row| row.id == Some(id)) {
+                                        if let Some(read) = this.knowledge.pending_source.take() {
+                                            this.library_action(read, cx);
+                                        }
+                                    } else {
+                                        this.library_action(
+                                            KnowledgeOperation::ActivateDocumentLibrary { id },
+                                            cx,
+                                        );
+                                    }
+                                } else if this.knowledge.location.is_none()
+                                    && this.knowledge.panel == Panel::Preview
+                                    && this.knowledge.error.is_none()
+                                    && let Some(id) = this.knowledge.tree.iter().find_map(|r| r.id)
+                                {
+                                    this.read_library_document(id, cx);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let message = e.to_string();
+                            if this.knowledge.poll_error.as_ref() != Some(&message) {
+                                this.knowledge.poll_error = Some(message);
+                                cx.notify();
+                            }
+                        }
+                    }
+                    true
+                }) else {
+                    return;
+                };
+                if !keep {
+                    return;
+                }
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+            }
+        }));
+    }
+
+    fn apply_library_status(
+        &mut self,
+        status: LibraryStatus,
+        saved_form: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.knowledge.status == status && !saved_form {
+            return;
+        }
+        let page = &mut self.knowledge;
+        let active_changed = page.status.config != status.config;
+        if active_changed {
+            page.revision += 1;
+            page.busy = false;
+            page.loaded = None;
+            page.panel = Panel::Preview;
+            page.file_target = None;
+            page.rename_target = None;
+            page.rename_save = None;
+            page.after_create = None;
+            page.location = None;
+            page.tree.clear();
+            page.visible.clear();
+            page.collapsed.clear();
+            page.cursor = 0;
+            page.error = None;
+        }
+        if active_changed || saved_form {
+            page.embedding = status.config.as_ref().map(|c| c.embedding.clone());
+            if saved_form {
+                page.close_add_form(cx);
+            }
+        }
+        page.status = status;
+        cx.notify();
+    }
+
+    fn choose_library_folder(&mut self, cx: &mut Context<Self>) {
+        if self.knowledge.changing_libraries {
+            return;
+        }
+        let revision = self.knowledge.revision;
+        let pick = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: true,
+            prompt: Some(tr!("knowledge.choose").into()),
+        });
+        cx.spawn(async move |view, cx| {
+            if let Ok(Ok(Some(paths))) = pick.await
+                && !paths.is_empty()
+            {
+                let _ = view.update(cx, |this, cx| {
+                    if this.knowledge.revision != revision
+                        || !this.knowledge.adding()
+                        || this.settings_page != Some(SettingsPage::Knowledge)
+                    {
+                        return;
+                    }
+                    this.knowledge.selected_roots = paths
+                        .into_iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect();
+                    if this.knowledge.selected_roots.len() == 1 {
+                        let root = this.knowledge.selected_roots.pop().unwrap();
+                        this.knowledge
+                            .root
+                            .update(cx, |input, cx| input.set_content(root, cx));
+                    } else {
+                        this.knowledge.root.update(cx, |input, cx| input.clear(cx));
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// A cancelled picker or a superseded library action must never create a document
+    fn import_local_document(&mut self, cx: &mut Context<Self>) {
+        if self.knowledge.busy || self.has_library_draft(cx) {
+            return;
+        }
+        self.knowledge.revision += 1;
+        let revision = self.knowledge.revision;
+        self.knowledge.busy = true;
+        let pick = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(tr!("knowledge.import_document").into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let result: anyhow::Result<_> = async {
+                let Some(source) = pick.await??.and_then(|paths| paths.into_iter().next()) else {
+                    return Ok(None);
+                };
+                cx.background_executor()
+                    .spawn(async move { local_document_action(&source).map(Some) })
+                    .await
+            }
+            .await;
+            let _ = view.update(cx, |this, cx| {
+                if this.knowledge.revision != revision {
+                    return;
+                }
+                this.knowledge.busy = false;
+                if this.knowledge.open && this.settings_page.is_none() {
+                    match result {
+                        Ok(Some(action)) if !this.has_library_draft(cx) => {
+                            this.library_action(KnowledgeOperation::Manage { action }, cx)
+                        }
+                        Err(error) => this.knowledge.error = Some(error.to_string()),
+                        _ => {}
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// A change of document or search must preserve text still waiting to be saved
+    fn has_library_draft(&mut self, cx: &mut Context<Self>) -> bool {
+        let p = &self.knowledge;
+        let dirty = match p.panel {
+            Panel::Edit => p.editor.read(cx).content() != p.edit_original.as_ref(),
+            Panel::Create => {
+                !p.editor.read(cx).content().is_empty()
+                    || !p.path_input.read(cx).content().is_empty()
+            }
+            Panel::CreateFolder => !p.path_input.read(cx).content().is_empty(),
+            Panel::Import => {
+                !p.url_input.read(cx).content().is_empty()
+                    || !p.path_input.read(cx).content().is_empty()
+            }
+            Panel::Move => p.file_target.as_ref().is_some_and(|doc| {
+                p.path_input.read(cx).content() != row_actions::document_parts(&doc.path).0
+            }),
+            _ => false,
+        };
+        if dirty {
+            self.show_info_toast(tr!("knowledge.unsaved"));
+            cx.notify();
+        }
+        dirty
+    }
+
+    /// Each user action owns its response until another action or configuration supersedes it
+    fn library_action(&mut self, operation: KnowledgeOperation, cx: &mut Context<Self>) {
+        if self.knowledge.changing_libraries {
+            return;
+        }
+        let rebuild = matches!(operation, KnowledgeOperation::Rebuild);
+        let citation_id = match &operation {
+            KnowledgeOperation::ActivateDocumentLibrary { id } => Some(*id),
+            _ => None,
+        };
+        let saved_form = matches!(
+            operation,
+            KnowledgeOperation::Configure { .. } | KnowledgeOperation::AddLibraries { .. }
+        );
+        let catalog = saved_form
+            || citation_id.is_some()
+            || matches!(
+                operation,
+                KnowledgeOperation::ActivateLibrary { .. }
+                    | KnowledgeOperation::RemoveLibrary { .. }
+            );
+        if catalog {
+            if self.knowledge.busy
+                || self.knowledge.rename_save.is_some()
+                || self.has_library_draft(cx)
+            {
+                return;
+            }
+            self.knowledge.changing_libraries = true;
+            self.knowledge.poll = None;
+        }
+        let created_folder = match &operation {
+            KnowledgeOperation::Manage {
+                action: LibraryAction::CreateFolder { path },
+            } => Some(path.clone()),
+            _ => None,
+        };
+        let managed_path = match &operation {
+            KnowledgeOperation::DocumentFile {
+                action: DocumentFileAction::Duplicate { to } | DocumentFileAction::Move { to },
+                ..
+            } => Some(to.clone()),
+            KnowledgeOperation::Manage {
+                action:
+                    LibraryAction::Create { path, .. }
+                    | LibraryAction::Update { path, .. }
+                    | LibraryAction::Restore { path, .. }
+                    | LibraryAction::ImportUrl { path, .. },
+            } => Some(path.clone()),
+            _ => None,
+        };
+        let deleted = match &operation {
+            KnowledgeOperation::DocumentFile {
+                id,
+                action: DocumentFileAction::Delete,
+            } => Some(*id),
+            _ => None,
+        };
+        self.knowledge.revision += 1;
+        let revision = self.knowledge.revision;
+        self.knowledge.busy = true;
+        self.knowledge.error = None;
+        let client = self.daemon.client();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if let KnowledgeOperation::Read {
+                        id,
+                        revision,
+                        start,
+                        end,
+                    } = operation
+                    {
+                        return reader::load_preview(&client, id, revision.as_deref(), start, end);
+                    }
+                    request(&client, operation).map(LibraryResponse::Command)
+                })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                let page = &mut this.knowledge;
+                if page.revision != revision {
+                    return;
+                }
+                page.busy = false;
+                page.changing_libraries = false;
+                // A newer click can replace the citation while the daemon is switching libraries
+                let citation = citation_id.and_then(|id| {
+                    page.pending_source.take_if(|op|
+                    matches!(op, KnowledgeOperation::Read { id: pending, .. } if *pending == id)
+                )
+                });
+                match result {
+                    Ok(LibraryResponse::Command(KnowledgeResult::Status { status })) => {
+                        this.apply_library_status(status, saved_form, cx);
+                        if let Some(read) = citation {
+                            this.library_action(read, cx);
+                        }
+                    }
+                    Ok(LibraryResponse::Command(KnowledgeResult::Managed { .. })) => {
+                        page.loaded = None;
+                        page.file_target = None;
+                        page.panel = Panel::Preview;
+                        if let Some(id) = deleted {
+                            if page.location.as_ref().is_some_and(|loc| loc.id == id) {
+                                page.location = None;
+                            }
+                            let pin = this.state.pinned_documents.remove(&id);
+                            let star = this.state.favorite_documents.remove(&id);
+                            if pin || star {
+                                this.save();
+                            }
+                            this.poll_library(cx);
+                            cx.notify();
+                            return;
+                        }
+                        if let Some(path) = created_folder {
+                            page.after_create = Some(path);
+                        } else if let Some(path) = managed_path {
+                            if let Some(id) = page
+                                .tree
+                                .iter()
+                                .find(|row| row.path == path)
+                                .and_then(|r| r.id)
+                            {
+                                this.read_library_document(id, cx);
+                            } else {
+                                page.location = None;
+                                page.after_create = Some(path);
+                            }
+                        }
+                        this.poll_library(cx);
+                    }
+                    Ok(LibraryResponse::Command(KnowledgeResult::Versions { versions })) => {
+                        page.versions = versions;
+                        page.panel = Panel::History;
+                    }
+                    Ok(LibraryResponse::Command(KnowledgeResult::Source {
+                        text,
+                        revision,
+                        ..
+                    })) => {
+                        page.edit_original = text.into();
+                        page.editor.update(cx, |input, cx| {
+                            input.set_content(page.edit_original.clone(), cx)
+                        });
+                        page.edit_revision = Some(revision);
+                        page.panel = Panel::Edit;
+                    }
+                    Ok(LibraryResponse::Preview {
+                        id,
+                        path,
+                        changed,
+                        document,
+                    }) => {
+                        page.location = Some(PreviewLocation {
+                            id,
+                            path,
+                            changed,
+                            document: DocumentPreview::new(document, cx),
+                        });
+                        page.panel = Panel::Preview;
+                        page.select_document(id);
+                    }
+                    Ok(_) => page.error = Some(tr!("assistant.invalid_response")),
+                    Err(e) => page.error = Some(e.to_string()),
+                }
+                if catalog || rebuild {
+                    this.poll_library(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+}
+
+/// Build the complete hierarchy off the render thread so pagination never splits a folder in the UI
+fn document_tree(
+    docs: Vec<LibraryDocument>,
+    folders: Vec<String>,
+    pins: &HashSet<Uuid>,
+) -> Vec<TreeRow> {
+    use std::collections::BTreeMap;
+    #[derive(Default)]
+    struct Folder {
+        dirs: BTreeMap<String, Folder>,
+        pinned: BTreeMap<String, LibraryDocument>,
+        files: BTreeMap<String, LibraryDocument>,
+    }
+    fn flatten(folder: Folder, parent: &str, depth: usize, rows: &mut Vec<TreeRow>) {
+        let file = |(name, doc): (String, LibraryDocument)| TreeRow {
+            path: doc.path,
+            name,
+            id: Some(doc.id),
+            depth,
+        };
+        rows.extend(folder.pinned.into_iter().map(file));
+        for (name, dir) in folder.dirs {
+            let path = if parent.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent}/{name}")
+            };
+            rows.push(TreeRow {
+                path: path.clone(),
+                name,
+                id: None,
+                depth,
+            });
+            flatten(dir, &path, depth + 1, rows);
+        }
+        rows.extend(folder.files.into_iter().map(file));
+    }
+    let mut root = Folder::default();
+    for path in folders {
+        let mut folder = &mut root;
+        for part in path.split('/') {
+            folder = folder.dirs.entry(part.to_owned()).or_default();
+        }
+    }
+    for doc in docs {
+        let mut names = doc.path.split(['/', '\\']).collect::<Vec<_>>();
+        let Some(name) = names.pop().map(str::to_owned) else {
+            continue;
+        };
+        let mut folder = &mut root;
+        for part in names {
+            folder = folder.dirs.entry(part.into()).or_default();
+        }
+        let files = if pins.contains(&doc.id) {
+            &mut folder.pinned
+        } else {
+            &mut folder.files
+        };
+        files.insert(name, doc);
+    }
+    let mut rows = Vec::new();
+    flatten(root, "", 0, &mut rows);
+    rows
+}
+
+impl KnowledgePage {
+    fn refresh_visible(&mut self) {
+        self.visible.clear();
+        let mut closed = None;
+        for (i, row) in self.tree.iter().enumerate() {
+            if closed.is_some_and(|depth| row.depth > depth) {
+                continue;
+            }
+            self.visible.push(i);
+            closed = (row.id.is_none() && self.collapsed.contains(&row.path)).then_some(row.depth);
+        }
+        self.cursor = self.cursor.min(self.visible.len().saturating_sub(1));
+    }
+    fn select_document(&mut self, id: Uuid) {
+        if let Some(i) = self.tree.iter().position(|r| r.id == Some(id)) {
+            self.reveal_tree_row(i);
+        }
+    }
+
+    /// Expand collapsed ancestors before scrolling a newly created folder or document into view
+    fn reveal_tree_row(&mut self, i: usize) {
+        let path = self.tree[i].path.replace('\\', "/");
+        self.collapsed.retain(|p| !Path::new(&path).starts_with(p));
+        self.refresh_visible();
+        if let Some(pos) = self.visible.iter().position(|r| *r == i) {
+            self.cursor = pos;
+            self.tree_scroll
+                .scroll_to_item(pos, gpui::ScrollStrategy::Nearest);
+        }
+    }
+}
+
+impl Waku {
+    fn library_visible(&self) -> bool {
+        self.settings_page == Some(SettingsPage::Knowledge)
+            || (self.settings_page.is_none() && self.knowledge.open)
+    }
+    pub(super) fn library_name(&self) -> String {
+        self.knowledge
+            .status
+            .config
+            .as_ref()
+            .map(|c| library_folder_name(&c.root).to_owned())
+            .unwrap_or_else(|| tr!("knowledge.title"))
+    }
+    fn read_library_document(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        self.library_action(
+            KnowledgeOperation::Read {
+                id,
+                revision: None,
+                start: 0,
+                end: None,
+            },
+            cx,
+        );
+    }
+    /// Resolve an internal citation on the daemon before displaying any note text
+    pub(super) fn open_library_citation(&mut self, target: &str, cx: &mut Context<Self>) -> bool {
+        let Some(op) = waku_protocol::knowledge::citation_operation(target) else {
+            return false;
+        };
+        if self.has_library_draft(cx) {
+            return true;
+        }
+        self.leave_translation();
+        self.settings_page = None;
+        self.knowledge.open = true;
+        self.knowledge.pending_source = Some(op);
+        self.poll_library(cx);
+        cx.notify();
+        true
+    }
+
+    fn select_tree_row(&mut self, pos: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let p = &mut self.knowledge;
+        let Some(&index) = p.visible.get(pos) else {
+            return;
+        };
+        p.cursor = pos;
+        let row = &p.tree[index];
+        let id = row.id;
+        window.focus(&p.tree_focus, cx);
+        if let Some(id) = id {
+            if !self.has_library_draft(cx) {
+                self.read_library_document(id, cx);
+            }
+        } else {
+            let path = row.path.clone();
+            if !p.collapsed.remove(&path) {
+                p.collapsed.insert(path);
+            }
+            p.refresh_visible();
+            cx.notify();
+        }
+    }
+
+    fn tree_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let p = &mut self.knowledge;
+        if p.visible.is_empty() || p.rename_input.read(cx).focus().is_focused(window) {
+            return;
+        }
+        let row = &p.tree[p.visible[p.cursor]];
+        match event.keystroke.key.as_str() {
+            "up" => p.cursor = p.cursor.saturating_sub(1),
+            "down" => p.cursor = (p.cursor + 1).min(p.visible.len() - 1),
+            "home" => p.cursor = 0,
+            "end" => p.cursor = p.visible.len() - 1,
+            "left" if row.id.is_none() && !p.collapsed.contains(&row.path) => {
+                p.collapsed.insert(row.path.clone());
+                p.refresh_visible();
+            }
+            "left" => {
+                if let Some(parent) = p.visible[..p.cursor]
+                    .iter()
+                    .rposition(|i| p.tree[*i].depth < row.depth)
+                {
+                    p.cursor = parent;
+                }
+            }
+            "right" if row.id.is_none() => {
+                if !p.collapsed.remove(&row.path) {
+                    p.cursor = (p.cursor + 1).min(p.visible.len() - 1);
+                }
+                p.refresh_visible();
+            }
+            "enter" | "space" => {
+                let pos = p.cursor;
+                self.select_tree_row(pos, window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            _ => return,
+        }
+        p.tree_scroll
+            .scroll_to_item(p.cursor, gpui::ScrollStrategy::Nearest);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn library_mode(&mut self, mode: Panel, cx: &mut Context<Self>) {
+        if self.knowledge.busy || (mode != Panel::Preview && self.has_library_draft(cx)) {
+            return;
+        }
+        self.knowledge.revision += 1;
+        self.knowledge.error = None;
+        if matches!(mode, Panel::Create | Panel::CreateFolder | Panel::Import) {
+            self.knowledge.path_input.update(cx, |i, cx| {
+                i.set_placeholder(
+                    tr!(if mode == Panel::CreateFolder {
+                        "knowledge.folder_path"
+                    } else {
+                        "knowledge.note_path"
+                    }),
+                    cx,
+                );
+                i.clear(cx);
+            });
+            self.knowledge.url_input.update(cx, |i, cx| i.clear(cx));
+            self.knowledge.editor.update(cx, |i, cx| i.clear(cx));
+        }
+        self.knowledge.panel = mode;
+        self.knowledge.file_target = None;
+        cx.notify();
+    }
+
+    fn save_library_form(&mut self, cx: &mut Context<Self>) {
+        if self.knowledge.busy {
+            return;
+        }
+        let p = &self.knowledge;
+        let path = p.path_input.read(cx).content().trim().to_owned();
+        if p.panel == Panel::Move {
+            self.save_file_destination(cx);
+            return;
+        }
+        let action = match p.panel {
+            Panel::CreateFolder => LibraryAction::CreateFolder { path },
+            Panel::Create => LibraryAction::Create {
+                path,
+                content: p.editor.read(cx).content().to_owned(),
+                format: None,
+                metadata: None,
+            },
+            Panel::Import => LibraryAction::ImportUrl {
+                path,
+                url: p.url_input.read(cx).content().trim().into(),
+                options: Default::default(),
+            },
+            Panel::Edit => {
+                let Some(loc) = &p.location else { return };
+                LibraryAction::Update {
+                    path: loc.path.clone(),
+                    content: p.editor.read(cx).content().into(),
+                    revision: p.edit_revision.clone(),
+                    mode: UpdateMode::Replace,
+                }
+            }
+            _ => return,
+        };
+        self.library_action(KnowledgeOperation::Manage { action }, cx);
+    }
+
+    /// Start a manual index rebuild from the knowledge settings
+    fn library_reindex_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = Theme::current(cx);
+        assistant_button_base("library-reindex", tr!("knowledge.rebuild"), theme).when_else(
+            self.knowledge.busy,
+            |button| button.opacity(0.5),
+            |button| {
+                button
+                    .hover(|style| style.bg(theme.overlay))
+                    .on_activation(cx, |this, _, cx| {
+                        if !this.knowledge.busy && !this.knowledge.status.indexing {
+                            this.library_action(KnowledgeOperation::Rebuild, cx);
+                        }
+                    })
+            },
+        )
+    }
+
+    pub(super) fn render_library_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let menu = self.menu_handle("library-menu", cx);
+        let name = self.library_name();
+        let trigger = MenuChip::new("library-name")
+            .label(name)
+            .selected(menu.is_open());
+        let weak = cx.weak_entity();
+        dropdown_menu(
+            trigger,
+            "library-menu",
+            &menu,
+            MenuAlign::BelowLeft,
+            move |cx| {
+                let weak = weak.clone();
+                let mut items = weak
+                    .read_with(cx, |t, _| {
+                        t.knowledge
+                            .status
+                            .libraries
+                            .iter()
+                            .map(|library| {
+                                let root = library.root.clone();
+                                let active = t
+                                    .knowledge
+                                    .status
+                                    .config
+                                    .as_ref()
+                                    .is_some_and(|c| c.root == root);
+                                let weak = weak.clone();
+                                let name = library_folder_name(&root);
+                                let label = format!("{name}  ·  {root}");
+                                MenuItem::new(label, move |_, cx| {
+                                    let _ = weak.update(cx, |t, cx| {
+                                        t.library_action(
+                                            KnowledgeOperation::ActivateLibrary {
+                                                root: root.clone(),
+                                            },
+                                            cx,
+                                        );
+                                    });
+                                })
+                                .selected(active)
+                                .disabled(active)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if !items.is_empty() {
+                    items.push(MenuItem::Separator);
+                }
+                items.push(MenuItem::new(tr!("knowledge.configure"), move |_, cx| {
+                    let _ = weak.update(cx, |t, cx| {
+                        t.open_settings_page(SettingsPage::Knowledge, cx)
+                    });
+                }));
+                items
+            },
+        )
+        .into_any_element()
+    }
+
+    /// Keep creation and import actions beside the directory heading
+    fn library_directory_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::current(cx);
+        let menu = self.menu_handle("library-directory-actions", cx);
+        let weak = cx.weak_entity();
+        dropdown_menu(
+            icon_button("library-add", "icons/plus.svg", theme)
+                .focus_visible(|style| style.border_1().border_color(theme.accent))
+                .when(menu.is_open(), |el| el.bg(theme.overlay_strong))
+                .tooltip(Tooltip::text(tr!("knowledge.add"))),
+            "library-directory-actions",
+            &menu,
+            MenuAlign::BelowLeft,
+            move |_| {
+                let create = weak.clone();
+                let folder = weak.clone();
+                let file = weak.clone();
+                let url = weak.clone();
+                vec![
+                    MenuItem::new(tr!("knowledge.new"), move |_, cx| {
+                        let _ = create.update(cx, |this, cx| this.library_mode(Panel::Create, cx));
+                    })
+                    .icon("icons/file.svg"),
+                    MenuItem::new(tr!("knowledge.new_folder"), move |window, cx| {
+                        let _ = folder.update(cx, |this, cx| {
+                            this.library_mode(Panel::CreateFolder, cx);
+                            if this.knowledge.panel == Panel::CreateFolder {
+                                let focus = this.knowledge.path_input.read(cx).focus();
+                                window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+                            }
+                        });
+                    })
+                    .icon("icons/folder.svg"),
+                    MenuItem::Separator,
+                    MenuItem::new(tr!("knowledge.import_document"), move |_, cx| {
+                        let _ = file.update(cx, |this, cx| this.import_local_document(cx));
+                    })
+                    .icon("icons/file-bottom-left-arrow.svg"),
+                    MenuItem::new(tr!("knowledge.import"), move |_, cx| {
+                        let _ = url.update(cx, |this, cx| this.library_mode(Panel::Import, cx));
+                    })
+                    .icon("icons/globe.svg"),
+                ]
+            },
+        )
+    }
+
+    /// The overflow menu belongs to the document currently shown in the preview
+    fn library_document_menu(&self, path: String, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::current(cx);
+        let menu = self.menu_handle("library-document-actions", cx);
+        let weak = cx.weak_entity();
+        dropdown_menu(
+            icon_button("library-document-more", "icons/ellipsis.svg", theme)
+                .focus_visible(|style| style.border_1().border_color(theme.accent))
+                .when(menu.is_open(), |el| el.bg(theme.overlay_strong))
+                .tooltip(Tooltip::text(tr!("knowledge.document_actions"))),
+            "library-document-actions",
+            &menu,
+            MenuAlign::BelowRight,
+            move |_| {
+                let item = |label, icon, op: KnowledgeOperation| {
+                    let weak = weak.clone();
+                    MenuItem::new(label, move |_, cx| {
+                        let _ = weak.update(cx, |this, cx| this.library_action(op.clone(), cx));
+                    })
+                    .icon(icon)
+                };
+                vec![
+                    item(
+                        tr!("knowledge.edit"),
+                        "icons/pencil.svg",
+                        KnowledgeOperation::Source { path: path.clone() },
+                    ),
+                    MenuItem::Separator,
+                    item(
+                        tr!("knowledge.history"),
+                        "icons/rewind.svg",
+                        KnowledgeOperation::History { path: path.clone() },
+                    ),
+                ]
+            },
+        )
+    }
+
+    pub(super) fn render_knowledge_workspace(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = &self.knowledge;
+        let theme = Theme::current(cx);
+        let tree = gpui::uniform_list(
+            "library-tree",
+            p.visible.len(),
+            cx.processor(|this, range: Range<usize>, window, cx| {
+                let tree_focused = this.knowledge.tree_focus.is_focused(window);
+                let keyboard_navigation = window.last_input_was_keyboard();
+                range
+                    .map(|pos| {
+                        let p = &this.knowledge;
+                        let r = &p.tree[p.visible[pos]];
+                        let is_dir = r.id.is_none();
+                        let expanded = is_dir && !p.collapsed.contains(&r.path);
+                        let chosen = r.id.is_some() && p.location.as_ref().map(|l| l.id) == r.id;
+                        let cursor = tree_focused && pos == p.cursor;
+                        let renaming = r.id.is_some() && p.rename_target == r.id;
+                        let theme = Theme::current(cx);
+                        let group: SharedString = format!("library-row-{pos}").into();
+                        let label = if renaming {
+                            TextField::new("knowledge-rename-field", p.rename_input.clone())
+                                .flex_1()
+                                .min_w_0()
+                                .on_mouse_down_out(cx.listener(Self::click_outside_document_rename))
+                                .on_action(cx.listener(
+                                    |this, _: &crate::input::Clear, window, cx| {
+                                        this.focus_knowledge(window, cx);
+                                    },
+                                ))
+                                .into_any_element()
+                        } else {
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(r.name.clone())
+                                .into_any_element()
+                        };
+                        div()
+                            .id(("knowledge-entry", pos))
+                            .group(group.clone())
+                            .h(px(29.))
+                            .w_full()
+                            .pl(px(8. + 14. * r.depth.min(12) as f32))
+                            .pr(px(6.))
+                            .flex()
+                            .gap(px(5.))
+                            .items_center()
+                            .rounded(px(5.))
+                            .cursor_default()
+                            // A filled row marks selection, with heavier text for the keyboard cursor
+                            .when(chosen || cursor, |e| e.bg(theme.sidebar_item_background))
+                            .when(cursor && keyboard_navigation, |e| {
+                                e.bg(theme.overlay_strong).font_weight(FontWeight::SEMIBOLD)
+                            })
+                            .when(!chosen && !cursor, |e| e.hover(|s| s.bg(theme.overlay)))
+                            .child(div().w(px(10.)).flex_none().when(is_dir, |e| {
+                                e.child(icon(
+                                    if expanded {
+                                        "icons/chevron-down.svg"
+                                    } else {
+                                        "icons/chevron-right.svg"
+                                    },
+                                    10.,
+                                    theme.text_tertiary,
+                                ))
+                            }))
+                            .child(icon(
+                                if is_dir {
+                                    if expanded {
+                                        "icons/folder-open.svg"
+                                    } else {
+                                        "icons/folder.svg"
+                                    }
+                                } else {
+                                    "icons/file.svg"
+                                },
+                                14.,
+                                theme.text_secondary,
+                            ))
+                            .child(label)
+                            .when_some(r.id, |row, id| {
+                                row.when(this.state.favorite_documents.contains(&id), |e| {
+                                    e.child(icon(
+                                        "icons/star-filled.svg",
+                                        12.,
+                                        theme.text_secondary,
+                                    ))
+                                })
+                                .when(!renaming, |row| {
+                                    this.with_library_row_menu(
+                                        row, id, &r.path, group, chosen, window, cx,
+                                    )
+                                })
+                            })
+                            .when(!renaming, |row| {
+                                row.on_click(cx.listener(move |this, _, window, cx| {
+                                    this.select_tree_row(pos, window, cx)
+                                }))
+                            })
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(&p.tree_scroll)
+        .flex_1()
+        .min_h_0();
+        let left = div()
+            .w(gpui::relative(0.30))
+            .min_w(px(140.))
+            .max_w(px(280.))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(theme.border)
+            .bg(theme.canvas)
+            .child(
+                div()
+                    .h(px(36.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(4.))
+                    .text_color(theme.text_secondary)
+                    .child(tr!("knowledge.tree"))
+                    .when(p.status.config.is_some(), |row| {
+                        row.child(self.library_directory_menu(cx))
+                    }),
+            )
+            .child(
+                div()
+                    .id("library-tree-focus")
+                    .track_focus(&p.tree_focus)
+                    .tab_index(0)
+                    .tab_stop(true)
+                    .flex_1()
+                    .min_h_0()
+                    .px(px(5.))
+                    .flex()
+                    .flex_col()
+                    .on_key_down(cx.listener(Self::tree_key))
+                    .child(tree),
+            );
+        let status = &p.status;
+        let working = p.busy || p.rename_save.is_some();
+        let footer = div()
+            .h(px(32.))
+            .flex_none()
+            .border_t_1()
+            .border_color(theme.border)
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .text_color(theme.text_secondary)
+            .when(status.indexing, |row| {
+                let percent = status
+                    .ready
+                    .saturating_mul(100)
+                    .checked_div(status.total)
+                    .unwrap_or(0)
+                    .min(100);
+                row.child(tr!(
+                    "knowledge.indexing",
+                    ready = status.ready,
+                    total = status.total
+                ))
+                .child(
+                    div()
+                        .w(px(76.))
+                        .h(px(4.))
+                        .rounded_full()
+                        .bg(theme.overlay_strong)
+                        .child(
+                            div()
+                                .h_full()
+                                .rounded_full()
+                                .w(gpui::relative(percent as f32 / 100.))
+                                .bg(theme.accent),
+                        ),
+                )
+                .child(format!("{percent}%"))
+            })
+            .when(working, |e| e.child(tr!("knowledge.working")));
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(theme.border)
+            .text_size(sp(12.5))
+            .text_color(theme.text)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(left)
+                    .child(self.library_detail(cx)),
+            )
+            .children(
+                p.error
+                    .as_ref()
+                    .or(p.poll_error.as_ref())
+                    .or(status.error.as_ref())
+                    .map(|e| {
+                        div()
+                            .px(px(12.))
+                            .py(px(5.))
+                            .text_color(theme.danger)
+                            .child(e.clone())
+                    }),
+            )
+            .when(
+                status.config.is_some() && (status.indexing || working),
+                |pane| pane.child(footer),
+            )
+            .into_any_element()
+    }
+
+    fn library_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = &self.knowledge;
+        let theme = Theme::current(cx);
+        let base = div()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .bg(theme.surface);
+        if p.status.config.is_none() {
+            return base
+                .items_center()
+                .justify_center()
+                .child(assistant_button(
+                    "library-setup",
+                    tr!("knowledge.configure"),
+                    cx,
+                    |t, _, cx| t.open_settings_page(SettingsPage::Knowledge, cx),
+                ))
+                .into_any_element();
+        }
+        if matches!(
+            p.panel,
+            Panel::Create | Panel::CreateFolder | Panel::Edit | Panel::Import | Panel::Move
+        ) {
+            let mut editor = base.p(px(14.)).gap(px(8.)).child(tr!(match p.panel {
+                Panel::Create => "knowledge.new",
+                Panel::CreateFolder => "knowledge.new_folder",
+                Panel::Import => "knowledge.import",
+                Panel::Move => "knowledge.move",
+                _ => "knowledge.edit",
+            }));
+            if let Some(doc) = &p.file_target {
+                editor = editor
+                    .child(doc.path.clone())
+                    .child(tr!("knowledge.target_folder"));
+            }
+            if p.panel != Panel::Edit {
+                editor = editor.child(TextField::new("note-path", p.path_input.clone()).w_full());
+            }
+            if p.panel == Panel::Import {
+                editor = editor.child(TextField::new("article-url", p.url_input.clone()).w_full());
+            } else if matches!(p.panel, Panel::Create | Panel::Edit) {
+                editor = editor.child(
+                    div()
+                        .id("note-editor")
+                        .border_1()
+                        .border_color(theme.border)
+                        .rounded(px(6.))
+                        .p(px(10.))
+                        .overflow_y_scroll()
+                        .flex_1()
+                        .min_h_0()
+                        .child(p.editor.clone()),
+                );
+            }
+            return editor
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.))
+                        .child(assistant_button(
+                            "save-note",
+                            tr!("knowledge.save"),
+                            cx,
+                            |t, _, cx| t.save_library_form(cx),
+                        ))
+                        .child(assistant_button(
+                            "cancel-note",
+                            tr!("settings.back"),
+                            cx,
+                            |t, _, cx| t.library_mode(Panel::Preview, cx),
+                        )),
+                )
+                .into_any_element();
+        }
+        let Some(loc) = &p.location else {
+            return base.into_any_element();
+        };
+        if p.panel == Panel::History {
+            let mut history = base
+                .id("note-versions")
+                .overflow_y_scroll()
+                .p(px(12.))
+                .gap(px(6.))
+                .child(tr!("knowledge.history"))
+                .child(assistant_button(
+                    "leave-history",
+                    tr!("settings.back"),
+                    cx,
+                    |t, _, cx| t.library_mode(Panel::Preview, cx),
+                ));
+            if p.versions.is_empty() {
+                history = history.child(tr!("knowledge.no_versions"));
+            }
+            for (i, v) in p.versions.iter().enumerate() {
+                let version = v.version.clone();
+                let path = loc.path.clone();
+                history = history.child(assistant_button(
+                    ("restore-note", i),
+                    tr!("knowledge.restore", date = v.saved_at.as_str()),
+                    cx,
+                    move |t, _, cx| {
+                        t.library_action(
+                            KnowledgeOperation::Manage {
+                                action: LibraryAction::Restore {
+                                    path: path.clone(),
+                                    version: version.clone(),
+                                },
+                            },
+                            cx,
+                        )
+                    },
+                ));
+            }
+            return history.into_any_element();
+        }
+        let mut body = base.child(
+            div()
+                .h(px(36.))
+                .px(px(12.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(icon("icons/file.svg", 14., theme.text_tertiary))
+                .child(div().flex_1().min_w_0().truncate().child(loc.path.clone()))
+                .child(self.library_document_menu(loc.path.clone(), cx)),
+        );
+        if loc.changed {
+            body = body.child(tr!("knowledge.changed"));
+        }
+        body.child(loc.document.render(
+            MarkdownMetrics::document(self.state.ui_font_size, self.state.code_font_size),
+            self.state.render_math,
+            cx,
+        ))
+        .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pinning promotes documents within their own directory while preserving the hierarchy
+    #[test]
+    fn document_marks_order_pinned_siblings() {
+        let docs: Vec<_> = ["a.md", "folder/a.md", "folder/z.md", "z.md"]
+            .into_iter()
+            .map(|path| LibraryDocument {
+                id: Uuid::new_v4(),
+                path: path.into(),
+            })
+            .collect();
+        let pins = HashSet::from([docs[2].id, docs[3].id]);
+        let rows = document_tree(docs, vec!["folder/empty".into(), "folder".into()], &pins);
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            [
+                "z.md",
+                "folder",
+                "folder/z.md",
+                "folder/empty",
+                "folder/a.md",
+                "a.md"
+            ]
+        );
+    }
+
+    /// Local import keeps the source bytes and sends only a filename to the daemon
+    #[test]
+    fn local_document_import_preserves_name_and_text() -> anyhow::Result<()> {
+        let directory = std::env::temp_dir().join(format!("waku-import-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory)?;
+        let name = "会议纪要.MD";
+        let source = directory.join(name);
+        let text = "---\r\ntags: [会议]\r\n---\r\n# 纪要\r\n";
+        std::fs::write(&source, text)?;
+        let action = local_document_action(&source)?;
+        assert!(
+            matches!(action, LibraryAction::Create { path, content, metadata: None, format: None }
+            if path == name && content == text)
+        );
+        let unsupported = directory.join("会议纪要.pdf");
+        std::fs::rename(&source, &unsupported)?;
+        assert!(local_document_action(&unsupported).is_err());
+        std::fs::remove_file(unsupported)?;
+        std::fs::remove_dir(directory)?;
+        Ok(())
+    }
+}

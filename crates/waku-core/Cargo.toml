@@ -15,16 +15,22 @@ bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5"
 dirs = "6.0"
+dom_query = "0.28"
+cap-std = "4"
+quick-xml = "0.39"
+pulldown-cmark = "0.13"
 eventsource-stream = "0.2"
 nucleo-matcher = "0.3"
+notify = "8.2"
 parking_lot = "0.12"
 rust-i18n = "4"
 rig = { package = "rig-core", version = "=0.37.0", default-features = false, features = ["reqwest", "rustls"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "multipart", "rustls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
-serde-saphyr = { version = "0.0.29", default-features = false, features = ["deserialize"] }
+serde-saphyr = { version = "0.0.29", default-features = false, features = ["deserialize", "serialize"] }
 serde_json = "1.0"
+sha2 = "0.10"
 smol = "2"
 subtle = "2"
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
@@ -51,4 +57,5 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
+tempfile = "3"
 waku-client = { path = "../waku-client" }

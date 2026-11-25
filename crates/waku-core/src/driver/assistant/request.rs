@@ -214,16 +214,20 @@ impl Chat<'_> {
         prompt: Message,
         events: &DriverEventSender,
     ) -> Result<ModelReply> {
-        self.send_with_search(http, prompt, events, None).await
+        Ok(self
+            .send_with_tools(http, prompt, events, None, None)
+            .await?
+            .0)
     }
 
-    pub async fn send_with_search(
+    pub async fn send_with_tools(
         self,
         http: &reqwest::Client,
         prompt: Message,
         events: &DriverEventSender,
         tavily: Option<&search::Tavily<'_>>,
-    ) -> Result<ModelReply> {
+        library: Option<&super::library_tools::AgentLibrary>,
+    ) -> Result<(ModelReply, Vec<Message>)> {
         let base = self.url.as_str().trim_end_matches('/');
         let model = self.model;
         let http = AssistantHttp::new(http.clone(), self.key.is_empty(), self.options.protocol);
@@ -234,8 +238,14 @@ impl Chat<'_> {
                     .base_url(base)
                     .http_client(http)
                     .build()?;
-                self.stream(client.completion_model(model), prompt, events, tavily)
-                    .await
+                self.stream(
+                    client.completion_model(model),
+                    prompt,
+                    events,
+                    tavily,
+                    library,
+                )
+                .await
             }
             ModelProtocol::OpenAiResponses => {
                 let client = openai::Client::builder()
@@ -243,8 +253,14 @@ impl Chat<'_> {
                     .base_url(base)
                     .http_client(http)
                     .build()?;
-                self.stream(client.completion_model(model), prompt, events, tavily)
-                    .await
+                self.stream(
+                    client.completion_model(model),
+                    prompt,
+                    events,
+                    tavily,
+                    library,
+                )
+                .await
             }
             ModelProtocol::AnthropicMessages => {
                 let client = anthropic::Client::builder()
@@ -252,8 +268,14 @@ impl Chat<'_> {
                     .base_url(base.trim_end_matches("/v1"))
                     .http_client(http)
                     .build()?;
-                self.stream(client.completion_model(model), prompt, events, tavily)
-                    .await
+                self.stream(
+                    client.completion_model(model),
+                    prompt,
+                    events,
+                    tavily,
+                    library,
+                )
+                .await
             }
             ModelProtocol::Gemini => {
                 let model = self.model.strip_prefix("models/").unwrap_or(self.model);
@@ -268,8 +290,14 @@ impl Chat<'_> {
                     .base_url(base.trim_end_matches("/v1beta").trim_end_matches("/v1"))
                     .http_client(http)
                     .build()?;
-                self.stream(client.completion_model(model), prompt, events, tavily)
-                    .await
+                self.stream(
+                    client.completion_model(model),
+                    prompt,
+                    events,
+                    tavily,
+                    library,
+                )
+                .await
             }
         }
     }
@@ -280,58 +308,76 @@ impl Chat<'_> {
         prompt: Message,
         events: &DriverEventSender,
         tavily: Option<&search::Tavily<'_>>,
-    ) -> Result<ModelReply> {
-        let original = tavily.map(|_| prompt.clone());
-        let ChatRound {
-            mut reply,
-            mut used,
-            continuation,
-        } = self
-            .stream_round(
-                &model,
-                prompt,
-                &[],
-                tavily.map(|_| ToolChoice::Auto),
-                events,
-            )
-            .await?;
-
-        if let (Some(tavily), Some(original), Some((assistant, calls))) =
-            (tavily, original, continuation)
-        {
-            let (results, sources) = search_results(tavily, calls, events).await?;
-            if !reply.text.trim().is_empty() {
-                reply.text.push_str("\n\n");
-                let _ = events.send(DriverEvent::TextDelta("\n\n".into()));
-            }
-            let follow_up = self
+        library: Option<&super::library_tools::AgentLibrary>,
+    ) -> Result<(ModelReply, Vec<Message>)> {
+        let mut definitions = library
+            .map(|l| l.definitions(self.options.protocol == ModelProtocol::OpenAiResponses))
+            .unwrap_or_default();
+        if tavily.is_some() {
+            definitions.push(search::tool());
+        }
+        let mut history = Vec::new();
+        let mut prompt = prompt;
+        let mut reply = ModelReply {
+            text: String::new(),
+            tokens: TokenTotals::default(),
+        };
+        let mut web_sources = None;
+        let mut final_answer = String::new();
+        // A library turn can search, read several notes, then edit before composing the final answer
+        let rounds = if library.is_some() { 8 } else { 1 };
+        let mut used = 0;
+        for round in 0..=rounds {
+            let choice = (!definitions.is_empty()).then_some(if round == rounds {
+                ToolChoice::None
+            } else {
+                ToolChoice::Auto
+            });
+            let result = self
                 .stream_round(
                     &model,
-                    results,
-                    &[original, assistant],
-                    Some(ToolChoice::None),
+                    prompt.clone(),
+                    &history,
+                    &definitions,
+                    choice,
                     events,
                 )
                 .await?;
-            if follow_up.reply.text.trim().is_empty() {
-                bail!(tr!("assistant.search_reply_missing"));
-            }
-            used = follow_up.used;
-            reply.tokens.add(&follow_up.reply.tokens);
-            reply.text.push_str(&follow_up.reply.text);
-            if !sources.is_empty() {
-                let links = search::links(&sources);
-                reply.text.push_str(&links);
-                let _ = events.send(DriverEvent::TextDelta(links));
+            used = result.used;
+            reply.tokens.add(&result.reply.tokens);
+            reply.text.push_str(&result.reply.text);
+            let Some((assistant, calls)) = result.continuation else {
+                if round > 0 && result.reply.text.trim().is_empty() {
+                    bail!(tr!("assistant.search_reply_missing"));
+                }
+                final_answer = result.reply.text;
+                break;
+            };
+            let results = tool_results(tavily, library, calls, &mut web_sources, events).await?;
+            history.push(prompt);
+            history.push(assistant);
+            prompt = results;
+            if !result.reply.text.trim().is_empty() {
+                reply.text.push_str("\n\n");
+                let _ = events.send(DriverEvent::TextDelta("\n\n".into()));
             }
         }
-
-        // The meter reflects the latest model request while billing includes both rounds
+        if let Some(sources) = web_sources.filter(|s| !s.is_empty()) {
+            let links = search::links(&sources);
+            final_answer.push_str(&links);
+            reply.text.push_str(&links);
+            let _ = events.send(DriverEvent::TextDelta(links));
+        }
         let _ = events.send(DriverEvent::UsageUpdated {
             context_tokens: (used > 0).then_some(used),
             context_window: self.options.context_window.map(u64::from),
         });
-        Ok(reply)
+        // Keep actual tool calls and their results in order for later requests in this session
+        history.push(prompt);
+        if !final_answer.is_empty() {
+            history.push(Message::assistant(final_answer));
+        }
+        Ok((reply, history))
     }
 
     async fn stream_round(
@@ -339,6 +385,7 @@ impl Chat<'_> {
         model: &impl CompletionModel,
         prompt: Message,
         extra_history: &[Message],
+        tools: &[rig::completion::ToolDefinition],
         tool_choice: Option<ToolChoice>,
         events: &DriverEventSender,
     ) -> Result<ChatRound> {
@@ -348,10 +395,9 @@ impl Chat<'_> {
             .flatten()
             .min();
         let mut input = self.preamble.len();
-        let tool = tool_choice.as_ref().map(|_| search::tool());
         let history = self.history.iter().chain(extra_history);
         if let Some(limit) = limit {
-            if let Some(tool) = &tool {
+            for tool in tools {
                 input += serde_json::to_vec(tool)?.len();
             }
             for message in history.clone().chain(std::iter::once(&prompt)) {
@@ -373,8 +419,8 @@ impl Chat<'_> {
         let completion_limit = self.options.protocol == ModelProtocol::OpenAiChat
             && (self.options.reasoning || self.url.host_str() == Some("api.openai.com"));
         let mut params = protocol_parameters(self.options, self.model, output, completion_limit)?;
-        let can_search = matches!(tool_choice, Some(ToolChoice::Auto));
-        if can_search
+        let can_call = matches!(tool_choice, Some(ToolChoice::Auto));
+        if can_call
             && self.options.protocol == ModelProtocol::OpenAiResponses
             && self.options.reasoning
         {
@@ -392,8 +438,11 @@ impl Chat<'_> {
         if !self.preamble.is_empty() {
             request = request.preamble(self.preamble.to_owned());
         }
-        if let (Some(tool), Some(choice)) = (tool, tool_choice) {
-            request = request.tool(tool).tool_choice(choice);
+        if let Some(choice) = tool_choice {
+            for tool in tools {
+                request = request.tool(tool.clone());
+            }
+            request = request.tool_choice(choice);
         }
         let mut stream = model.stream(request.build()).await?;
         let mut answer = String::new();
@@ -439,7 +488,15 @@ impl Chat<'_> {
                     content: ToolCallDeltaContent::Name(name),
                     ..
                 } if !name.is_empty() => {
-                    if can_search && name == search::NAME {
+                    if can_call
+                        && tools.iter().any(|tool| tool.name == name)
+                        && name != search::NAME
+                    {
+                        report_library(events, internal_call_id, &name, None, None);
+                    } else if can_call
+                        && name == search::NAME
+                        && tools.iter().any(|tool| tool.name == name)
+                    {
                         report_search(events, internal_call_id, None, None);
                     } else {
                         report_tool_request(events, internal_call_id, &name, None);
@@ -449,7 +506,11 @@ impl Chat<'_> {
                     tool_call,
                     internal_call_id,
                 } => {
-                    if !can_search || tool_call.function.name != search::NAME {
+                    if !can_call
+                        || !tools
+                            .iter()
+                            .any(|tool| tool.name == tool_call.function.name)
+                    {
                         report_tool_request(
                             events,
                             internal_call_id.clone(),
@@ -457,7 +518,7 @@ impl Chat<'_> {
                             Some(tool_call.function.arguments.to_string()),
                         );
                     }
-                    if can_search {
+                    if can_call {
                         calls.push((tool_call, internal_call_id));
                     }
                 }
@@ -471,7 +532,7 @@ impl Chat<'_> {
             .max(tokens.total());
         let continuation = if calls
             .iter()
-            .any(|(call, _)| call.function.name == search::NAME)
+            .any(|(call, _)| tools.iter().any(|tool| tool.name == call.function.name))
         {
             // Rig builds its complete assistant message when the stream closes
             while let Some(item) = stream.next().await {
@@ -519,16 +580,41 @@ impl Chat<'_> {
     }
 }
 
-/// Execute one Tavily call and complete every provider tool call before asking for the answer
-async fn search_results(
-    tavily: &search::Tavily<'_>,
+/// Answer every provider-issued tool call with its original ID before resuming the turn
+async fn tool_results(
+    tavily: Option<&search::Tavily<'_>>,
+    library: Option<&super::library_tools::AgentLibrary>,
     calls: Vec<(ToolCall, String)>,
+    sources: &mut Option<Vec<search::Source>>,
     events: &DriverEventSender,
-) -> Result<(Message, Vec<search::Source>)> {
-    let mut sources = None;
+) -> Result<Message> {
     let mut results = Vec::new();
     for (call, internal_id) in calls {
-        let output = if call.function.name != search::NAME {
+        let name = &call.function.name;
+        let output = if name != search::NAME
+            && let Some(library) = library
+        {
+            report_library(
+                events,
+                internal_id.clone(),
+                name,
+                Some(call.function.arguments.to_string()),
+                None,
+            );
+            let value = library.call(name, call.function.arguments).await;
+            let (failed, text) = match value {
+                Ok(v) => (false, v),
+                Err(e) => (true, format!("Tool error: {e}")),
+            };
+            report_library(
+                events,
+                internal_id,
+                name,
+                None,
+                Some((failed, text.chars().take(900).collect())),
+            );
+            text
+        } else if name != search::NAME || tavily.is_none() {
             tr!("assistant.tool_unavailable")
         } else if sources.is_some() {
             let message = tr!("assistant.search_limit");
@@ -544,7 +630,12 @@ async fn search_results(
                 None,
             );
             let found = match query {
-                Ok(query) => tavily.search(&query.query).await,
+                Ok(query) => {
+                    tavily
+                        .expect("web tool was offered")
+                        .search(&query.query)
+                        .await
+                }
                 Err(error) => Err(error),
             };
             let found = match found {
@@ -564,7 +655,7 @@ async fn search_results(
                     tr!("assistant.search_result_count", count = found.len()),
                 )),
             );
-            sources = Some(found);
+            *sources = Some(found);
             output
         };
         results.push(UserContent::ToolResult(message::ToolResult {
@@ -573,12 +664,26 @@ async fn search_results(
             content: rig::OneOrMany::one(ToolResultContent::text(output)),
         }));
     }
-    Ok((
-        Message::User {
-            content: rig::OneOrMany::many(results)?,
-        },
-        sources.unwrap_or_default(),
-    ))
+    Ok(Message::User {
+        content: rig::OneOrMany::many(results)?,
+    })
+}
+
+/// Keep tool progress and results attached to the provider's activity in the ordinary transcript
+fn report_library(
+    events: &DriverEventSender,
+    id: String,
+    name: &str,
+    args: Option<String>,
+    result: Option<(bool, String)>,
+) {
+    let mut item = ActivityItem::new(Some(id), ActivityKind::Tool, name, None, result.is_some())
+        .with_tool_name(Some(name))
+        .with_arguments(args);
+    if let Some((failed, message)) = result {
+        item = item.with_failed(failed).with_output(Some(message));
+    }
+    let _ = events.send(DriverEvent::RichActivity(item));
 }
 
 fn report_search(
@@ -758,10 +863,7 @@ impl Operation<'_> {
             },
             ModelPurpose::CatalogOnly => bail!(tr!("service_model.unsupported_operation")),
         };
-        let response = bearer_auth(http.post(format!("{base}{endpoint}")), self.key)
-            .json(&payload)
-            .send()
-            .await?;
+        let response = post_model_json(http, self.url, self.key, endpoint, &payload).await?;
         if !label.is_empty() {
             return image_result(http, response, store, events, label).await;
         }
@@ -862,7 +964,22 @@ fn operation_tokens(value: &Value) -> TokenTotals {
     }
 }
 
-async fn read_json(response: reqwest::Response) -> Result<Value> {
+/// Direct model operations and the library share endpoint construction and bearer authentication
+pub(super) async fn post_model_json(
+    http: &reqwest::Client,
+    url: &Url,
+    key: &str,
+    operation: &str,
+    payload: &Value,
+) -> Result<reqwest::Response> {
+    let endpoint = format!("{}{operation}", url.as_str().trim_end_matches('/'));
+    Ok(bearer_auth(http.post(endpoint), key)
+        .json(payload)
+        .send()
+        .await?)
+}
+
+pub(super) async fn read_json(response: reqwest::Response) -> Result<Value> {
     Ok(serde_json::from_slice(
         &read_body(response, 2 * MAX_ATTACHMENT_BYTES).await?,
     )?)
@@ -1105,7 +1222,7 @@ mod tests {
                 key: "fixture-tavily-key",
             };
             let (events, received) = crate::driver::test_event_channel();
-            let reply = Chat {
+            let (reply, messages) = Chat {
                 url: &url,
                 key: "",
                 model: "demo",
@@ -1113,14 +1230,16 @@ mod tests {
                 preamble: "private system prompt",
                 history: &[],
             }
-            .send_with_search(
+            .send_with_tools(
                 &http,
                 Message::user("private user turn"),
                 &events,
                 Some(&tavily),
+                None,
             )
             .await
             .unwrap_or_else(|error| panic!("{protocol:?}: {error:#}"));
+            assert_eq!(messages.len(), 4);
             assert!(reply.text.starts_with("OK"), "{protocol:?}: {}", reply.text);
             assert!(
                 reply

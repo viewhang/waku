@@ -1740,6 +1740,9 @@ mod tests {
 
 impl Waku {
     pub(super) fn open_transcript_link(&mut self, target: &str, cx: &mut Context<Self>) -> bool {
+        if self.open_library_citation(target, cx) {
+            return true;
+        }
         match transcript_link_route(target, self.selected_workspace_path()) {
             TranscriptLinkRoute::ProjectFile(relative_path) => {
                 self.open_right_panel_surface(RightPanelSurface::Files, cx);
@@ -2303,6 +2306,7 @@ impl Waku {
         // at full width. Keep it down until the panel has finished moving.
         let active_browser = if self.settings_page.is_none()
             && !self.translation_is_open()
+            && !self.knowledge.open
             && self.right_panel_visible
             && self.right_panel_slide.is_none()
         {
@@ -2863,7 +2867,12 @@ impl Waku {
         let is_markdown = file_highlighter_language(&relative_path) == "markdown";
         let preview = is_markdown && self.state.markdown_preview;
         let body = if preview {
-            self.render_file_markdown_preview(&relative_path, &editor_state, cx)
+            self.render_file_markdown_preview(
+                &relative_path,
+                &editor_state,
+                self.markdown_link_handler.clone(),
+                cx,
+            )
         } else {
             self.render_file_editor_body(
                 &relative_path,
@@ -3283,10 +3292,11 @@ impl Waku {
     /// parse is cached per path, so re-rendering an unchanged document costs
     /// `Rc` clones, not a re-parse. Reads only in-memory editor state: the
     /// render path may not touch the filesystem.
-    fn render_file_markdown_preview(
-        &mut self,
+    pub(super) fn render_file_markdown_preview(
+        &self,
         relative_path: &str,
         editor_state: &Entity<TextInput>,
+        link_handler: md::render::LinkHandler,
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = Theme::current(cx);
@@ -3305,7 +3315,7 @@ impl Waku {
         )
         .with_math_enabled(self.state.render_math)
         .with_math_context_menu(self.menu_handle("file-preview-math", cx))
-        .with_link_handler(self.markdown_link_handler.clone());
+        .with_link_handler(link_handler);
         let document = md::render::markdown(view, &ctx);
 
         let selection_input = {

@@ -42,6 +42,7 @@ mod http_wire;
 pub mod i18n;
 pub mod identity;
 pub mod kimi_session;
+mod knowledge;
 pub mod model;
 pub mod model_catalog;
 pub mod opencode_api;

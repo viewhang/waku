@@ -90,6 +90,15 @@ impl DaemonSettingsStore {
             .cloned()
     }
 
+    /// Apply the currently saved library grant to ordinary assistant turns
+    pub(crate) fn assistant_knowledge(&self, id: Uuid) -> bool {
+        self.settings
+            .lock()
+            .assistants
+            .iter()
+            .any(|profile| profile.id == id && profile.knowledge_tools)
+    }
+
     /// Resolve the old assistant-wide search default for conversations without a saved choice
     pub(crate) fn assistant_web_search(&self, id: Uuid) -> bool {
         self.settings
@@ -201,7 +210,7 @@ impl DaemonSettingsStore {
             // Settings write failure rolls the credential back with the SQLite transaction
             write_atomic(&self.path, &next)?;
             if let Err(error) = transaction.commit() {
-                write_atomic(&self.path, &current)
+                write_atomic(&self.path, &*current)
                     .context("Could not restore the model service settings")?;
                 return Err(error.into());
             }
@@ -428,7 +437,7 @@ fn quarantine_corrupt_settings(path: &Path) -> io::Result<PathBuf> {
     Ok(backup)
 }
 
-fn write_atomic(path: &Path, settings: &DaemonSettings) -> io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, settings: &impl serde::Serialize) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -464,6 +473,7 @@ mod tests {
                 name: "Search test".into(),
                 system_prompt: String::new(),
                 model: "demo".into(),
+                knowledge_tools: true,
                 web_search: true,
                 model_service_id: None,
                 base_url: String::new(),

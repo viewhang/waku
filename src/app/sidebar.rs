@@ -252,7 +252,7 @@ const SIDEBAR_SESSION_ROW_GAP: f32 = 1.0;
 const SIDEBAR_SESSION_ROW_HEIGHT: f32 = SIDEBAR_SESSION_CARD_HEIGHT + SIDEBAR_SESSION_ROW_GAP;
 const SIDEBAR_ASSISTANT_SESSION_ROW_HEIGHT: f32 = 32.0 + SIDEBAR_SESSION_ROW_GAP;
 const SIDEBAR_ACTION_ROW_HEIGHT: f32 = 32.0;
-const SIDEBAR_SHORTCUTS_HEIGHT: f32 = 3.0 * SIDEBAR_ACTION_ROW_HEIGHT + 10.0;
+const SIDEBAR_SHORTCUTS_HEIGHT: f32 = 4.0 * SIDEBAR_ACTION_ROW_HEIGHT + 10.0;
 const SIDEBAR_GROUP_HEADER_HEIGHT: f32 = 28.0;
 const SIDEBAR_GROUP_HEADER_BOTTOM_GAP: f32 = 2.0;
 const SIDEBAR_SHOW_MORE_ROW_HEIGHT: f32 = 30.0;
@@ -843,6 +843,23 @@ impl Waku {
                 row.bg(Theme::current(cx).sidebar_item_background)
             })
             .on_activation(cx, Self::open_translation);
+        let knowledge_focus = self
+            .menu_handle("sidebar-knowledge", cx)
+            .trigger_focus_handle()
+            .clone();
+        let knowledge = self
+            .render_sidebar_action_row(
+                "sidebar-knowledge",
+                "icons/library.svg",
+                tr!("knowledge.title"),
+                cx,
+            )
+            .when(self.knowledge.open, |row| {
+                row.bg(Theme::current(cx).sidebar_item_background)
+            })
+            .track_focus(&knowledge_focus)
+            .tab_stop(true)
+            .on_activation(cx, Self::open_library);
         let create_focus = self
             .menu_handle("sidebar-add-assistant", cx)
             .trigger_focus_handle()
@@ -867,6 +884,7 @@ impl Waku {
             .flex_col()
             .child(search)
             .child(translate)
+            .child(knowledge)
             .child(create_assistant)
     }
 
@@ -2262,12 +2280,14 @@ impl Waku {
     pub(super) fn render_header(
         &self,
         window: &Window,
-        translating: bool,
+        tool_open: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = Theme::current(cx);
         let session = self.selected_session();
-        let title = if translating {
+        let title = if self.knowledge.open {
+            self.library_name()
+        } else if tool_open {
             tr!("translation.title")
         } else {
             session
@@ -2276,7 +2296,7 @@ impl Waku {
         };
         let agent_preset_label = session
             .filter(|session| {
-                !translating && session.provider == ProviderKind::DeepSeek && session.has_started()
+                !tool_open && session.provider == ProviderKind::DeepSeek && session.has_started()
             })
             .and_then(|session| self.agent_preset_label_for_session(session));
         let left_window_controls = (!self.sidebar_visible)
@@ -2289,7 +2309,7 @@ impl Waku {
             })
             .flatten();
         // Translation fills the workspace so the header also owns the right window controls
-        let right_window_controls = (translating || !self.right_panel_visible)
+        let right_window_controls = (tool_open || !self.right_panel_visible)
             .then(|| {
                 self.render_client_window_controls(
                     super::window_chrome::WindowControlSide::Right,
@@ -2312,7 +2332,7 @@ impl Waku {
             // a sidebar sliding in shrinks the inset as it takes the lights
             // over, which is what keeps the title from passing under them.
             .pl(if self.sidebar_visible {
-                let inset = if translating { 20.0 } else { 14.0 };
+                let inset = if tool_open { 20.0 } else { 14.0 };
                 px(inset + (TRAFFIC_LIGHT_CLEARANCE - self.sidebar_rendered_width).max(0.0))
             } else {
                 px(0.0)
@@ -2358,55 +2378,62 @@ impl Waku {
                             ),
                     )
             })
-            .child(
-                self.window_drag_region(
-                    div()
-                        .id("header-title-drag-region")
-                        .h_full()
-                        .min_w_0()
-                        .flex_shrink(1.0)
-                        .flex()
-                        .items_center()
-                        .gap(px(7.0))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(sp(13.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.text)
-                                .when(translating, |title| {
-                                    title.text_size(sp(18.0)).font_weight(FontWeight::SEMIBOLD)
-                                })
-                                .child(title),
-                        )
-                        .children(agent_preset_label.map(|label| {
-                            div()
-                                .h(px(22.0))
-                                .max_w(px(180.0))
-                                .px(px(6.0))
-                                .rounded(px(6.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap(px(4.0))
-                                .bg(theme.overlay)
-                                .text_size(sp(12.5))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.text_secondary)
-                                .child(icon("icons/bot.svg", 10.5, theme.text_tertiary))
-                                .child(div().min_w_0().truncate().child(SharedString::from(label)))
-                        })),
-                    cx,
-                ),
-            )
+            .when(!self.knowledge.open, |header| {
+                header.child(
+                    self.window_drag_region(
+                        div()
+                            .id("header-title-drag-region")
+                            .h_full()
+                            .min_w_0()
+                            .flex_shrink(1.0)
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(sp(13.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .when(tool_open, |title| {
+                                        title.text_size(sp(18.0)).font_weight(FontWeight::SEMIBOLD)
+                                    })
+                                    .child(title),
+                            )
+                            .children(agent_preset_label.map(|label| {
+                                div()
+                                    .h(px(22.0))
+                                    .max_w(px(180.0))
+                                    .px(px(6.0))
+                                    .rounded(px(6.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .bg(theme.overlay)
+                                    .text_size(sp(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text_secondary)
+                                    .child(icon("icons/bot.svg", 10.5, theme.text_tertiary))
+                                    .child(
+                                        div().min_w_0().truncate().child(SharedString::from(label)),
+                                    )
+                            })),
+                        cx,
+                    ),
+                )
+            })
+            .when(self.knowledge.open, |header| {
+                header.child(self.render_library_header(cx))
+            })
             .child(
                 self.window_drag_region(
                     div().id("header-center-drag-region").h_full().flex_1(),
                     cx,
                 ),
             )
-            .when(!translating, |element| {
+            .when(!tool_open, |element| {
                 element.child(self.render_background_work_summary(cx)).when(
                     !self.right_panel_visible,
                     |element| {

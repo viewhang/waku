@@ -15,6 +15,9 @@ pub struct AssistantProfile {
     pub id: Uuid,
     pub name: String,
     pub system_prompt: String,
+    /// Personal library tools can be disabled per assistant, including during an existing chat
+    #[serde(default = "knowledge_enabled_by_default")]
+    pub knowledge_tools: bool,
     pub model: String,
     /// Previous assistant-wide preference for sessions without a saved choice
     #[serde(default)]
@@ -24,6 +27,10 @@ pub struct AssistantProfile {
     /// Endpoint stored by older assistant profiles and sessions
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base_url: String,
+}
+
+fn knowledge_enabled_by_default() -> bool {
+    true
 }
 
 /// Provider endpoint and the models exposed in Waku's picker

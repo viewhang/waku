@@ -154,6 +154,7 @@ impl Waku {
     }
 
     pub(super) fn open_translation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.knowledge.open=false;
         let page = self.translation.get_or_insert_with(|| {
             let default_model = self
                 .state

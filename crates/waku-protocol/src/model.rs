@@ -947,6 +947,14 @@ pub struct RuntimeEventCursor {
     pub sequence: u64,
 }
 
+/// Tools the user can enable independently in an assistant conversation
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum AssistantTool {
+    WebSearch,
+    Knowledge,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, TS)]
 pub struct AgentSession {
     pub id: Uuid,
@@ -971,6 +979,9 @@ pub struct AgentSession {
     /// Latest web-search choice for this conversation
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_web_search: Option<bool>,
+    /// Library tools are off until explicitly enabled in this conversation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_knowledge: Option<bool>,
     /// Completed assistant chat boundaries retained as transcript dividers
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assistant_context_resets: Vec<Uuid>,
@@ -1060,6 +1071,7 @@ impl AgentSession {
             assistant_id: None,
             assistant: None,
             assistant_web_search: None,
+            assistant_knowledge: None,
             assistant_context_resets: Vec::new(),
             model: None,
             runtime_mode: RuntimeMode::FullAccess,
@@ -1101,6 +1113,7 @@ impl AgentSession {
             assistant_id: self.assistant_profile_id(),
             assistant: None,
             assistant_web_search: self.assistant_web_search,
+            assistant_knowledge: self.assistant_knowledge,
             assistant_context_resets: self.assistant_context_resets.clone(),
             model: self.model.clone(),
             runtime_mode: RuntimeMode::default(),
@@ -1137,6 +1150,14 @@ impl AgentSession {
             .or(self.assistant_id)
     }
 
+    /// Both the daemon and composer update the same persisted tool choice
+    pub fn assistant_tool_choice_mut(&mut self, tool: AssistantTool) -> &mut Option<bool> {
+        match tool {
+            AssistantTool::WebSearch => &mut self.assistant_web_search,
+            AssistantTool::Knowledge => &mut self.assistant_knowledge,
+        }
+    }
+
     /// Clear only at a settled turn with no follow-up already queued
     pub fn assistant_context_clear_target(&self) -> Option<Uuid> {
         let turn = self.turns.last()?;
@@ -1163,9 +1184,10 @@ impl AgentSession {
     }
 
     pub fn has_started(&self) -> bool {
-        // A saved search choice also makes an empty assistant session worth keeping
+        // A saved tool choice also makes an empty assistant session worth keeping
         !self.detail_loaded
-            || (self.provider == ProviderKind::Assistant && self.assistant_web_search.is_some())
+            || (self.provider == ProviderKind::Assistant
+                && (self.assistant_web_search.is_some() || self.assistant_knowledge.is_some()))
             || !self.turns.is_empty()
             || !self.messages.is_empty()
             || self.provider_cursor.is_some()

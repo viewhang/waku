@@ -596,6 +596,10 @@ composer.queue_followup: 排队为后续消息（⏎）
 composer.clear_context: 清空上下文
 composer.enable_web_search: 开启联网搜索
 composer.disable_web_search: 关闭联网搜索
+composer.enable_knowledge: 启用知识库
+composer.disable_knowledge: 关闭知识库
+composer.remove_legacy_note: 请移除草稿中的旧版知识库附件后再发送
+knowledge.add_before_chat: 请先在知识库设置中添加知识库
 composer.clear_context_failed: "无法清空上下文：%{error}"
 composer.message: 消息
 composer.queue_placeholder: 添加后续消息…
@@ -1209,3 +1213,131 @@ service_model.token_hint: 发送前检查输入 Token 估算值。输出上限�
 service_model.invalid_tokens: 请输入正整数，输入和输出的上限须在上下文窗口内
 service_model.edit_needs_image: 在会话中添加图片并描述要做的修改
 service_model.rerank_format: 第一行填写查询内容，之后每行填写一条待排序文本
+
+knowledge.title: "知识库"
+
+knowledge.keywords: "知识库 笔记 语义 检索 RAG"
+
+knowledge.question: "输入关于笔记的问题…"
+
+knowledge.root: "知识库目录"
+
+knowledge.remote_root: "远程主机上的知识库目录"
+
+knowledge.add_library: "添加知识库"
+
+knowledge.index_settings: "当前库的索引设置"
+
+knowledge.document_index: "文档索引"
+
+knowledge.remove_library: "移除「%{name}」"
+
+knowledge.path: "目录的绝对路径"
+
+knowledge.saved_libraries: "已添加的知识库"
+
+knowledge.active_library: "当前知识库"
+
+knowledge.activate_library: "切换"
+
+knowledge.choose: "选择文件夹…"
+
+knowledge.embedding: "Embedding 模型"
+
+knowledge.choose_embedding: "请先选择 Embedding 模型"
+
+knowledge.disclosure: "建索引时会把笔记分段发给所选 Embedding 服务，提问时会把命中片段发给问答服务。"
+
+knowledge.apply: "添加并建立索引"
+
+knowledge.indexing: "正在索引 · %{ready} / %{total} 篇文档"
+
+knowledge.search: "搜索片段"
+
+knowledge.ask: "向知识库提问"
+
+knowledge.working: "处理中…"
+
+knowledge.changed: "引用的原文已修改，当前显示新版文档开头。"
+
+knowledge.documents: "文档"
+
+
+knowledge.previous: "上一页文档"
+
+knowledge.next: "下一页文档"
+
+knowledge.rebuild: "重新索引"
+
+knowledge.agent_tools: "知识库工具（读取与管理笔记）"
+
+knowledge.configure: "知识库设置"
+
+knowledge.open: "打开知识库"
+
+knowledge.open_in_file_manager: "文件管理器打开"
+
+knowledge.new: "新建文档"
+knowledge.new_folder: "新建文件夹"
+knowledge.folder_path: "文件夹名称或路径，如 项目/会议"
+knowledge.create_folder_failed: "无法创建文件夹「%{path}」：%{error}"
+
+knowledge.add: "新建或导入"
+
+knowledge.document_actions: "文档操作"
+
+knowledge.open_window: "在新窗口中打开"
+
+knowledge.duplicate: "创建副本"
+
+knowledge.move: "移动到…"
+
+knowledge.copy_address: "复制文件地址"
+
+knowledge.pin: "置顶"
+
+knowledge.unpin: "取消置顶"
+
+knowledge.favorite: "收藏"
+
+knowledge.unfavorite: "取消收藏"
+
+knowledge.download: "下载"
+
+knowledge.original: "原始文档"
+
+knowledge.filename: "文件名"
+
+knowledge.target_folder: "目标目录（留空表示知识库根目录）"
+
+knowledge.invalid_name: "请输入文件名，不含目录"
+
+knowledge.copy_name: "%{name} 副本"
+
+knowledge.delete_confirm: "从知识库中删除「%{path}」？"
+
+
+knowledge.import_document: "导入文档"
+
+knowledge.import_requirements: "请选择不超过 32 MiB 的 UTF-8 Markdown 或 XML 文档"
+
+knowledge.import: "导入 URL"
+
+knowledge.tree: "目录"
+
+knowledge.edit: "编辑"
+
+knowledge.history: "历史版本"
+
+
+knowledge.save: "保存"
+
+knowledge.note_path: "文档路径，如 notes/meeting.md"
+
+knowledge.restore: "恢复 %{date} 的版本"
+
+knowledge.no_versions: "暂无历史版本"
+
+knowledge.unsaved: "请先保存或取消当前编辑，再切换文档"
+
+knowledge.model_requires_tools: "让助手检索和管理笔记，需要选择支持工具调用的对话模型"

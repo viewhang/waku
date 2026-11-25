@@ -146,6 +146,9 @@ pub(super) fn merge_remote_session_catalog(
             if remote.assistant_web_search.is_some() {
                 local.assistant_web_search = remote.assistant_web_search;
             }
+            if remote.assistant_knowledge.is_some() {
+                local.assistant_knowledge = remote.assistant_knowledge;
+            }
             for turn_id in remote.assistant_context_resets {
                 if !local.assistant_context_resets.contains(&turn_id) {
                     local.assistant_context_resets.push(turn_id);
@@ -2915,7 +2918,7 @@ impl Waku {
             return;
         };
         if self.assistant_context_resets_pending.contains(&session.id)
-            || self.assistant_web_search_pending.contains(&session.id)
+            || self.assistant_tool_choice_pending.contains(&session.id)
         {
             self.restore_composer_submission(submission, cx);
             return;
@@ -3098,7 +3101,7 @@ impl Waku {
     /// settled turn has been fully closed, so the session is Idle.
     pub(super) fn drain_queued_message(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
         if self.response_fork_preparations.contains_key(&session_id)
-            || self.assistant_web_search_pending.contains(&session_id)
+            || self.assistant_tool_choice_pending.contains(&session_id)
         {
             return;
         }

@@ -200,6 +200,11 @@ pub enum Command {
     SetAssistantWebSearch {
         enabled: bool,
     },
+    /// Persist a composer tool switch and apply it to subsequent prompts in this chat
+    SetAssistantTool {
+        tool: crate::model::AssistantTool,
+        enabled: bool,
+    },
     /// Persist a provider and its optional credential change together
     SaveModelService {
         service: crate::settings::ModelService,
@@ -238,6 +243,10 @@ pub enum Command {
     /// Fetch and merge the saved provider's catalog on the daemon that owns its key
     SyncModelService {
         service_id: Uuid,
+    },
+    /// Access the personal knowledge library on the daemon host
+    Knowledge {
+        operation: crate::knowledge::KnowledgeOperation,
     },
     /// Translate text with a saved model service independently of any conversation
     TranslateText {
@@ -494,6 +503,9 @@ pub enum ResponseOutcome {
     rename_all_fields = "camelCase"
 )]
 pub enum ResponsePayload {
+    Knowledge {
+        result: crate::knowledge::KnowledgeResult,
+    },
     Ack,
     SessionRuntime {
         runtime_id: Option<Uuid>,

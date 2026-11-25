@@ -1925,6 +1925,7 @@ fn settings_search_filters_pages_for_arrow_cycling() {
         SettingsPage::ModelServices,
         SettingsPage::SearchProviders,
         SettingsPage::Assistants,
+        SettingsPage::Knowledge,
         SettingsPage::Skills,
         SettingsPage::Usage,
         SettingsPage::Daemon,

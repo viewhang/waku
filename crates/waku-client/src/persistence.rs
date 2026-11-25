@@ -331,6 +331,10 @@ struct AppState {
     /// instead of source. One global mode, not per file.
     #[serde(default)]
     markdown_preview: bool,
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pinned_documents: HashSet<Uuid>,
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    favorite_documents: HashSet<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window_state: Option<PersistedWindowState>,
 }
@@ -387,6 +391,11 @@ pub struct PersistedState {
     /// instead of source. One global mode, not per file.
     #[serde(default)]
     pub markdown_preview: bool,
+    /// Library document IDs survive moves and keep different libraries' preferences separate
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub pinned_documents: HashSet<Uuid>,
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub favorite_documents: HashSet<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_state: Option<PersistedWindowState>,
     #[serde(default = "default_computer_use_enabled")]
@@ -452,6 +461,8 @@ impl PersistedState {
             sidebar_ordering: SidebarOrdering::Newest,
             right_panel_width: DEFAULT_RIGHT_PANEL_WIDTH,
             markdown_preview: false,
+            pinned_documents: HashSet::new(),
+            favorite_documents: HashSet::new(),
             window_state: None,
             computer_use_enabled: false,
             computer_use_allowed_apps: Vec::new(),
@@ -598,6 +609,8 @@ impl PersistedState {
             sidebar_ordering: self.sidebar_ordering,
             right_panel_width: self.right_panel_width,
             markdown_preview: self.markdown_preview,
+            pinned_documents: self.pinned_documents.clone(),
+            favorite_documents: self.favorite_documents.clone(),
             window_state: self.window_state,
         }
     }
@@ -630,6 +643,8 @@ impl PersistedState {
         self.sidebar_ordering = app_state.sidebar_ordering;
         self.right_panel_width = app_state.right_panel_width;
         self.markdown_preview = app_state.markdown_preview;
+        self.pinned_documents = app_state.pinned_documents;
+        self.favorite_documents = app_state.favorite_documents;
         self.window_state = app_state.window_state;
     }
 
@@ -1184,11 +1199,26 @@ mod tests {
         assert_eq!(state.sidebar_grouping, SidebarGrouping::Updated);
         assert_eq!(state.sidebar_ordering, SidebarOrdering::Newest);
         assert_eq!(state.last_runtime_mode, RuntimeMode::FullAccess);
+        assert!(state.pinned_documents.is_empty() && state.favorite_documents.is_empty());
         assert!(
             serde_json::to_value(state)
                 .unwrap()
                 .get("analytics_id")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn document_marks_round_trip_in_app_state() {
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let id = Uuid::new_v4();
+        state.pinned_documents.insert(id);
+        state.favorite_documents.insert(id);
+        let stored = serde_json::to_vec(&state.app_state()).unwrap();
+        let mut reopened = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        reopened.apply_app_state(serde_json::from_slice(&stored).unwrap());
+        assert!(
+            reopened.pinned_documents.contains(&id) && reopened.favorite_documents.contains(&id)
         );
     }
 

@@ -212,6 +212,7 @@ enum BranchPickerAction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SettingsPage {
+    Knowledge,
     Assistants,
     General,
     ModelServices,
@@ -1077,6 +1078,7 @@ pub struct Waku {
     tavily_key_input: Entity<TextInput>,
     tavily_key_pending: bool,
     model_services_page: model_services_page::ModelServicesPage,
+    knowledge: knowledge::KnowledgePage,
     model_service_form: Option<model_services::ModelServiceForm>,
     assistant_model_scroll: gpui::UniformListScrollHandle,
     daemon_port_input: Entity<TextInput>,
@@ -1305,8 +1307,8 @@ pub struct Waku {
     submission_preparations: HashSet<Uuid>,
     /// Hold new prompts until the daemon has saved the assistant context reset
     assistant_context_resets_pending: HashSet<Uuid>,
-    /// Hold new prompts until the daemon has applied the assistant's search choice
-    assistant_web_search_pending: HashSet<Uuid>,
+    /// Hold new prompts until the daemon has applied the assistant's tool choice
+    assistant_tool_choice_pending: HashSet<Uuid>,
     /// First Escape press for the current turn. A matching second press stops
     /// the response; otherwise this returns to the ordinary Stop icon after a
     /// short timeout.
@@ -1642,6 +1644,7 @@ mod drafts;
 mod file_search;
 mod goal_dialog;
 mod image_preview;
+mod knowledge;
 mod model_capabilities;
 mod model_services;
 mod model_services_page;
@@ -2321,6 +2324,7 @@ impl Waku {
             .map(|updater| (updater.status(), Some(updater.events())))
             .unwrap_or_default();
         let entity = cx.new(|cx| {
+            let knowledge = knowledge::KnowledgePage::new(window, cx);
             let settings_focus = cx.focus_handle();
             let onboarding_add_project_focus = cx.focus_handle();
             let onboarding_projectless_focus = cx.focus_handle();
@@ -2789,6 +2793,7 @@ impl Waku {
                 tavily_key_input,
                 tavily_key_pending: false,
                 model_services_page,
+                knowledge,
                 model_service_form: None,
                 assistant_model_scroll,
                 daemon_port_input,
@@ -2910,7 +2915,7 @@ impl Waku {
                 last_background_work_tick: Instant::now(),
                 submission_preparations: HashSet::new(),
                 assistant_context_resets_pending: HashSet::new(),
-                assistant_web_search_pending: HashSet::new(),
+                assistant_tool_choice_pending: HashSet::new(),
                 escape_stop_confirmation: EscapeStopConfirmation::default(),
                 response_fork_preparations: HashMap::new(),
                 pending_queue_drains: Vec::new(),

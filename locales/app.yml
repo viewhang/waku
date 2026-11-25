@@ -1221,6 +1221,14 @@ composer.enable_web_search:
   en: Enable web search
 composer.disable_web_search:
   en: Disable web search
+composer.enable_knowledge:
+  en: Enable knowledge library
+composer.disable_knowledge:
+  en: Disable knowledge library
+composer.remove_legacy_note:
+  en: Remove the legacy library attachment from this draft before sending
+knowledge.add_before_chat:
+  en: Add a library in Knowledge Library settings first
 composer.clear_context_failed:
   en: "Could not clear context: %{error}"
 composer.message:
@@ -2472,3 +2480,192 @@ service_model.edit_needs_image:
   en: Attach an image and describe the edit in the conversation
 service_model.rerank_format:
   en: Put the query on the first line and one document on each following line
+
+knowledge.title:
+  en: "Knowledge library"
+
+knowledge.keywords:
+  en: "knowledge library notes semantic RAG"
+
+knowledge.question:
+  en: "Ask about your notes…"
+
+knowledge.root:
+  en: "Library folder"
+
+knowledge.remote_root:
+  en: "Folder on the daemon host"
+
+knowledge.add_library:
+  en: "Add library"
+
+knowledge.index_settings:
+  en: "Index settings for the active library"
+
+knowledge.document_index:
+  en: "Document index"
+
+knowledge.remove_library:
+  en: "Remove “%{name}”"
+
+knowledge.path:
+  en: "Absolute directory path"
+
+knowledge.saved_libraries:
+  en: "Saved libraries"
+
+knowledge.active_library:
+  en: "Active"
+
+knowledge.activate_library:
+  en: "Switch"
+
+knowledge.choose:
+  en: "Choose folders…"
+
+knowledge.embedding:
+  en: "Embedding model"
+
+knowledge.choose_embedding:
+  en: "Choose an embedding model first"
+
+knowledge.disclosure:
+  en: "Indexing sends note passages to the selected embedding service. Questions send matching passages to the dialogue service."
+
+knowledge.apply:
+  en: "Add and index"
+
+knowledge.indexing:
+  en: "Indexing · %{ready} / %{total} documents"
+
+knowledge.search:
+  en: "Search passages"
+
+knowledge.ask:
+  en: "Ask the library"
+
+knowledge.working:
+  en: "Loading…"
+
+knowledge.changed:
+  en: "The cited revision has changed. Showing the current document from the beginning."
+
+knowledge.documents:
+  en: "Documents"
+
+knowledge.previous:
+  en: "Previous documents"
+
+knowledge.next:
+  en: "Next documents"
+
+knowledge.rebuild:
+  en: "Reindex"
+
+knowledge.agent_tools:
+  en: "Library tools (read and manage notes)"
+
+knowledge.configure:
+  en: "Library settings"
+
+knowledge.open:
+  en: "Open library"
+
+knowledge.open_in_file_manager:
+  en: "Open in file manager"
+
+knowledge.new:
+  en: "New document"
+knowledge.new_folder:
+  en: "New folder"
+knowledge.folder_path:
+  en: "Folder name or path, e.g. Projects/Meetings"
+knowledge.create_folder_failed:
+  en: "Could not create folder “%{path}” (%{error})"
+
+knowledge.add:
+  en: "Create or import"
+
+knowledge.document_actions:
+  en: "Document actions"
+
+knowledge.open_window:
+  en: "Open in new window"
+
+knowledge.duplicate:
+  en: "Create duplicate"
+
+knowledge.move:
+  en: "Move to…"
+
+knowledge.copy_address:
+  en: "Copy file path"
+
+knowledge.pin:
+  en: "Pin to top"
+
+knowledge.unpin:
+  en: "Unpin"
+
+knowledge.favorite:
+  en: "Add to favorites"
+
+knowledge.unfavorite:
+  en: "Remove from favorites"
+
+knowledge.download:
+  en: "Download"
+
+knowledge.original:
+  en: "Original document"
+
+knowledge.filename:
+  en: "File name"
+
+knowledge.target_folder:
+  en: "Destination folder (leave empty for the library root)"
+
+knowledge.invalid_name:
+  en: "Enter a file name without a directory"
+
+knowledge.copy_name:
+  en: "%{name} copy"
+
+knowledge.delete_confirm:
+  en: "Delete “%{path}” from the library?"
+
+knowledge.import_document:
+  en: "Import document"
+
+knowledge.import_requirements:
+  en: "Choose a UTF-8 Markdown or XML file up to 32 MiB"
+
+knowledge.import:
+  en: "Import URL"
+
+knowledge.tree:
+  en: "Directory"
+
+knowledge.edit:
+  en: "Edit"
+
+knowledge.history:
+  en: "Version history"
+
+knowledge.save:
+  en: "Save"
+
+knowledge.note_path:
+  en: "Relative path, e.g. notes/meeting.md"
+
+knowledge.restore:
+  en: "Restore %{date}"
+
+knowledge.no_versions:
+  en: "No previous versions"
+
+knowledge.unsaved:
+  en: "Save or cancel your note changes before switching documents"
+
+knowledge.model_requires_tools:
+  en: "Choose a dialogue model with tool calling to let this assistant search and manage notes"

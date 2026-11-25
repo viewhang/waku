@@ -3,7 +3,11 @@
 /**
  * Reusable direct-model configuration saved by the daemon without credentials
  */
-export type AssistantProfile = { id: string, name: string, system_prompt: string, model: string,
+export type AssistantProfile = { id: string, name: string, system_prompt: string,
+/**
+ * Personal library tools can be disabled per assistant, including during an existing chat
+ */
+knowledge_tools: boolean, model: string,
 /**
  * Previous assistant-wide preference for sessions without a saved choice
  */

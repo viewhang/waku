@@ -625,6 +625,10 @@ composer.queue_followup: フォローアップとしてキューに追加（⏎�
 composer.clear_context: コンテキストをクリア
 composer.enable_web_search: ウェブ検索をオンにする
 composer.disable_web_search: ウェブ検索をオフにする
+composer.enable_knowledge: ライブラリを有効にする
+composer.disable_knowledge: ライブラリを無効にする
+composer.remove_legacy_note: 送信する前に、下書きから旧形式のライブラリ添付を削除してください
+knowledge.add_before_chat: 先にライブラリ設定でライブラリを追加してください
 composer.clear_context_failed: "コンテキストをクリアできませんでした：%{error}"
 transcript.context_cleared: コンテキストをクリアしました
 composer.message: メッセージ
@@ -1151,3 +1155,131 @@ assistant.search_limit: "1 回の回答につき検索は 1 回までです"
 assistant.search_reply_missing: "検索後にモデルから回答が返りませんでした"
 assistant.search_result_count: "%{count} 件の参照元を取得"
 assistant.search_sources: "参照元"
+
+knowledge.title: "ナレッジライブラリ"
+
+knowledge.keywords: "ナレッジ ノート 検索 RAG"
+
+knowledge.question: "ノートについて質問…"
+
+knowledge.root: "ライブラリフォルダ"
+
+knowledge.remote_root: "リモートホストのライブラリフォルダ"
+
+knowledge.add_library: "ライブラリを追加"
+
+knowledge.index_settings: "使用中のライブラリの索引設定"
+
+knowledge.document_index: "文書の索引"
+
+knowledge.remove_library: "「%{name}」を取り除く"
+
+knowledge.path: "フォルダの絶対パス"
+
+knowledge.saved_libraries: "登録済みのライブラリ"
+
+knowledge.active_library: "使用中"
+
+knowledge.activate_library: "切り替え"
+
+knowledge.choose: "フォルダを選択…"
+
+knowledge.embedding: "埋め込みモデル"
+
+knowledge.choose_embedding: "埋め込みモデルを選択してください"
+
+knowledge.disclosure: "索引作成時にノートの抜粋を埋め込みサービスへ、質問時に該当箇所を対話サービスへ送信します。"
+
+knowledge.apply: "追加して索引を作成"
+
+knowledge.indexing: "索引作成中 · %{ready} / %{total} 件"
+
+knowledge.search: "抜粋を検索"
+
+knowledge.ask: "ライブラリに質問"
+
+knowledge.working: "処理中…"
+
+knowledge.changed: "引用元が更新されました。最新の文書を先頭から表示します。"
+
+knowledge.documents: "文書"
+
+
+knowledge.previous: "前の文書"
+
+knowledge.next: "次の文書"
+
+knowledge.rebuild: "再インデックス"
+
+knowledge.agent_tools: "ライブラリの読み取り・管理ツール"
+
+knowledge.configure: "ライブラリ設定"
+
+knowledge.open: "ライブラリを開く"
+
+knowledge.open_in_file_manager: "ファイルマネージャーで開く"
+
+knowledge.new: "新規ドキュメント"
+knowledge.new_folder: "新規フォルダ"
+knowledge.folder_path: "フォルダ名またはパス（例：プロジェクト/会議）"
+knowledge.create_folder_failed: "フォルダ「%{path}」を作成できません（%{error}）"
+
+knowledge.add: "新規作成または取り込み"
+
+knowledge.document_actions: "ドキュメントの操作"
+
+knowledge.open_window: "新しいウィンドウで開く"
+
+knowledge.duplicate: "複製"
+
+knowledge.move: "移動先…"
+
+knowledge.copy_address: "ファイルのパスをコピー"
+
+knowledge.pin: "上部に固定"
+
+knowledge.unpin: "固定を解除"
+
+knowledge.favorite: "お気に入りに追加"
+
+knowledge.unfavorite: "お気に入りから削除"
+
+knowledge.download: "ダウンロード"
+
+knowledge.original: "元のドキュメント"
+
+knowledge.filename: "ファイル名"
+
+knowledge.target_folder: "移動先フォルダ（空欄はライブラリのルート）"
+
+knowledge.invalid_name: "フォルダを含まないファイル名を入力してください"
+
+knowledge.copy_name: "%{name} のコピー"
+
+knowledge.delete_confirm: "「%{path}」をライブラリから削除しますか？"
+
+
+knowledge.import_document: "ドキュメントを取り込む"
+
+knowledge.import_requirements: "32 MiB 以下の UTF-8 の Markdown または XML ファイルを選んでください"
+
+knowledge.import: "URL から取り込む"
+
+knowledge.tree: "ディレクトリ"
+
+knowledge.edit: "編集"
+
+knowledge.history: "変更履歴"
+
+
+knowledge.save: "保存"
+
+knowledge.note_path: "保存先（例 notes/meeting.md）"
+
+knowledge.restore: "%{date} に復元"
+
+knowledge.no_versions: "履歴はありません"
+
+knowledge.unsaved: "変更を保存またはキャンセルしてから文書を切り替えてください"
+
+knowledge.model_requires_tools: "ノートを検索・管理するには、ツール呼び出しに対応した対話モデルを選んでください"

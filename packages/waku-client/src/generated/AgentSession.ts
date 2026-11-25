@@ -42,6 +42,10 @@ assistant?: AssistantProfile | null,
  */
 assistant_web_search?: boolean | null,
 /**
+ * Library tools are off until explicitly enabled in this conversation
+ */
+assistant_knowledge?: boolean | null,
+/**
  * Completed assistant chat boundaries retained as transcript dividers
  */
 assistant_context_resets?: Array<string>, model?: string | null, runtime_mode: RuntimeMode, reasoning_effort?: string | null, service_tier?: string | null,

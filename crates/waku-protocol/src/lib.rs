@@ -35,6 +35,7 @@ mod driver_wire;
 pub mod git;
 pub mod i18n;
 pub mod identity;
+pub mod knowledge;
 pub mod model;
 pub mod model_catalog;
 pub mod persistence;
