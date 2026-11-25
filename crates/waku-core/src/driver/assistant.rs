@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::attachments::AttachmentStore;
+use crate::blob_store::BlobStore;
 use anyhow::{Context as _, anyhow, bail};
 use rig::message::Message as RigMessage;
 use serde::Deserialize;
@@ -459,6 +460,7 @@ pub(crate) fn start(
     settings: Arc<DaemonSettingsStore>,
     library: Option<Arc<crate::knowledge::KnowledgeLibrary>>,
     attachments: AttachmentStore,
+    blobs: Arc<BlobStore>,
     messages: Vec<Message>,
     events: DriverEventSender,
     usage: Option<AssistantUsage>,
@@ -493,6 +495,7 @@ pub(crate) fn start(
                 settings,
                 library,
                 attachments,
+                blobs,
                 history,
                 rx,
                 &worker_busy,
@@ -540,6 +543,7 @@ fn run(
     settings: Arc<DaemonSettingsStore>,
     library: Option<Arc<crate::knowledge::KnowledgeLibrary>>,
     attachments: AttachmentStore,
+    blobs: Arc<BlobStore>,
     mut history: Vec<RigMessage>,
     mut commands: mpsc::UnboundedReceiver<Control>,
     busy: &AtomicBool,
@@ -585,7 +589,7 @@ fn run(
                 };
                 let key = api_key(&url, service.as_ref(), &settings)?;
                 let result = async {
-                    let media = request::read_media(&attachments, input, options)?;
+                    let media = request::read_media(&attachments, &blobs, input, options)?;
                     let library = library.as_ref().filter(|tool| tools.knowledge && tool.enabled());
                     if library.is_some() && !(options.dialogue() && options.tools) {
                         bail!(tr!("knowledge.model_requires_tools"));
@@ -1031,6 +1035,7 @@ pub(crate) mod tests {
             settings,
             None,
             AttachmentStore::new(project.join("attachments")),
+            Arc::new(BlobStore::new(project.join("blobs"))),
             history,
             events,
             None,

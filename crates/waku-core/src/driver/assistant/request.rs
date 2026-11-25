@@ -20,6 +20,7 @@ use waku_protocol::settings::{
 
 use super::{bearer_auth, search, transport::AssistantHttp};
 use crate::attachments::{AttachmentStore, AttachmentUpload, MAX_ATTACHMENT_BYTES};
+use crate::blob_store::{BlobStore, is_blob_reference};
 use crate::driver::DriverEventSender;
 use crate::model::{ActivityItem, ActivityKind, DriverEvent, MessageAttachment};
 use crate::usage_history::TokenTotals;
@@ -53,6 +54,7 @@ pub(super) fn media_mime(name: &str) -> Option<&'static str> {
 /// Resolve only daemon attachments selected by the user, with one combined size limit
 pub(super) fn read_media(
     store: &AttachmentStore,
+    blobs: &BlobStore,
     attachments: Vec<MessageAttachment>,
     options: &ServiceModelOptions,
 ) -> Result<Vec<Media>> {
@@ -82,7 +84,12 @@ pub(super) fn read_media(
                 .blob_reference
                 .as_deref()
                 .context("Missing managed attachment reference")?;
-            let bytes = store.read_file(reference, &attachment.path)?;
+            // Clipboard images use content-addressed blobs and imported files use attachment IDs
+            let bytes = if is_blob_reference(reference) {
+                blobs.read(reference)?
+            } else {
+                store.read_file(reference, &attachment.path)?
+            };
             total += bytes.len();
             if bytes.is_empty() || total > MAX_ATTACHMENT_BYTES {
                 bail!("Model attachments are empty or exceed Waku's combined size limit");
@@ -1262,6 +1269,22 @@ mod tests {
     #[tokio::test]
     async fn configured_protocols_send_reasoning_limits_and_supported_media() {
         let http = super::super::http_client().unwrap();
+        // Exercise the clipboard's stored reference through to each provider's HTTP payload
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::new(directory.path().join("attachments"));
+        let blobs = BlobStore::new(directory.path().join("blobs"));
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(PNG)
+            .unwrap();
+        let reference = blobs.store_image_bytes("image/png", &bytes).unwrap();
+        let image = MessageAttachment {
+            path: blobs.path_for(&reference).unwrap(),
+            mention: "image.png".into(),
+            name: "image.png".into(),
+            is_dir: false,
+            is_image: true,
+            blob_reference: Some(reference),
+        };
         for protocol in [
             ModelProtocol::OpenAiChat,
             ModelProtocol::OpenAiResponses,
@@ -1289,11 +1312,7 @@ mod tests {
                 ],
                 ..Default::default()
             };
-            let mut media = vec![Media {
-                mime: "image/png",
-                name: "source.png".into(),
-                bytes: vec![1, 2, 3],
-            }];
+            let mut media = read_media(&store, &blobs, vec![image.clone()], &options).unwrap();
             if protocol.supports(ModelModality::Audio) {
                 media.push(Media {
                     mime: "audio/wav",
@@ -1357,7 +1376,7 @@ mod tests {
             let received = server.join().unwrap();
             let body: Value = serde_json::from_slice(&received.body).unwrap();
             let payload = body.to_string();
-            assert!(payload.contains("AQID"), "{payload}");
+            assert!(payload.contains(PNG), "{protocol:?}: missing PNG data");
             assert!(
                 body.get("tools").is_none_or(
                     |tools| tools.is_null() || tools.as_array().is_some_and(Vec::is_empty)
@@ -1609,6 +1628,7 @@ mod tests {
         let http = super::super::http_client().unwrap();
         let root = std::env::temp_dir().join(format!("waku-model-files-{}", uuid::Uuid::new_v4()));
         let store = AttachmentStore::new(root.clone());
+        let blobs = BlobStore::new(root.join("blobs"));
         let (events, received_events) = crate::driver::test_event_channel();
         for (purpose, kind, endpoint, prompt) in [
             (
@@ -1669,12 +1689,13 @@ mod tests {
                 assert!(
                     read_media(
                         &store,
+                        &blobs,
                         vec![attachment.clone()],
                         &ServiceModelOptions::default()
                     )
                     .is_err()
                 );
-                media = read_media(&store, vec![attachment], &options).unwrap();
+                media = read_media(&store, &blobs, vec![attachment], &options).unwrap();
             }
             Operation {
                 url: &url,

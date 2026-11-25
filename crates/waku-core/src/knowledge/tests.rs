@@ -1223,6 +1223,7 @@ fn live_assistant_session(import_only: bool) -> Result<()> {
         settings,
         Some(lib.clone()),
         crate::attachments::AttachmentStore::new(tmp.path().join("attachments")),
+        Arc::new(crate::blob_store::BlobStore::new(tmp.path().join("blobs"))),
         vec![],
         events,
         None,

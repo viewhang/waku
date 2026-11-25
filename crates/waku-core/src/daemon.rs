@@ -847,16 +847,9 @@ impl Backend for WakuBackend {
             Command::ImportPathAttachment { path } => Ok(ResponsePayload::AttachmentStored {
                 attachment: self.attachments.import_path(&path)?,
             }),
-            Command::ReadBlob { reference } => {
-                let path = self
-                    .task_store
-                    .blobs()
-                    .path_for(&reference)
-                    .ok_or_else(|| anyhow!("invalid blob reference"))?;
-                Ok(ResponsePayload::BlobData {
-                    bytes: std::fs::read(path)?,
-                })
-            }
+            Command::ReadBlob { reference } => Ok(ResponsePayload::BlobData {
+                bytes: self.task_store.blobs().read(&reference)?,
+            }),
             Command::ReadAttachment { reference, path } => Ok(ResponsePayload::BlobData {
                 bytes: self.attachments.read_file(&reference, &path)?,
             }),
@@ -1045,6 +1038,7 @@ impl Backend for WakuBackend {
                         self.settings.clone(),
                         Some(self.knowledge.clone()),
                         self.attachments.clone(),
+                        self.task_store.blobs(),
                         stored
                             .map(|mut session| {
                                 let first_turn =

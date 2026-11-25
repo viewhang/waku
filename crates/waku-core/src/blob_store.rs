@@ -68,7 +68,7 @@ pub fn is_blob_reference(value: &str) -> bool {
 
 fn resolve_path(root: &Path, reference: &str) -> Option<PathBuf> {
     let name = reference.strip_prefix(BLOB_SCHEME)?;
-    if name.is_empty() || name.contains('/') || name.contains("..") {
+    if name.is_empty() || name.contains(['/', '\\', ':']) || name.contains("..") {
         return None;
     }
     let shard = name.get(..2)?;
@@ -92,6 +92,14 @@ impl BlobStore {
     /// Resolves a `waku-blob:` reference against this daemon store's root.
     pub fn path_for(&self, reference: &str) -> Option<PathBuf> {
         resolve_path(&self.root, reference)
+    }
+
+    /// Previews and model inputs resolve blob bytes by reference inside the daemon store
+    pub fn read(&self, reference: &str) -> io::Result<Vec<u8>> {
+        let path = self
+            .path_for(reference)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid blob reference"))?;
+        fs::read(path)
     }
 
     /// Stores raw binary image bytes and returns a durable blob reference.
