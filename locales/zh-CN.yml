@@ -1284,6 +1284,12 @@ knowledge.create_folder_failed: "无法创建文件夹「%{path}」：%{error}"
 
 knowledge.add: "新建或导入"
 
+knowledge.folder_actions: "文件夹操作"
+knowledge.root_folder: "知识库根目录"
+knowledge.move_up: "上移"
+knowledge.move_down: "下移"
+knowledge.trash_folder: "移到回收站"
+knowledge.trash_folder_confirm: "将「%{path}」及其中的全部内容移到回收站？"
 knowledge.document_actions: "文档操作"
 
 knowledge.open_window: "在新窗口中打开"
@@ -1308,7 +1314,7 @@ knowledge.original: "原始文档"
 
 knowledge.filename: "文件名"
 
-knowledge.target_folder: "目标目录（留空表示知识库根目录）"
+knowledge.target_folder: "选择目标目录"
 
 knowledge.invalid_name: "请输入文件名，不含目录"
 

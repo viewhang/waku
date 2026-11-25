@@ -8,6 +8,7 @@ mod markdown;
 mod retrieval;
 #[cfg(test)]
 mod tests;
+mod tree;
 
 use crate::{driver::assistant::knowledge::LibraryModel, settings::DaemonSettingsStore};
 use anyhow::{Context, Result, bail, ensure};
@@ -127,6 +128,7 @@ impl KnowledgeLibrary {
                 })
             }
             Op::Manage { action } => self.manage(action),
+            Op::ManageTree { root, id, action } => self.manage_tree(&root, id, action),
             Op::DocumentFile { id, action } => self.document_file(id, action),
             op => {
                 let (generation, config) = self.active()?;
@@ -219,6 +221,7 @@ impl KnowledgeLibrary {
                     | Op::ActivateLibrary { .. }
                     | Op::ActivateDocumentLibrary { .. }
                     | Op::RemoveLibrary { .. }
+                    | Op::ManageTree { .. }
                     | Op::Manage { .. }
                     | Op::DocumentFile { .. }
                     | Op::Status
@@ -266,7 +269,9 @@ impl KnowledgeLibrary {
             SELECT replace(path,char(92),'/') FROM documents WHERE root=?1
             UNION ALL SELECT path || '/' FROM folders WHERE root=?1
         ), entries AS (SELECT substr(path,length(?2)+1) AS tail FROM paths WHERE substr(path,1,length(?2))=?2 AND path!=?2)
-        SELECT DISTINCT CASE WHEN ?3 OR instr(tail,'/')=0 THEN tail ELSE substr(tail,1,instr(tail,'/')) END name FROM entries ORDER BY name LIMIT 51 OFFSET ?4")?;
+        ,names AS (SELECT DISTINCT CASE WHEN ?3 OR instr(tail,'/')=0 THEN tail ELSE substr(tail,1,instr(tail,'/')) END name FROM entries)
+        SELECT name FROM names LEFT JOIN entry_order o ON o.root=?1 AND o.path=?2 || rtrim(name,'/')
+        ORDER BY CASE WHEN NOT ?3 THEN o.position END NULLS LAST, CASE WHEN NOT ?3 AND substr(name,-1)='/' THEN 0 ELSE 1 END, name LIMIT 51 OFFSET ?4")?;
         let mut paths = stmt
             .query_map(params![config.root, prefix, recursive, offset], |r| {
                 r.get::<_, String>(0)
@@ -370,6 +375,17 @@ impl KnowledgeLibrary {
         let mut ready = 0;
         let mut errors = Vec::new();
         let mut manifest = String::new();
+        // A filesystem scan must not restore an old catalog stamp after a manual reorder
+        let mut order =
+            db.prepare("SELECT path,position FROM entry_order WHERE root=? ORDER BY path")?;
+        let mut ranked = order.query([&config.root])?;
+        while let Some(row) = ranked.next()? {
+            let path: String = row.get(0)?;
+            let position: usize = row.get(1)?;
+            manifest.push_str(&format!("P{}:{path}:{position};", path.len()));
+        }
+        drop(ranked);
+        drop(order);
         for path in &folders {
             manifest.push_str(&format!("D{}:{path}", path.len()));
         }
@@ -444,7 +460,7 @@ impl KnowledgeLibrary {
                     state.generation == generation,
                     "Library configuration changed"
                 );
-                index::publish(&mut db, &id, &rev, &key)?;
+                index::publish(&mut db, &id, path, &rev, &key)?;
                 Ok(true)
             })();
             match result {

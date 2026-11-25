@@ -25,7 +25,7 @@ impl AgentLibrary {
         let mut definitions = vec![
             definition(
                 "knowledge_list",
-                "List folders and document paths in the active knowledge library. Use offset for the next page.",
+                "List folders and documents in the active library. Nonrecursive results follow saved sibling order. Use offset for the next page.",
                 json!({"directory":{"type":"string"},"recursive":{"type":"boolean"},"offset":{"type":"integer","minimum":0}}),
                 &[],
             ),
@@ -67,9 +67,21 @@ impl AgentLibrary {
             ),
             definition(
                 "knowledge_move",
-                "Rename or move a note and update relative Markdown links.",
+                "Rename or move a document or entire folder to its full destination path in this library. Keep document identities and rewrite relative Markdown links.",
                 json!({"from":{"type":"string"},"to":{"type":"string"}}),
                 &["from", "to"],
+            ),
+            definition(
+                "knowledge_reorder",
+                "Place a document or folder immediately before or after the given sibling. This also moves it to that sibling's folder if necessary.",
+                json!({"path":{"type":"string"},"sibling":{"type":"string"},"after":{"type":"boolean"}}),
+                &["path", "sibling"],
+            ),
+            definition(
+                "knowledge_delete_folder",
+                "Move a requested folder and all of its contents to the library trash.",
+                json!({"path":{"type":"string"}}),
+                &["path"],
             ),
             definition(
                 "knowledge_batch_tag",
@@ -171,10 +183,25 @@ impl AgentLibrary {
             | "knowledge_create_folder"
             | "knowledge_update"
             | "knowledge_delete"
+            | "knowledge_reorder"
+            | "knowledge_delete_folder"
             | "knowledge_move"
             | "knowledge_batch_tag"
             | "knowledge_import_url" => {
                 let mut params = args.as_object().context("Expected tool arguments")?.clone();
+                // Folder entries from knowledge_list include a display slash
+                for field in ["from", "to", "sibling", "path"] {
+                    if let Some(Value::String(path)) = params.get_mut(field)
+                        && matches!(
+                            name,
+                            "knowledge_move" | "knowledge_reorder" | "knowledge_delete_folder"
+                        )
+                    {
+                        if path.ends_with('/') {
+                            path.pop();
+                        }
+                    }
+                }
                 params.insert("type".into(), json!(&name["knowledge_".len()..]));
                 let action = serde_json::from_value(Value::Object(params))?;
                 let Reply::Managed { paths } = self.library.execute(Op::Manage { action })? else {
@@ -293,6 +320,10 @@ mod tests {
                 "knowledge_batch_tag",
                 json!({"paths":["a.md"],"tags":["team"]}),
             ),
+            (
+                "knowledge_reorder",
+                json!({"path":"a.md","sibling":"empty/","after":false}),
+            ),
             ("knowledge_list", json!({"directory":null,"offset":null})),
             ("knowledge_move", json!({"from":"a.md","to":"archive/b.md"})),
             (
@@ -300,6 +331,7 @@ mod tests {
                 json!({"path":"archive/b.md","revision":null}),
             ),
             ("knowledge_delete", json!({"path":"archive/b.md"})),
+            ("knowledge_delete_folder", json!({"path":"empty"})),
         ];
         let definitions = tools.definitions(true);
         let mut names: std::collections::HashSet<_> =

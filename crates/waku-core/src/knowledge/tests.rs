@@ -307,6 +307,22 @@ fn knowledge_round_trip_search_citations_watch_and_restart() {
         matches!(call(&client, list_tree()), KnowledgeResult::Documents {folders, documents, ..}
         if folders == ["项目", "项目/会议"] && documents.len() == 2)
     );
+    call(
+        &client,
+        Op::ManageTree {
+            root: original_root.clone(),
+            id: Some(hit.document_id),
+            action: LibraryAction::Reorder {
+                path: "decision.md".into(),
+                sibling: "项目".into(),
+                after: false,
+            },
+        },
+    );
+    assert!(
+        matches!(call(&client, list_tree()),KnowledgeResult::Documents{positions,..} if positions["decision.md"] < positions["项目"])
+    );
+    assert_eq!(indexed.load(Ordering::Relaxed), before_restart);
     client.shutdown();
     server.join().unwrap();
 
@@ -315,8 +331,8 @@ fn knowledge_round_trip_search_citations_watch_and_restart() {
     let (client, server) = start_daemon(&dir);
     ready(&client, 2, "");
     assert!(
-        matches!(call(&client, list_tree()), KnowledgeResult::Documents {folders, ..}
-        if folders == ["项目", "项目/会议"])
+        matches!(call(&client, list_tree()), KnowledgeResult::Documents {folders, positions, ..}
+        if folders == ["项目", "项目/会议"] && positions["decision.md"] < positions["项目"])
     );
     let KnowledgeResult::Documents { documents, .. } = call(
         &client,
@@ -791,7 +807,7 @@ fn knowledge_incomplete_revision_is_never_retrieved() {
     let (id, _) = index::prepare(&db, "/notes", "doc.md", "first", "model").unwrap();
     index::begin_document(&db).unwrap();
     index::stage(&mut db, &index::chunks("before"), &[vec![1.0]]).unwrap();
-    index::publish(&mut db, &id, "first", "model").unwrap();
+    index::publish(&mut db, &id, "doc.md", "first", "model").unwrap();
     index::prepare(&db, "/notes", "doc.md", "second", "model").unwrap();
     index::begin_document(&db).unwrap();
     index::stage(&mut db, &index::chunks("after"), &[vec![1.0]]).unwrap();
@@ -814,7 +830,7 @@ fn knowledge_incomplete_revision_is_never_retrieved() {
     );
     index::begin_document(&db).unwrap();
     index::stage(&mut db, &index::chunks("complete"), &[vec![1.0]]).unwrap();
-    index::publish(&mut db, &id, "second", "model").unwrap();
+    index::publish(&mut db, &id, "doc.md", "second", "model").unwrap();
     let hits = index::search(&db, "/notes", "model", "after", &[1.0]).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].1.text, "complete");
@@ -822,12 +838,8 @@ fn knowledge_incomplete_revision_is_never_retrieved() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// Exercise the same mutations the desktop and assistant can issue, in a disposable directory
-#[test]
-fn knowledge_management_versions_links_tags_and_recovery() -> Result<()> {
-    use waku_protocol::knowledge::{
-        KnowledgeOperation as O, KnowledgeResult as R, LibraryAction as A,
-    };
+/// Isolate filesystem and catalog mutations from the asynchronous embedding worker
+fn tree_fixture() -> Result<(tempfile::TempDir, PathBuf, KnowledgeLibrary)> {
     let tmp = tempfile::tempdir()?;
     let root = tmp.path().canonicalize()?.join("notes");
     fs::create_dir(&root)?;
@@ -853,6 +865,141 @@ fn knowledge_management_versions_links_tags_and_recovery() -> Result<()> {
             ..Default::default()
         }),
     };
+    Ok((tmp, root, lib))
+}
+
+/// Moving a directory preserves notes, attachments, empty children and historical citation IDs
+#[test]
+fn knowledge_tree_moves_subtrees_and_persists_sibling_order() -> Result<()> {
+    use LibraryAction as A;
+    let (_tmp, root, lib) = tree_fixture()?;
+    let root_name = root.to_str().unwrap();
+    let run = |action| lib.execute(KnowledgeOperation::Manage { action });
+    let folder = |s: &str| run(A::CreateFolder { path: s.into() });
+    let create = |p: &str, body: &str| {
+        run(A::Create {
+            path: p.into(),
+            content: body.into(),
+            metadata: None,
+            format: None,
+        })
+    };
+    let reorder = |p: &str, s: &str, after| {
+        run(A::Reorder {
+            path: p.into(),
+            sibling: s.into(),
+            after,
+        })
+    };
+    let list = |dir: &str| -> Result<Vec<String>> {
+        Ok(lib.list_entries(dir, false, 0)?["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap().to_owned())
+            .collect())
+    };
+    folder("会议/子目录/空")?;
+    folder("归档")?;
+    folder("会议记录")?;
+    create("会议/a.md", "[指南](../index.md) ![图](image.png)")?;
+    create("会议/子目录/b.md", "需要保留的原文")?;
+    create("index.md", "[纪要](会议/a.md#section)")?;
+    fs::write(root.join("会议/image.png"), b"attachment")?;
+    let id = lib.document_id("会议/子目录/b.md")?;
+    let rev = index::revision("需要保留的原文");
+    let before = lib.state.lock().generation;
+    let db = index::connect(&lib.path)?;
+    db.execute("UPDATE documents SET indexed_with='ready'", [])?;
+    reorder("会议/a.md", "会议/子目录", false)?;
+    reorder("index.md", "会议", false)?;
+    assert_eq!(list("会议")?, ["会议/a.md", "会议/子目录/"]);
+    assert_eq!(lib.state.lock().generation, before);
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM documents WHERE indexed_with='ready'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        3
+    );
+    assert!(
+        matches!(index::list(&index::initialize(&lib.path)?,root_name,0,true)?,KnowledgeResult::Documents{positions,..}
+        if positions["会议/a.md"] < positions["会议/子目录"])
+    );
+    // The sibling target determines the new parent and insertion point in one operation
+    create("归档/end.md", "end")?;
+    assert!(reorder("会议", "不存在/anchor.md", false).is_err());
+    assert!(!root.join("不存在").exists());
+    reorder("会议", "归档/end.md", true)?;
+    // A vector batch staged under the old path must never replace the moved note's passages
+    let mut worker = index::connect(&lib.path)?;
+    index::begin_document(&worker)?;
+    index::stage(&mut worker, &index::chunks("需要保留的原文"), &[vec![1.0]])?;
+    assert!(
+        index::publish(
+            &mut worker,
+            &id.to_string(),
+            "会议/子目录/b.md",
+            &rev,
+            "old-model"
+        )
+        .is_err()
+    );
+    assert_eq!(list("归档")?, ["归档/end.md", "归档/会议/"]);
+    assert_eq!(list("归档/会议")?, ["归档/会议/a.md", "归档/会议/子目录/"]);
+    assert!(root.join("归档/会议/子目录/空").is_dir());
+    assert_eq!(fs::read(root.join("归档/会议/image.png"))?, b"attachment");
+    assert!(root.join("会议记录").is_dir());
+    assert_eq!(
+        fs::read_to_string(root.join("归档/会议/a.md"))?,
+        "[指南](../../index.md) ![图](image.png)"
+    );
+    let inbound = fs::read_to_string(root.join("index.md"))?;
+    assert!(inbound.contains("a.md#section") && inbound != "[纪要](会议/a.md#section)");
+    let url = url::Url::from_file_path(root.join("index.md")).unwrap();
+    assert_eq!(
+        url.join(inbound.split_once('(').unwrap().1.trim_end_matches(')'))?
+            .to_file_path()
+            .unwrap(),
+        root.join("归档/会议/a.md")
+    );
+    assert_eq!(lib.document_id("归档/会议/子目录/b.md")?, id);
+    assert!(
+        matches!(lib.execute(KnowledgeOperation::Read{id,revision:Some(rev),start:0,end:None})?,
+        KnowledgeResult::Passage{path,changed:false,..} if path=="归档/会议/子目录/b.md")
+    );
+    let move_to = |p: &str, d: &str| {
+        run(A::Move {
+            from: p.into(),
+            to: d.into(),
+        })
+    };
+    assert!(move_to("归档/会议", "归档/会议/子目录/loop").is_err());
+    assert!(move_to("归档/会议", "会议记录").is_err());
+    assert!(reorder("归档/会议", "归档/会议/子目录", true).is_err());
+    move_to("归档/会议", "新会议")?;
+    assert_eq!(lib.document_id("新会议/子目录/b.md")?, id);
+    run(A::DeleteFolder {
+        path: "新会议".into(),
+    })?;
+    assert!(lib.document_id("新会议/子目录/b.md").is_err());
+    assert!(list("")?.iter().all(|p| p != "新会议/"));
+    let trash = fs::read_dir(root.join(".waku-trash"))?
+        .next()
+        .unwrap()?
+        .path();
+    assert!(trash.join("新会议/子目录/空").is_dir() && trash.join("新会议/image.png").is_file());
+    Ok(())
+}
+
+/// Exercise the same mutations the desktop and assistant can issue, in a disposable directory
+#[test]
+fn knowledge_management_versions_links_tags_and_recovery() -> Result<()> {
+    use waku_protocol::knowledge::{
+        KnowledgeOperation as O, KnowledgeResult as R, LibraryAction as A,
+    };
+    let (tmp, root, lib) = tree_fixture()?;
     let op = |action| lib.execute(O::Manage { action });
     let folder = |path: &str| op(A::CreateFolder { path: path.into() });
     folder("项目/会议")?;

@@ -7,6 +7,8 @@ use waku_protocol::knowledge::*;
 use waku_protocol::{Command, ResponsePayload};
 mod reader;
 mod row_actions;
+mod tree_actions;
+use tree_actions::{DropZone, MovePicker, TreeItem};
 mod settings;
 use reader::{DocumentPreview, PreparedDocument};
 
@@ -31,11 +33,15 @@ pub(super) struct KnowledgePage {
     pub(super) open: bool,
     pending_source: Option<KnowledgeOperation>,
     after_create: Option<String>,
+    /// Restore the manipulated row independently of the open document
+    reveal_after_move: Option<String>,
     panel: Panel,
     path_input: Entity<TextInput>,
-    /// The move form and the inline filename editor each target their own document
-    file_target: Option<LibraryDocument>,
-    rename_target: Option<Uuid>,
+    /// Directory operations remember the library and the row that opened the menu
+    move_picker: Option<MovePicker>,
+    rename_target: Option<TreeItem>,
+    drop_hint: Option<(String, DropZone)>,
+    hover_expand: Option<gpui::Task<()>>,
     /// Keep the pending rename valid when the same mouse click opens another preview
     rename_save: Option<gpui::Task<()>>,
     rename_input: Entity<TextInput>,
@@ -69,6 +75,9 @@ struct TreeRow {
     name: String,
     id: Option<Uuid>,
     depth: usize,
+    /// Precomputed while sorting so an open row menu never traverses the full directory
+    can_move_up: bool,
+    can_move_down: bool,
 }
 
 struct PreviewLocation {
@@ -150,8 +159,11 @@ impl KnowledgePage {
             open: false,
             pending_source: None,
             after_create: None,
+            reveal_after_move: None,
             panel: Panel::Preview,
-            file_target: None,
+            move_picker: None,
+            drop_hint: None,
+            hover_expand: None,
             rename_target: None,
             rename_save: None,
             rename_input,
@@ -293,10 +305,12 @@ impl Waku {
                         {
                             let mut docs = Vec::new();
                             let mut folders = Vec::new();
+                            let mut positions = HashMap::new();
                             loop {
                                 let KnowledgeResult::Documents {
                                     documents,
                                     folders: page_folders,
+                                    positions: page_positions,
                                     more,
                                 } = request(
                                     &client,
@@ -310,6 +324,7 @@ impl Waku {
                                 };
                                 docs.extend(documents);
                                 folders.extend(page_folders);
+                                positions.extend(page_positions);
                                 if !more {
                                     break;
                                 }
@@ -324,7 +339,7 @@ impl Waku {
                             {
                                 return Ok((latest, None));
                             }
-                            Some((document_tree(docs, folders, &pins), stamp))
+                            Some((document_tree(docs, folders, &positions, &pins), stamp))
                         } else {
                             None
                         };
@@ -376,6 +391,11 @@ impl Waku {
                                     && let Some(id) = page.location.as_ref().map(|loc| loc.id)
                                 {
                                     page.select_document(id);
+                                }
+                                if let Some(path) = page.reveal_after_move.take()
+                                    && let Some(i) = page.tree.iter().position(|r| r.path == path)
+                                {
+                                    page.reveal_tree_row(i);
                                 }
                                 if let Some(path) = page.after_create.as_ref()
                                     && let Some(i) =
@@ -455,14 +475,17 @@ impl Waku {
             page.busy = false;
             page.loaded = None;
             page.panel = Panel::Preview;
-            page.file_target = None;
+            page.move_picker = None;
             page.rename_target = None;
             page.rename_save = None;
             page.after_create = None;
+            page.reveal_after_move = None;
             page.location = None;
             page.tree.clear();
             page.visible.clear();
             page.collapsed.clear();
+            page.drop_hint = None;
+            page.hover_expand = None;
             page.cursor = 0;
             page.error = None;
         }
@@ -576,9 +599,6 @@ impl Waku {
                 !p.url_input.read(cx).content().is_empty()
                     || !p.path_input.read(cx).content().is_empty()
             }
-            Panel::Move => p.file_target.as_ref().is_some_and(|doc| {
-                p.path_input.read(cx).content() != row_actions::document_parts(&doc.path).0
-            }),
             _ => false,
         };
         if dirty {
@@ -639,6 +659,23 @@ impl Waku {
             } => Some(path.clone()),
             _ => None,
         };
+        let tree_move = match &operation {
+            KnowledgeOperation::ManageTree {
+                action: LibraryAction::Move { from, to },
+                ..
+            } => Some((from.clone(), to.clone())),
+            KnowledgeOperation::ManageTree {
+                action: LibraryAction::Reorder { path, sibling, .. },
+                ..
+            } => Some((
+                path.clone(),
+                tree_actions::child_path(
+                    row_actions::document_parts(sibling).0,
+                    row_actions::document_parts(path).1,
+                ),
+            )),
+            _ => None,
+        };
         let deleted = match &operation {
             KnowledgeOperation::DocumentFile {
                 id,
@@ -689,8 +726,11 @@ impl Waku {
                     }
                     Ok(LibraryResponse::Command(KnowledgeResult::Managed { .. })) => {
                         page.loaded = None;
-                        page.file_target = None;
+                        page.move_picker = None;
                         page.panel = Panel::Preview;
+                        if let Some((from, to)) = tree_move {
+                            page.follow_move(&from, &to);
+                        }
                         if let Some(id) = deleted {
                             if page.location.as_ref().is_some_and(|loc| loc.id == id) {
                                 page.location = None;
@@ -750,6 +790,7 @@ impl Waku {
                             document: DocumentPreview::new(document, cx),
                         });
                         page.panel = Panel::Preview;
+                        page.move_picker = None;
                         page.select_document(id);
                     }
                     Ok(_) => page.error = Some(tr!("assistant.invalid_response")),
@@ -770,64 +811,74 @@ impl Waku {
 fn document_tree(
     docs: Vec<LibraryDocument>,
     folders: Vec<String>,
+    positions: &HashMap<String, usize>,
     pins: &HashSet<Uuid>,
 ) -> Vec<TreeRow> {
-    use std::collections::BTreeMap;
-    #[derive(Default)]
-    struct Folder {
-        dirs: BTreeMap<String, Folder>,
-        pinned: BTreeMap<String, LibraryDocument>,
-        files: BTreeMap<String, LibraryDocument>,
+    // Complete implicit parents for catalogs created before empty folders were tracked
+    let mut directories = HashSet::new();
+    for mut parent in folders.iter().map(String::as_str).chain(
+        docs.iter()
+            .map(|doc| row_actions::document_parts(&doc.path).0),
+    ) {
+        while !parent.is_empty() && directories.insert(parent.to_owned()) {
+            parent = row_actions::document_parts(parent).0;
+        }
     }
-    fn flatten(folder: Folder, parent: &str, depth: usize, rows: &mut Vec<TreeRow>) {
-        let file = |(name, doc): (String, LibraryDocument)| TreeRow {
-            path: doc.path,
-            name,
-            id: Some(doc.id),
-            depth,
-        };
-        rows.extend(folder.pinned.into_iter().map(file));
-        for (name, dir) in folder.dirs {
-            let path = if parent.is_empty() {
-                name.clone()
-            } else {
-                format!("{parent}/{name}")
-            };
-            rows.push(TreeRow {
-                path: path.clone(),
-                name,
-                id: None,
-                depth,
+    let entries = directories
+        .into_iter()
+        .map(|path| (path, None))
+        .chain(docs.into_iter().map(|doc| (doc.path, Some(doc.id))));
+    let mut children: HashMap<String, Vec<TreeRow>> = HashMap::new();
+    for (path, id) in entries {
+        let (parent, name) = row_actions::document_parts(&path);
+        children
+            .entry(parent.to_owned())
+            .or_default()
+            .push(TreeRow {
+                name: name.to_owned(),
+                path,
+                id,
+                depth: 0,
+                can_move_up: false,
+                can_move_down: false,
             });
-            flatten(dir, &path, depth + 1, rows);
-        }
-        rows.extend(folder.files.into_iter().map(file));
     }
-    let mut root = Folder::default();
-    for path in folders {
-        let mut folder = &mut root;
-        for part in path.split('/') {
-            folder = folder.dirs.entry(part.to_owned()).or_default();
+    for rows in children.values_mut() {
+        rows.sort_unstable_by(|a, b| {
+            let key = |r: &TreeRow| {
+                (
+                    !r.id.is_some_and(|id| pins.contains(&id)),
+                    positions.get(&r.path).copied().unwrap_or(usize::MAX),
+                    r.id.is_some(),
+                )
+            };
+            key(a).cmp(&key(b)).then_with(|| a.name.cmp(&b.name))
+        });
+        let pinned_count = rows.partition_point(|r| r.id.is_some_and(|id| pins.contains(&id)));
+        for section in [0..pinned_count, pinned_count..rows.len()] {
+            let count = section.len();
+            for (i, row) in rows[section].iter_mut().enumerate() {
+                row.can_move_up = i > 0;
+                row.can_move_down = i + 1 < count;
+            }
         }
-    }
-    for doc in docs {
-        let mut names = doc.path.split(['/', '\\']).collect::<Vec<_>>();
-        let Some(name) = names.pop().map(str::to_owned) else {
-            continue;
-        };
-        let mut folder = &mut root;
-        for part in names {
-            folder = folder.dirs.entry(part.into()).or_default();
-        }
-        let files = if pins.contains(&doc.id) {
-            &mut folder.pinned
-        } else {
-            &mut folder.files
-        };
-        files.insert(name, doc);
     }
     let mut rows = Vec::new();
-    flatten(root, "", 0, &mut rows);
+    let mut pending: Vec<_> = children
+        .remove("")
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .collect();
+    while let Some(row) = pending.pop() {
+        if let Some(items) = children.remove(&row.path) {
+            pending.extend(items.into_iter().rev().map(|mut child| {
+                child.depth = row.depth + 1;
+                child
+            }));
+        }
+        rows.push(row);
+    }
     rows
 }
 
@@ -853,7 +904,8 @@ impl KnowledgePage {
     /// Expand collapsed ancestors before scrolling a newly created folder or document into view
     fn reveal_tree_row(&mut self, i: usize) {
         let path = self.tree[i].path.replace('\\', "/");
-        self.collapsed.retain(|p| !Path::new(&path).starts_with(p));
+        self.collapsed
+            .retain(|p| *p == path || !Path::new(&path).starts_with(p));
         self.refresh_visible();
         if let Some(pos) = self.visible.iter().position(|r| *r == i) {
             self.cursor = pos;
@@ -992,7 +1044,7 @@ impl Waku {
             self.knowledge.editor.update(cx, |i, cx| i.clear(cx));
         }
         self.knowledge.panel = mode;
-        self.knowledge.file_target = None;
+        self.knowledge.move_picker = None;
         cx.notify();
     }
 
@@ -1002,10 +1054,6 @@ impl Waku {
         }
         let p = &self.knowledge;
         let path = p.path_input.read(cx).content().trim().to_owned();
-        if p.panel == Panel::Move {
-            self.save_file_destination(cx);
-            return;
-        }
         let action = match p.panel {
             Panel::CreateFolder => LibraryAction::CreateFolder { path },
             Panel::Create => LibraryAction::Create {
@@ -1214,7 +1262,10 @@ impl Waku {
                         let expanded = is_dir && !p.collapsed.contains(&r.path);
                         let chosen = r.id.is_some() && p.location.as_ref().map(|l| l.id) == r.id;
                         let cursor = tree_focused && pos == p.cursor;
-                        let renaming = r.id.is_some() && p.rename_target == r.id;
+                        let renaming = p
+                            .rename_target
+                            .as_ref()
+                            .is_some_and(|target| target.path == r.path && target.id == r.id);
                         let theme = Theme::current(cx);
                         let group: SharedString = format!("library-row-{pos}").into();
                         let label = if renaming {
@@ -1287,16 +1338,18 @@ impl Waku {
                                         theme.text_secondary,
                                     ))
                                 })
-                                .when(!renaming, |row| {
-                                    this.with_library_row_menu(
-                                        row, id, &r.path, group, chosen, window, cx,
-                                    )
-                                })
                             })
                             .when(!renaming, |row| {
-                                row.on_click(cx.listener(move |this, _, window, cx| {
-                                    this.select_tree_row(pos, window, cx)
-                                }))
+                                let item =
+                                    TreeItem::new(r, &p.status.config.as_ref().unwrap().root);
+                                let row = this.with_library_row_menu(
+                                    row, &item, r, group, chosen, window, cx,
+                                );
+                                this.tree_drag_row(row, item, cx).on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.select_tree_row(pos, window, cx)
+                                    },
+                                ))
                             })
                     })
                     .collect::<Vec<_>>()
@@ -1305,45 +1358,51 @@ impl Waku {
         .track_scroll(&p.tree_scroll)
         .flex_1()
         .min_h_0();
-        let left = div()
-            .w(gpui::relative(0.30))
-            .min_w(px(140.))
-            .max_w(px(280.))
-            .h_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .border_r_1()
-            .border_color(theme.border)
-            .bg(theme.canvas)
-            .child(
-                div()
-                    .h(px(36.))
-                    .px(px(12.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(4.))
-                    .text_color(theme.text_secondary)
-                    .child(tr!("knowledge.tree"))
-                    .when(p.status.config.is_some(), |row| {
-                        row.child(self.library_directory_menu(cx))
-                    }),
-            )
-            .child(
-                div()
-                    .id("library-tree-focus")
-                    .track_focus(&p.tree_focus)
-                    .tab_index(0)
-                    .tab_stop(true)
-                    .flex_1()
-                    .min_h_0()
-                    .px(px(5.))
-                    .flex()
-                    .flex_col()
-                    .on_key_down(cx.listener(Self::tree_key))
-                    .child(tree),
-            );
+        let left =
+            div()
+                .w(gpui::relative(0.30))
+                .min_w(px(140.))
+                .max_w(px(280.))
+                .h_full()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .border_r_1()
+                .border_color(theme.border)
+                .bg(theme.canvas)
+                .child(
+                    div()
+                        .id("library-root-drop")
+                        .drag_over::<TreeItem>(move |s, _, _, _| s.bg(theme.overlay_strong))
+                        .on_drop(cx.listener(|this, item: &TreeItem, _, cx| {
+                            this.move_tree_item(item, "", cx)
+                        }))
+                        .h(px(36.))
+                        .px(px(12.))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(4.))
+                        .text_color(theme.text_secondary)
+                        .child(tr!("knowledge.tree"))
+                        .when(p.status.config.is_some(), |row| {
+                            row.child(self.library_directory_menu(cx))
+                        }),
+                )
+                .child(
+                    div()
+                        .id("library-tree-focus")
+                        .track_focus(&p.tree_focus)
+                        .tab_index(0)
+                        .tab_stop(true)
+                        .flex_1()
+                        .min_h_0()
+                        .px(px(5.))
+                        .flex()
+                        .flex_col()
+                        .on_key_down(cx.listener(Self::tree_key))
+                        .child(tree),
+                );
         let status = &p.status;
         let working = p.busy || p.rename_save.is_some();
         let footer = div()
@@ -1445,22 +1504,21 @@ impl Waku {
                 ))
                 .into_any_element();
         }
+        if p.panel == Panel::Move
+            && let Some(picker) = &p.move_picker
+        {
+            return self.render_move_picker(base, picker, cx);
+        }
         if matches!(
             p.panel,
-            Panel::Create | Panel::CreateFolder | Panel::Edit | Panel::Import | Panel::Move
+            Panel::Create | Panel::CreateFolder | Panel::Edit | Panel::Import
         ) {
             let mut editor = base.p(px(14.)).gap(px(8.)).child(tr!(match p.panel {
                 Panel::Create => "knowledge.new",
                 Panel::CreateFolder => "knowledge.new_folder",
                 Panel::Import => "knowledge.import",
-                Panel::Move => "knowledge.move",
                 _ => "knowledge.edit",
             }));
-            if let Some(doc) = &p.file_target {
-                editor = editor
-                    .child(doc.path.clone())
-                    .child(tr!("knowledge.target_folder"));
-            }
             if p.panel != Panel::Edit {
                 editor = editor.child(TextField::new("note-path", p.path_input.clone()).w_full());
             }
@@ -1579,7 +1637,12 @@ mod tests {
             })
             .collect();
         let pins = HashSet::from([docs[2].id, docs[3].id]);
-        let rows = document_tree(docs, vec!["folder/empty".into(), "folder".into()], &pins);
+        let rows = document_tree(
+            docs,
+            vec!["folder/empty".into(), "folder".into()],
+            &HashMap::new(),
+            &pins,
+        );
         assert_eq!(
             rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
             [
@@ -1589,6 +1652,37 @@ mod tests {
                 "folder/empty",
                 "folder/a.md",
                 "a.md"
+            ]
+        );
+    }
+
+    /// Manual positions mix folders and files within a parent while pins retain their priority
+    #[test]
+    fn manual_tree_order_keeps_pins_and_implicit_parents() {
+        let docs: Vec<_> = ["a.md", "pin.md", "folder/z.md", "folder/a.md"]
+            .into_iter()
+            .map(|path| LibraryDocument {
+                id: Uuid::new_v4(),
+                path: path.into(),
+            })
+            .collect();
+        let pins = HashSet::from([docs[1].id]);
+        let positions = HashMap::from([
+            ("a.md".into(), 0),
+            ("folder".into(), 1),
+            ("folder/z.md".into(), 0),
+        ]);
+        let rows = document_tree(docs, vec!["folder/empty/child".into()], &positions, &pins);
+        assert_eq!(
+            rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            [
+                "pin.md",
+                "a.md",
+                "folder",
+                "folder/z.md",
+                "folder/empty",
+                "folder/empty/child",
+                "folder/a.md"
             ]
         );
     }

@@ -29,7 +29,12 @@ pub(super) fn initialize(path: &Path) -> Result<Connection> {
         CREATE TABLE IF NOT EXISTS documents(
             id TEXT PRIMARY KEY, root TEXT NOT NULL, path TEXT NOT NULL, revision TEXT NOT NULL,
             indexed_with TEXT, UNIQUE(root,path));
+        CREATE TABLE IF NOT EXISTS entry_order(root TEXT NOT NULL, path TEXT NOT NULL, position INTEGER NOT NULL, PRIMARY KEY(root,path));
         CREATE TABLE IF NOT EXISTS folders(root TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY(root,path));
+        CREATE TRIGGER IF NOT EXISTS forget_document_position AFTER DELETE ON documents BEGIN
+            DELETE FROM entry_order WHERE root=OLD.root AND path=OLD.path; END;
+        CREATE TRIGGER IF NOT EXISTS forget_folder_position AFTER DELETE ON folders BEGIN
+            DELETE FROM entry_order WHERE root=OLD.root AND path=OLD.path; END;
         CREATE TABLE IF NOT EXISTS passages(
             doc TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             start INTEGER NOT NULL, end INTEGER NOT NULL, line INTEGER NOT NULL,
@@ -125,18 +130,23 @@ pub(super) fn list(
     offset: usize,
     include_folders: bool,
 ) -> Result<KnowledgeResult> {
-    let mut stmt = db.prepare("SELECT id,path FROM documents WHERE root=?1
-        UNION ALL SELECT NULL,path FROM folders WHERE root=?1 AND ?2 ORDER BY path LIMIT 51 OFFSET ?3")?;
+    let mut stmt = db.prepare("SELECT entries.id,entries.path,entry_order.position FROM
+        (SELECT id,path FROM documents WHERE root=?1 UNION ALL SELECT NULL,path FROM folders WHERE root=?1 AND ?2) entries
+        LEFT JOIN entry_order ON entry_order.root=?1 AND entry_order.path=entries.path ORDER BY entries.path LIMIT 51 OFFSET ?3")?;
     let mut rows = stmt.query(params![root, include_folders, offset])?;
     let mut documents = Vec::new();
     let mut folders = Vec::new();
+    let mut positions = std::collections::HashMap::new();
     let mut more = false;
     while let Some(row) = rows.next()? {
         if documents.len() + folders.len() == 50 {
             more = true;
             break;
         }
-        let path = row.get(1)?;
+        let path: String = row.get(1)?;
+        if let Some(position) = row.get::<_, Option<usize>>(2)? {
+            positions.insert(path.clone(), position);
+        }
         match row.get::<_, Option<String>>(0)? {
             Some(id) => documents.push(LibraryDocument {
                 id: id.parse()?,
@@ -148,6 +158,7 @@ pub(super) fn list(
     Ok(KnowledgeResult::Documents {
         documents,
         folders,
+        positions,
         more,
     })
 }
@@ -349,14 +360,20 @@ pub(super) fn stage(
 }
 
 /// Readers see all passages from exactly one complete revision
-pub(super) fn publish(db: &mut Connection, id: &str, rev: &str, key: &str) -> Result<()> {
+pub(super) fn publish(
+    db: &mut Connection,
+    id: &str,
+    path: &str,
+    rev: &str,
+    key: &str,
+) -> Result<()> {
     let tx = db.transaction()?;
     ensure!(
         tx.execute(
-            "UPDATE documents SET indexed_with=? WHERE id=? AND revision=?",
-            [key, id, rev]
+            "UPDATE documents SET indexed_with=? WHERE id=? AND path=? AND revision=?",
+            [key, id, path, rev]
         )? == 1,
-        "Note revision changed"
+        "Document path or revision changed"
     );
     tx.execute("DELETE FROM passages WHERE doc=?", [id])?;
     tx.execute(

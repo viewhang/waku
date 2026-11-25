@@ -41,6 +41,9 @@ url = "2"
 uuid = { version = "1.18", features = ["v4", "serde"] }
 waku-protocol = { path = "../waku-protocol" }
 
+[target.'cfg(any(target_vendor = "apple", target_os = "linux"))'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -54,7 +57,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 ] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"

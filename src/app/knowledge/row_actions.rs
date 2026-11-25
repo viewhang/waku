@@ -1,10 +1,14 @@
-//! Document row menus bind their actions to catalog IDs independently of the main preview
+//! Folder and document rows share a context menu and an inline filename editor
 
 use super::*;
 use std::io::Write;
 
 #[derive(Clone, Copy)]
 enum RowAction {
+    Create,
+    CreateFolder,
+    Up,
+    Down,
     OpenWindow,
     Duplicate,
     Move,
@@ -37,27 +41,30 @@ impl Waku {
     pub(super) fn with_library_row_menu(
         &self,
         row: Stateful<Div>,
-        id: Uuid,
-        path: &str,
+        target: &TreeItem,
+        entry: &TreeRow,
         group: SharedString,
         selected: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = Theme::current(cx);
-        let key: SharedString = format!("knowledge-actions-{id}").into();
+        let key: SharedString = format!("knowledge-actions-{}:{}", target.root, target.path).into();
         // Virtualized rows release their focus and menu state when they leave the viewport
         let menu = window
             .use_keyed_state(key.clone(), cx, |_, cx| ContextMenuHandle::new(cx))
             .read(cx)
             .clone();
         let weak = cx.weak_entity();
-        let doc = LibraryDocument {
-            id,
-            path: path.into(),
-        };
-        let pinned = self.state.pinned_documents.contains(&id);
-        let favorite = self.state.favorite_documents.contains(&id);
+        let (can_move_up, can_move_down) = (entry.can_move_up, entry.can_move_down);
+        let target = target.clone();
+        let folder = target.id.is_none();
+        let pinned = target
+            .id
+            .is_some_and(|id| self.state.pinned_documents.contains(&id));
+        let favorite = target
+            .id
+            .is_some_and(|id| self.state.favorite_documents.contains(&id));
         let trigger = icon_button(key.clone(), "icons/ellipsis.svg", theme)
             .flex_none()
             .when(!selected && !menu.is_open(), |e| {
@@ -66,18 +73,58 @@ impl Waku {
             .focus_visible(|s| s.opacity(1.).border_1().border_color(theme.accent))
             .when(menu.is_open(), |e| e.bg(theme.overlay_strong))
             .on_click(|_, _, cx| cx.stop_propagation())
-            .tooltip(Tooltip::text(tr!("knowledge.document_actions")));
+            .tab_index(0)
+            .tooltip(Tooltip::text(tr!(if folder {
+                "knowledge.folder_actions"
+            } else {
+                "knowledge.document_actions"
+            })));
         let dropdown = dropdown_menu(trigger, key, &menu, MenuAlign::BelowLeft, move |_| {
             let item = |label: &str, icon, action| {
                 let weak = weak.clone();
-                let doc = doc.clone();
+                let target = target.clone();
                 MenuItem::new(tr!(label), move |window, cx| {
                     let _ = weak.update(cx, |this, cx| {
-                        this.document_row_action(action, &doc, window, cx)
+                        this.tree_row_action(action, &target, window, cx)
                     });
                 })
                 .icon(icon)
             };
+            let step = |after| {
+                if after {
+                    item(
+                        "knowledge.move_down",
+                        "icons/arrow-down.svg",
+                        RowAction::Down,
+                    )
+                    .disabled(!can_move_down)
+                } else {
+                    item("knowledge.move_up", "icons/arrow-up.svg", RowAction::Up)
+                        .disabled(!can_move_up)
+                }
+            };
+            if folder {
+                return vec![
+                    item("knowledge.new", "icons/file.svg", RowAction::Create),
+                    item(
+                        "knowledge.new_folder",
+                        "icons/folder-new.svg",
+                        RowAction::CreateFolder,
+                    ),
+                    MenuItem::Separator,
+                    item("common.rename", "icons/pencil.svg", RowAction::Rename),
+                    item("knowledge.move", "icons/folder-open.svg", RowAction::Move),
+                    step(false),
+                    step(true),
+                    MenuItem::Separator,
+                    item(
+                        "knowledge.trash_folder",
+                        "icons/trash.svg",
+                        RowAction::Delete,
+                    )
+                    .destructive(),
+                ];
+            }
             let download = item("knowledge.original", "icons/file.svg", RowAction::Download);
             vec![
                 item(
@@ -91,6 +138,8 @@ impl Waku {
                     RowAction::Duplicate,
                 ),
                 item("knowledge.move", "icons/folder-open.svg", RowAction::Move),
+                step(false),
+                step(true),
                 item(
                     "knowledge.copy_address",
                     "icons/copy.svg",
@@ -130,22 +179,107 @@ impl Waku {
             })
     }
 
-    /// Resolve the clicked row again after a menu delay before acting on its cached path
-    fn document_row_action(
+    /// Revalidate menu targets after delayed activation or a library switch
+    fn tree_row_action(
         &mut self,
         action: RowAction,
-        doc: &LibraryDocument,
+        item: &TreeItem,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self
-            .knowledge
-            .tree
-            .iter()
-            .any(|row| row.id == Some(doc.id) && row.path == doc.path)
+        if !self.has_tree_item(item) {
+            return;
+        }
+        if !matches!(
+            action,
+            RowAction::OpenWindow
+                | RowAction::Download
+                | RowAction::CopyPath
+                | RowAction::Pin
+                | RowAction::Favorite
+        ) && !self.tree_editable(cx)
         {
             return;
         }
+        match action {
+            RowAction::Create | RowAction::CreateFolder => {
+                let mode = if matches!(action, RowAction::Create) {
+                    Panel::Create
+                } else {
+                    Panel::CreateFolder
+                };
+                self.library_mode(mode, cx);
+                self.knowledge.path_input.update(cx, |input, cx| {
+                    input.set_content(format!("{}/", item.path), cx)
+                });
+                window.focus(&self.knowledge.path_input.read(cx).focus(), cx);
+                return;
+            }
+            RowAction::Up | RowAction::Down => {
+                let after = matches!(action, RowAction::Down);
+                if let Some(sibling) = self.tree_neighbor(item, after) {
+                    self.reorder_tree_item(item, sibling, after, cx);
+                }
+                return;
+            }
+            RowAction::Rename => {
+                let page = &mut self.knowledge;
+                page.rename_target = Some(item.clone());
+                if let Some(i) = page.tree.iter().position(|row| row.path == item.path) {
+                    page.reveal_tree_row(i);
+                }
+                let (_, name) = document_parts(&item.path);
+                page.rename_input.update(cx, |input, cx| {
+                    edit_filename(input, name, cx);
+                    if item.id.is_none() {
+                        input.select_all_text(cx);
+                    }
+                });
+                let focus = page.rename_input.read(cx).focus();
+                window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+                cx.notify();
+                return;
+            }
+            RowAction::Move => {
+                self.open_move_picker(item, window, cx);
+                return;
+            }
+            RowAction::Delete if item.id.is_none() => {
+                let item = item.clone();
+                let confirm = window.prompt(
+                    gpui::PromptLevel::Warning,
+                    &tr!("knowledge.trash_folder_confirm", path = &item.path),
+                    None,
+                    &[
+                        gpui::PromptButton::cancel(tr!("common.cancel")),
+                        gpui::PromptButton::new(tr!("knowledge.trash_folder")),
+                    ],
+                    cx,
+                );
+                cx.spawn(async move |view, cx| {
+                    if confirm.await == Ok(1) {
+                        let _ = view.update(cx, |this, cx| {
+                            if this.has_tree_item(&item) && this.tree_editable(cx) {
+                                this.library_action(
+                                    item.operation(LibraryAction::DeleteFolder {
+                                        path: item.path.clone(),
+                                    }),
+                                    cx,
+                                );
+                            }
+                        });
+                    }
+                })
+                .detach();
+                return;
+            }
+            _ => {}
+        }
+        let Some(id) = item.id else { return };
+        let doc = &LibraryDocument {
+            id,
+            path: item.path.clone(),
+        };
         match action {
             RowAction::OpenWindow | RowAction::Download => self.read_row_source(doc, action, cx),
             RowAction::CopyPath => {
@@ -171,33 +305,12 @@ impl Waku {
                     self.poll_library(cx);
                 }
             }
-            _ if self.knowledge.busy
-                || self.knowledge.rename_save.is_some()
-                || self.has_library_draft(cx) =>
-            {
-                return;
-            }
-            RowAction::Rename => {
-                let page = &mut self.knowledge;
-                page.rename_target = Some(doc.id);
-                page.select_document(doc.id);
-                let (_, name) = document_parts(&doc.path);
-                page.rename_input
-                    .update(cx, |input, cx| edit_filename(input, name, cx));
-                let focus = page.rename_input.read(cx).focus();
-                window.on_next_frame(move |window, cx| window.focus(&focus, cx));
-            }
-            RowAction::Move => {
-                self.library_mode(Panel::Move, cx);
-                self.knowledge.file_target = Some(doc.clone());
-                self.knowledge.path_input.update(cx, |input, cx| {
-                    input.set_placeholder("", cx);
-                    input.set_content(document_parts(&doc.path).0.to_owned(), cx);
-                    input.select_all_text(cx);
-                });
-                let focus = self.knowledge.path_input.read(cx).focus();
-                window.on_next_frame(move |window, cx| window.focus(&focus, cx));
-            }
+            RowAction::Create
+            | RowAction::CreateFolder
+            | RowAction::Up
+            | RowAction::Down
+            | RowAction::Rename
+            | RowAction::Move => unreachable!(),
             RowAction::Duplicate => {
                 let (_, filename) = document_parts(&doc.path);
                 let Some((stem, ext)) = filename.rsplit_once('.') else {
@@ -288,10 +401,18 @@ impl Waku {
         cx: &mut Context<Self>,
     ) -> bool {
         let page = &mut self.knowledge;
-        let Some(id) = page.rename_target.filter(|_| page.rename_save.is_none()) else {
+        let Some(item) = page
+            .rename_target
+            .clone()
+            .filter(|_| page.rename_save.is_none())
+        else {
             return true;
         };
-        let Some(row) = page.tree.iter().find(|row| row.id == Some(id)) else {
+        let Some(row) = page
+            .tree
+            .iter()
+            .find(|row| row.path == item.path && row.id == item.id)
+        else {
             return true;
         };
         let name = name.trim();
@@ -307,10 +428,10 @@ impl Waku {
             return true;
         }
         let to = format!("{}{name}", &row.path[..row.path.len() - row.name.len()]);
-        let operation = KnowledgeOperation::DocumentFile {
-            id,
-            action: DocumentFileAction::Move { to: to.clone() },
-        };
+        let operation = item.operation(LibraryAction::Move {
+            from: item.path.clone(),
+            to: to.clone(),
+        });
         page.rename_input
             .update(cx, |input, _| input.set_read_only(true));
         let client = self.daemon.client();
@@ -331,16 +452,7 @@ impl Waku {
                 }
                 match result {
                     Ok(KnowledgeResult::Managed { .. }) => {
-                        // Paint the confirmed name immediately while the catalog refresh sorts the rows
-                        if let Some(row) = page.tree.iter_mut().find(|row| row.id == Some(id)) {
-                            row.name = document_parts(&to).1.to_owned();
-                            row.path.clone_from(&to);
-                        }
-                        if let Some(loc) = &mut page.location
-                            && loc.id == id
-                        {
-                            loc.path = to;
-                        }
+                        page.follow_move(&item.path, &to);
                         page.loaded = None;
                         page.rename_target = None;
                         if focused {
@@ -356,30 +468,6 @@ impl Waku {
         }));
         cx.notify();
         true
-    }
-
-    /// Moving to another directory preserves the original filename
-    pub(super) fn save_file_destination(&mut self, cx: &mut Context<Self>) {
-        let p = &self.knowledge;
-        let Some(doc) = &p.file_target else { return };
-        let input = p.path_input.read(cx).content().trim();
-        let (_, old_name) = document_parts(&doc.path);
-        let to = if input.is_empty() {
-            old_name.to_string()
-        } else {
-            format!("{}/{old_name}", input.trim_end_matches('/'))
-        };
-        if to == doc.path {
-            self.library_mode(Panel::Preview, cx);
-            return;
-        }
-        self.library_action(
-            KnowledgeOperation::DocumentFile {
-                id: doc.id,
-                action: DocumentFileAction::Move { to },
-            },
-            cx,
-        );
     }
 
     /// Export writes the full original source and an independent window owns its own reading position

@@ -2586,6 +2586,18 @@ knowledge.create_folder_failed:
 knowledge.add:
   en: "Create or import"
 
+knowledge.folder_actions:
+  en: "Folder actions"
+knowledge.root_folder:
+  en: "Library root"
+knowledge.move_up:
+  en: "Move up"
+knowledge.move_down:
+  en: "Move down"
+knowledge.trash_folder:
+  en: "Move to trash"
+knowledge.trash_folder_confirm:
+  en: "Move “%{path}” and all its contents to the trash?"
 knowledge.document_actions:
   en: "Document actions"
 
@@ -2623,7 +2635,7 @@ knowledge.filename:
   en: "File name"
 
 knowledge.target_folder:
-  en: "Destination folder (leave empty for the library root)"
+  en: "Choose a destination folder"
 
 knowledge.invalid_name:
   en: "Enter a file name without a directory"

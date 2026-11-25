@@ -13,7 +13,7 @@ use uuid::Uuid;
 use waku_protocol::knowledge::*;
 
 /// Notes and folders use visible components relative to the selected library
-fn relative_path(path: &str) -> Result<&Path> {
+pub(super) fn relative_path(path: &str) -> Result<&Path> {
     let p = Path::new(path);
     ensure!(
         path.split('/')
@@ -43,7 +43,7 @@ pub(super) fn root_dir(root: &Path) -> Result<Dir> {
 }
 
 /// Match the scanner's exclusion of symlinks for existing and new paths
-fn check_ancestors(dir: &Dir, path: &Path) -> Result<()> {
+pub(super) fn check_ancestors(dir: &Dir, path: &Path) -> Result<()> {
     for ancestor in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
         match dir.symlink_metadata(ancestor) {
             Ok(meta) => ensure!(
@@ -116,7 +116,7 @@ pub(super) fn read_note(root: &Path, path: &str) -> Result<String> {
 }
 
 /// Stage beside the destination and publish without overwriting a concurrent create
-fn atomic_write(dir: &Dir, path: &Path, data: &[u8], replace: bool) -> Result<()> {
+pub(super) fn atomic_write(dir: &Dir, path: &Path, data: &[u8], replace: bool) -> Result<()> {
     ensure!(
         data.len() as u64 <= index::MAX_NOTE_BYTES,
         "Note exceeds 32 MiB"
@@ -145,6 +145,42 @@ fn atomic_write(dir: &Dir, path: &Path, data: &[u8], replace: bool) -> Result<()
     result
 }
 
+/// Validate new document bytes on both writes and renames that change the file format
+pub(super) fn validate_body(path: &Path, body: &str) -> Result<()> {
+    ensure!(
+        body.len() as u64 <= index::MAX_NOTE_BYTES,
+        "Note exceeds 32 MiB"
+    );
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("xml"))
+    {
+        let mut xml = quick_xml::Reader::from_str(body);
+        while !matches!(xml.read_event()?, quick_xml::events::Event::Eof) {}
+    }
+    Ok(())
+}
+
+/// The versions table belongs to the history database, either opened directly or attached for a move
+pub(super) fn save_version(db: &Connection, root: &str, path: &str, body: &str) -> Result<()> {
+    db.execute(
+        "INSERT INTO versions VALUES(?,?,?,?,?)",
+        params![
+            Uuid::new_v4().to_string(),
+            root,
+            path,
+            chrono::Utc::now().to_rfc3339(),
+            body
+        ],
+    )?;
+    db.execute(
+        "DELETE FROM versions WHERE root=?1 AND path=?2 AND version NOT IN
+        (SELECT version FROM versions WHERE root=?1 AND path=?2 ORDER BY saved_at DESC LIMIT 50)",
+        [root, path],
+    )?;
+    Ok(())
+}
+
 struct Change {
     path: String,
     before: Option<String>,
@@ -170,7 +206,7 @@ impl Change {
 
 impl KnowledgeLibrary {
     /// Historical note text lives outside the rebuildable vector index
-    fn history_db(&self) -> Result<Connection> {
+    pub(super) fn history_db(&self) -> Result<Connection> {
         let db = index::connect(&self.path.with_file_name("knowledge-history.sqlite"))?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS versions(version TEXT PRIMARY KEY,root TEXT NOT NULL,path TEXT NOT NULL,saved_at TEXT NOT NULL,body TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS note_versions ON versions(root,path,saved_at)")?;
@@ -203,6 +239,43 @@ impl KnowledgeLibrary {
         let _serial = self.writes.lock();
         self.current(generation)?;
         self.apply_action(config, action, article)
+    }
+
+    /// Validate the menu target under the same lock as the filesystem and catalog changes
+    pub(super) fn manage_tree(
+        &self,
+        root: &str,
+        id: Option<Uuid>,
+        action: LibraryAction,
+    ) -> Result<KnowledgeResult> {
+        let _serial = self.writes.lock();
+        let (_, config) = self.active()?;
+        ensure!(config.root == root, "The active knowledge library changed");
+        let path = match &action {
+            LibraryAction::Move { from, to } => {
+                let parent = relative_path(to)?.parent().unwrap();
+                ensure!(
+                    parent.as_os_str().is_empty() || root_dir(Path::new(root))?.is_dir(parent),
+                    "Destination folder no longer exists"
+                );
+                from
+            }
+            LibraryAction::Reorder { path, .. } | LibraryAction::DeleteFolder { path } => path,
+            _ => anyhow::bail!("Expected a directory operation"),
+        };
+        if let Some(id) = id {
+            let location = index::document_location(&index::connect(&self.path)?, id)?;
+            ensure!(
+                location.0 == root && location.1 == *path,
+                "The document has moved"
+            );
+        } else {
+            ensure!(
+                root_dir(Path::new(root))?.is_dir(relative_path(path)?),
+                "Folder no longer exists"
+            );
+        }
+        self.apply_action(config, action, None)
     }
 
     /// Resolve the row under the write lock so a stale menu cannot act on a replacement file
@@ -254,7 +327,7 @@ impl KnowledgeLibrary {
             |path: &str| current(&dir, valid_path(path)?)?.context("Document does not exist");
         let mut changes = Vec::new();
         let mut assets = Vec::new();
-        let mut moved = None;
+
         match action {
             LibraryAction::CreateFolder { path } => {
                 let relative = relative_path(&path)?;
@@ -364,31 +437,26 @@ impl KnowledgeLibrary {
                 }
             }
             LibraryAction::Move { from, to } => {
-                valid_path(&to)?;
-                ensure!(from != to, "Source and destination are identical");
-                let original = read(&from)?;
-                let body = if index::is_markdown(Path::new(&from)) {
-                    markdown::moved_links(&original, root, &from, &from, &to)?
-                } else {
-                    original.clone()
-                };
-                changes.push(Change::create(to.clone(), body));
-                for path in index::inventory(root)?.files {
-                    if path == from || !index::is_markdown(Path::new(&path)) {
-                        continue;
-                    }
-                    let old = read(&path)?;
-                    let new = markdown::moved_links(&old, root, &path, &from, &to)?;
-                    if new != old {
-                        changes.push(Change::edit(path, old, new));
-                    }
-                }
-                changes.push(Change {
-                    path: from.clone(),
-                    before: Some(original),
-                    after: None,
-                });
-                moved = Some((from, to));
+                return self.place_entry(&config.root, &dir, &from, &to, None);
+            }
+            LibraryAction::Reorder {
+                path,
+                sibling,
+                after,
+            } => {
+                let anchor = relative_path(&sibling)?;
+                let name = relative_path(&path)?.file_name().unwrap();
+                let to = anchor.with_file_name(name);
+                return self.place_entry(
+                    &config.root,
+                    &dir,
+                    &path,
+                    &to.to_str().unwrap().replace(std::path::MAIN_SEPARATOR, "/"),
+                    Some((&sibling, after)),
+                );
+            }
+            LibraryAction::DeleteFolder { path } => {
+                return self.trash_folder(&config.root, &dir, &path);
             }
             LibraryAction::ImportUrl { path, .. } => {
                 ensure!(
@@ -433,34 +501,10 @@ impl KnowledgeLibrary {
                 c.path
             );
             if let Some(body) = &c.after {
-                ensure!(
-                    body.len() as u64 <= index::MAX_NOTE_BYTES,
-                    "Note exceeds 32 MiB"
-                );
-                if Path::new(&c.path)
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("xml"))
-                {
-                    let mut xml = quick_xml::Reader::from_str(body);
-                    loop {
-                        if matches!(xml.read_event()?, quick_xml::events::Event::Eof) {
-                            break;
-                        }
-                    }
-                }
+                validate_body(Path::new(&c.path), body)?;
             }
             if let Some(old) = &c.before {
-                tx.execute(
-                    "INSERT INTO versions VALUES(?,?,?,?,?)",
-                    params![
-                        Uuid::new_v4().to_string(),
-                        config.root,
-                        c.path,
-                        chrono::Utc::now().to_rfc3339(),
-                        old
-                    ],
-                )?;
-                tx.execute("DELETE FROM versions WHERE root=?1 AND path=?2 AND version NOT IN (SELECT version FROM versions WHERE root=?1 AND path=?2 ORDER BY saved_at DESC LIMIT 50)",params![config.root,c.path])?;
+                save_version(&tx, &config.root, &c.path, old)?;
             }
         }
         tx.commit()?;
@@ -481,47 +525,27 @@ impl KnowledgeLibrary {
                 match &c.after {
                     Some(body) => atomic_write(&dir, path, body.as_bytes(), c.before.is_some())?,
                     None => {
-                        if moved.is_some() {
-                            dir.remove_file(path)?;
-                        } else {
-                            let trash = Path::new(".waku-trash")
-                                .join(Uuid::new_v4().to_string())
-                                .join(path);
-                            dir.create_dir_all(trash.parent().unwrap())?;
-                            dir.rename(path, &dir, trash)?;
-                        }
+                        let trash = Path::new(".waku-trash")
+                            .join(Uuid::new_v4().to_string())
+                            .join(path);
+                        dir.create_dir_all(trash.parent().unwrap())?;
+                        dir.rename(path, &dir, trash)?;
                     }
                 }
                 applied += 1;
             }
             let mut db = index::initialize(&self.path)?;
-            if moved.is_some() {
-                db.execute(
-                    "ATTACH DATABASE ? AS history",
-                    [self
-                        .path
-                        .with_file_name("knowledge-history.sqlite")
-                        .to_str()
-                        .context("Invalid history path")?],
-                )?;
-            }
             let tx = db.transaction()?;
-            if let Some((from, to)) = &moved {
-                tx.execute(
-                    "UPDATE documents SET path=?,indexed_with=NULL WHERE root=? AND path=?",
-                    params![to, config.root, from],
-                )?;
-                tx.execute(
-                    "UPDATE history.versions SET path=? WHERE root=? AND path=?",
-                    params![to, config.root, from],
-                )?;
-            }
             for c in &changes {
                 if let Some(body) = &c.after {
                     index::prepare(&tx, &config.root, &c.path, &index::revision(body), "")?;
                 } else {
                     tx.execute(
                         "DELETE FROM documents WHERE root=? AND path=?",
+                        params![config.root, c.path],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM entry_order WHERE root=? AND path=?",
                         params![config.root, c.path],
                     )?;
                 }

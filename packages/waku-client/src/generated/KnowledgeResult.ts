@@ -4,4 +4,8 @@ import type { LibraryDocument } from "./LibraryDocument";
 import type { LibraryStatus } from "./LibraryStatus";
 import type { LibraryVersion } from "./LibraryVersion";
 
-export type KnowledgeResult = { "type": "managed", paths: Array<string>, } | { "type": "versions", versions: Array<LibraryVersion>, } | { "type": "source", path: string, revision: string, text: string, } | { "type": "status", status: LibraryStatus, } | { "type": "documents", documents: Array<LibraryDocument>, folders: Array<string>, more: boolean, } | { "type": "matches", sources: Array<KnowledgeSource>, warnings: Array<string>, } | { "type": "answer", text: string, sources: Array<KnowledgeSource>, warnings: Array<string>, } | { "type": "passage", path: string, revision: string, changed: boolean, text: string, next: number | null, };
+export type KnowledgeResult = { "type": "managed", paths: Array<string>, } | { "type": "versions", versions: Array<LibraryVersion>, } | { "type": "source", path: string, revision: string, text: string, } | { "type": "status", status: LibraryStatus, } | { "type": "documents", documents: Array<LibraryDocument>, folders: Array<string>,
+/**
+ * Only entries with a saved sibling position are included in this page
+ */
+positions: { [key in string]: number }, more: boolean, } | { "type": "matches", sources: Array<KnowledgeSource>, warnings: Array<string>, } | { "type": "answer", text: string, sources: Array<KnowledgeSource>, warnings: Array<string>, } | { "type": "passage", path: string, revision: string, changed: boolean, text: string, next: number | null, };

@@ -1226,6 +1226,12 @@ knowledge.create_folder_failed: "フォルダ「%{path}」を作成できませ�
 
 knowledge.add: "新規作成または取り込み"
 
+knowledge.folder_actions: "フォルダの操作"
+knowledge.root_folder: "ライブラリのルート"
+knowledge.move_up: "上へ移動"
+knowledge.move_down: "下へ移動"
+knowledge.trash_folder: "ゴミ箱に移動"
+knowledge.trash_folder_confirm: "「%{path}」とそのすべての内容をゴミ箱に移動しますか？"
 knowledge.document_actions: "ドキュメントの操作"
 
 knowledge.open_window: "新しいウィンドウで開く"
@@ -1250,7 +1256,7 @@ knowledge.original: "元のドキュメント"
 
 knowledge.filename: "ファイル名"
 
-knowledge.target_folder: "移動先フォルダ（空欄はライブラリのルート）"
+knowledge.target_folder: "移動先フォルダを選択"
 
 knowledge.invalid_name: "フォルダを含まないファイル名を入力してください"
 

@@ -67,8 +67,11 @@ pub(super) fn moved_links(
 ) -> Result<String> {
     let source = Url::from_file_path(root.join(owner))
         .map_err(|_| anyhow::anyhow!("Invalid source path"))?;
-    let new_owner = if owner == from { to } else { owner };
-    let base = Url::from_file_path(root.join(new_owner))
+    // Rebase both ends of links when their common ancestor is moved
+    let owner_path = Path::new(owner);
+    let new_owner = super::tree::relocated_path(owner_path, Path::new(from), Path::new(to))
+        .unwrap_or_else(|| owner_path.to_owned());
+    let base = Url::from_file_path(root.join(&new_owner))
         .map_err(|_| anyhow::anyhow!("Invalid destination path"))?;
     let old = root.join(from);
     let new = root.join(to);
@@ -106,13 +109,25 @@ pub(super) fn moved_links(
         let Ok(path) = target.to_file_path() else {
             continue;
         };
-        if path == old {
-            let mut replacement = Url::from_file_path(&new).unwrap();
+        let relocated = super::tree::relocated_path(&path, &old, &new);
+        if relocated.is_none() && owner_path == new_owner {
+            continue;
+        }
+        // Preserve the original Markdown spelling when the relative destination still resolves correctly
+        if base
+            .join(&dest)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .as_deref()
+            == Some(relocated.as_deref().unwrap_or(&path))
+        {
+            continue;
+        }
+        if let Some(target_path) = relocated {
+            let mut replacement = Url::from_file_path(target_path).unwrap();
             replacement.set_fragment(target.fragment());
             replacement.set_query(target.query());
             target = replacement;
-        } else if owner == new_owner {
-            continue;
         }
         let Some(relative) = base.make_relative(&target) else {
             continue;

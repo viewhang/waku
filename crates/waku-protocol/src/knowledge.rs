@@ -88,6 +88,12 @@ pub enum KnowledgeOperation {
     Manage {
         action: LibraryAction,
     },
+    /// Bind a delayed desktop tree action to its original library and document identity
+    ManageTree {
+        root: String,
+        id: Option<Uuid>,
+        action: LibraryAction,
+    },
     /// A directory row keeps its immutable document identity across menu and dialog interactions
     DocumentFile {
         id: Uuid,
@@ -178,6 +184,9 @@ pub enum KnowledgeResult {
         documents: Vec<LibraryDocument>,
         #[serde(default)]
         folders: Vec<String>,
+        /// Only entries with a saved sibling position are included in this page
+        #[serde(default)]
+        positions: std::collections::HashMap<String, usize>,
         more: bool,
     },
     Matches {
@@ -229,6 +238,17 @@ pub enum LibraryAction {
     Move {
         from: String,
         to: String,
+    },
+    /// Place the entry immediately before or after a sibling, moving it into that parent if needed
+    Reorder {
+        path: String,
+        sibling: String,
+        #[serde(default)]
+        after: bool,
+    },
+    /// Trash the entire directory, including files outside the document index
+    DeleteFolder {
+        path: String,
     },
     BatchTag {
         paths: Vec<String>,
