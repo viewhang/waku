@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 pub use waku_protocol::settings::DaemonSettings;
-use waku_protocol::settings::{ModelService, ServiceModel};
+use waku_protocol::settings::{AssistantProfile, ModelService, ServiceModel};
 
 pub(crate) const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
 // Model entries use UUIDs, leaving this credential ID reserved for Tavily
@@ -121,21 +121,11 @@ impl DaemonSettingsStore {
         store_api_key(&database, TAVILY_KEY_ID, TAVILY_ENDPOINT, key)
     }
 
-    /// Older sessions still refer to a model service by URL
-    pub fn legacy_model_service(&self, assistant: Uuid, base_url: &str) -> Option<ModelService> {
-        let base_url = base_url.trim().trim_end_matches('/');
+    /// Take a snapshot of the current service for the assistant worker
+    pub fn assistant_model_service(&self, profile: &AssistantProfile) -> Option<ModelService> {
         let settings = self.settings.lock();
-        let default = settings
-            .assistants
-            .iter()
-            .find(|item| item.id == assistant)
-            .and_then(|item| item.model_service_id);
-        settings
-            .model_services
-            .iter()
-            .filter(|service| service.base_url == base_url)
-            .filter(|service| service.legacy_key || default == Some(service.id))
-            .max_by_key(|service| default == Some(service.id))
+        profile
+            .service(&settings.model_services, &settings.assistants)
             .cloned()
     }
 

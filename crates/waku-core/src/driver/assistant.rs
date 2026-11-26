@@ -520,14 +520,10 @@ fn connection_settings(
     profile: &AssistantProfile,
     settings: &DaemonSettingsStore,
 ) -> anyhow::Result<(Url, Option<ModelService>)> {
-    let service = match profile.model_service_id {
-        Some(id) => Some(
-            settings
-                .model_service(id)
-                .context("Model service is missing")?,
-        ),
-        None => settings.legacy_model_service(profile.id, &profile.base_url),
-    };
+    let service = settings.assistant_model_service(profile);
+    if service.is_none() && profile.model_service_id.is_some() {
+        bail!("Model service is missing");
+    }
     if let Some(service) = service.as_ref() {
         if !service.enabled {
             bail!("Model service {} is disabled", service.name);

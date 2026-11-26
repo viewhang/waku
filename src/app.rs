@@ -2421,6 +2421,9 @@ impl Waku {
                 &composer,
                 |this: &mut Self, _, event: &ComposerEvent, cx| match event {
                     ComposerEvent::Submit(prompt) => {
+                        if prompt.trim().is_empty() && this.composer_attachments.is_empty() {
+                            return;
+                        }
                         if let Some(session_id) = this.selected_session().and_then(|session| {
                             this.response_fork_preparations
                                 .contains_key(&session.id)

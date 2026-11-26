@@ -9079,6 +9079,7 @@ dependencies = [
  "dirs",
  "dom_query",
  "eventsource-stream",
+ "image",
  "libc",
  "notify",
  "nucleo-matcher",

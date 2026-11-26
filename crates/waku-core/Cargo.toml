@@ -20,6 +20,7 @@ cap-std = "4"
 quick-xml = "0.39"
 pulldown-cmark = "0.13"
 eventsource-stream = "0.2"
+image = { version = "0.25", default-features = false, features = ["bmp", "png", "tiff"] }
 nucleo-matcher = "0.3"
 notify = "8.2"
 parking_lot = "0.12"

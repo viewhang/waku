@@ -593,6 +593,19 @@ fn media_paste_entries(clipboard: &ClipboardItem) -> Option<Vec<ClipboardEntry>>
     (!entries.is_empty()).then_some(entries)
 }
 
+/// GPUI reads plain text while Markdown editors can publish the source under its own pasteboard type
+#[cfg(target_os = "macos")]
+fn pasteboard_markdown(board: &objc2_app_kit::NSPasteboard) -> Option<String> {
+    ["net.daringfireball.markdown", "text/markdown"]
+        .into_iter()
+        .find_map(|kind| {
+            let data = board.dataForType(&objc2_foundation::NSString::from_str(kind))?;
+            String::from_utf8(data.to_vec())
+                .ok()
+                .filter(|text| !text.is_empty())
+        })
+}
+
 /// The web's input/textarea split, because it is the load-bearing one: a
 /// single-line field never wraps — overlong text slides horizontally under a
 /// clipped viewport, pasted breaks collapse to spaces, and Enter always
@@ -699,6 +712,8 @@ pub struct TextInput {
     history: EditHistory,
     external_context_menu_focus_holds: usize,
     context_menu: ContextMenuHandle,
+    /// Clipboard availability is sampled when the menu opens so rendering never reads the system pasteboard
+    context_can_paste: bool,
     blink_cursor: Entity<BlinkCursor>,
     _subscriptions: Vec<Subscription>,
 }
@@ -768,6 +783,7 @@ impl TextInput {
             selected_word_range: None,
             history: EditHistory::default(),
             external_context_menu_focus_holds: 0,
+            context_can_paste: false,
             context_menu: {
                 // The menu takes real focus while open, so the composer holds
                 // its caret visible for the duration — otherwise right-clicking
@@ -776,6 +792,11 @@ impl TextInput {
                 ContextMenuHandle::new(cx).on_toggle(move |open, window, cx| {
                     let _ = composer.update(cx, |composer: &mut Self, cx| {
                         if open {
+                            composer.context_can_paste =
+                                composer.clipboard_for_paste(cx).is_some_and(|item| {
+                                    composer.accepts_media_paste && !item.entries().is_empty()
+                                        || item.text().is_some()
+                                });
                             composer.preserve_visual_focus_for_context_menu(window, cx);
                         } else {
                             composer.release_visual_focus_for_context_menu(window, cx);
@@ -1772,8 +1793,25 @@ impl TextInput {
         }
     }
 
+    /// Keep Finder copies and screenshots as attachments, and prefer the source Markdown when copying text
+    fn clipboard_for_paste(&self, cx: &App) -> Option<ClipboardItem> {
+        let item = cx.read_from_clipboard();
+        #[cfg(target_os = "macos")]
+        if self.accepts_media_paste
+            && matches!(
+                item.as_ref().and_then(|item| item.entries().first()),
+                None | Some(ClipboardEntry::String(_))
+            )
+            && let Some(text) =
+                pasteboard_markdown(&objc2_app_kit::NSPasteboard::generalPasteboard())
+        {
+            return Some(ClipboardItem::new_string(text));
+        }
+        item
+    }
+
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(clipboard) = cx.read_from_clipboard() else {
+        let Some(clipboard) = self.clipboard_for_paste(cx) else {
             return;
         };
         if self.accepts_media_paste
@@ -2930,10 +2968,7 @@ impl Render for TextInput {
                         !input.masks_content(),
                     )
                 };
-                let can_paste = cx
-                    .read_from_clipboard()
-                    .and_then(|item| item.text())
-                    .is_some();
+                let can_paste = context_menu_input.read(cx).context_can_paste;
 
                 // Call the editing methods directly rather than dispatching the
                 // actions: by the time an item runs, focus is still unwinding
@@ -2994,9 +3029,7 @@ impl Focusable for TextInput {
     }
 }
 
-/// What the composer tells its owner. `Submit` and `SubmitSteer` carry the
-/// trimmed prompt; the remaining events report composer-level interactions
-/// or mirror [`InputEvent`] from the embedded field.
+/// Composer submissions carry the original text so the owner can preserve Markdown indentation
 #[derive(Clone)]
 pub enum ComposerEvent {
     /// Enter: send the prompt, or queue it behind the running turn.
@@ -3047,13 +3080,11 @@ impl ComposerInput {
         let _subscriptions = vec![
             cx.subscribe(&input, |composer, _, event: &InputEvent, cx| match event {
                 InputEvent::Submit(raw) => {
-                    // The prompt is consumed by sending it, and whitespace
-                    // alone is nothing to send.
-                    let value = raw.trim().to_owned();
-                    if !value.is_empty() {
+                    // Only the owner knows whether an empty text field has a staged attachment to send
+                    if !raw.trim().is_empty() {
                         composer.input.update(cx, |input, cx| input.clear(cx));
-                        cx.emit(ComposerEvent::Submit(value));
                     }
+                    cx.emit(ComposerEvent::Submit(raw.clone()));
                 }
                 InputEvent::Focus => cx.emit(ComposerEvent::Focus),
                 InputEvent::Edited => cx.emit(ComposerEvent::Edited),
@@ -3148,8 +3179,8 @@ impl Render for ComposerInput {
             // The embedded field propagates SubmitSteer; this ancestor
             // handler is where steering becomes a composer event.
             .on_action(cx.listener(|composer, _: &SubmitSteer, _, cx| {
-                let value = composer.content(cx).trim().to_owned();
-                if value.is_empty() {
+                let value = composer.content(cx).to_owned();
+                if value.trim().is_empty() {
                     cx.emit(ComposerEvent::SteerQueued);
                     return;
                 }
@@ -3304,6 +3335,19 @@ mod tests {
             .detach();
         });
 
+        // The owner must receive Enter for an attachment-only draft and Markdown with leading indentation
+        cx.simulate_keystrokes("enter");
+        assert!(
+            matches!(events.borrow().last(), Some(ComposerEvent::Submit(text)) if text.is_empty())
+        );
+        composer.update(cx, |composer, cx| composer.set_content("    code\n", cx));
+        cx.simulate_keystrokes("enter");
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, ComposerEvent::Submit(text) if text == "    code\n"))
+        );
         cx.simulate_keystrokes("secondary-enter");
         assert!(matches!(
             events.borrow().last(),
@@ -3637,6 +3681,28 @@ mod tests {
             ],
         };
         assert!(media_paste_entries(&clipboard).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn markdown_paste_reads_the_source_representation() {
+        use objc2_foundation::{NSData, NSString};
+        // A private pasteboard exercises native representation lookup without touching the user's clipboard
+        let board = objc2_app_kit::NSPasteboard::pasteboardWithUniqueName();
+        let markdown = "    code\n\n**重点**";
+        board.setString_forType(
+            &NSString::from_str("code 重点"),
+            &NSString::from_str("public.utf8-plain-text"),
+        );
+        assert!(super::pasteboard_markdown(&board).is_none());
+        board.setData_forType(
+            Some(&NSData::with_bytes(markdown.as_bytes())),
+            &NSString::from_str("net.daringfireball.markdown"),
+        );
+        assert_eq!(
+            super::pasteboard_markdown(&board).as_deref(),
+            Some(markdown)
+        );
     }
 
     #[test]

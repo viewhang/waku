@@ -33,6 +33,30 @@ fn knowledge_enabled_by_default() -> bool {
     true
 }
 
+impl AssistantProfile {
+    /// Resolve the session's provider consistently across the desktop and daemon, including old URL-based sessions
+    pub fn service<'a>(
+        &self,
+        services: &'a [ModelService],
+        profiles: &[Self],
+    ) -> Option<&'a ModelService> {
+        if let Some(id) = self.model_service_id {
+            return services.iter().find(|service| service.id == id);
+        }
+        let base_url = self.base_url.trim().trim_end_matches('/');
+        let default = profiles
+            .iter()
+            .find(|profile| profile.id == self.id)
+            .and_then(|profile| profile.model_service_id);
+        services
+            .iter()
+            .filter(|service| {
+                service.base_url == base_url && (service.legacy_key || default == Some(service.id))
+            })
+            .max_by_key(|service| default == Some(service.id))
+    }
+}
+
 /// Provider endpoint and the models exposed in Waku's picker
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 pub struct ModelService {

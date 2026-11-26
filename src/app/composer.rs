@@ -2039,9 +2039,31 @@ impl Waku {
         true
     }
 
-    /// Stage the clipboard's primary image/file representation. On-disk paths
-    /// reuse drop handling immediately; raw image bytes are copied into Waku's
-    /// durable blob store on the background executor before their chip appears.
+    /// CLI agents handle file references themselves while direct chats use the selected model's vision capability
+    fn composer_accepts_images(&self) -> bool {
+        let Some(session) = self
+            .selected_session()
+            .filter(|session| session.provider == ProviderKind::Assistant)
+        else {
+            return true;
+        };
+        session
+            .assistant
+            .as_ref()
+            .and_then(|profile| {
+                profile
+                    .service(&self.state.model_services, &self.state.assistant_profiles)
+                    .filter(|service| service.enabled)?
+                    .model(&profile.model)
+            })
+            .is_some_and(|model| {
+                model
+                    .options
+                    .accepts(waku_protocol::settings::ModelModality::Vision)
+            })
+    }
+
+    /// Stage copied files and screenshots after checking the active model, retaining text files in mixed pastes
     pub(super) fn stage_pasted_attachments(
         &mut self,
         entries: Vec<ClipboardEntry>,
@@ -2056,6 +2078,15 @@ impl Waku {
                     paths.extend(external.paths().iter().cloned())
                 }
                 ClipboardEntry::String(_) | ClipboardEntry::Image(_) => {}
+            }
+        }
+        if !self.composer_accepts_images() {
+            let count = paths.len();
+            paths.retain(|path| !is_image_attachment_path(path));
+            if paths.len() != count || !images.is_empty() {
+                images.clear();
+                self.show_info_toast(tr!("assistant.image_input_unsupported"));
+                cx.notify();
             }
         }
         self.stage_attachment_paths(&paths, cx);
@@ -2154,18 +2185,27 @@ impl Waku {
         if !native && self.model_picker_has_no_providers() {
             return None;
         }
-        // Keep the draft editable if it still contains a retired knowledge attachment
-        if self.composer_attachments.iter().any(|a| {
+        // Recheck staged images after a model switch and keep ineligible drafts editable
+        let notice = if self.composer_attachments.iter().any(|a| a.is_image)
+            && !self.composer_accepts_images()
+        {
+            Some(tr!("assistant.image_input_unsupported"))
+        } else if self.composer_attachments.iter().any(|a| {
             a.blob_reference.is_none()
                 && a.mention
                     .starts_with(waku_protocol::knowledge::LEGACY_NOTE_PREFIX)
         }) {
+            Some(tr!("composer.remove_legacy_note"))
+        } else {
+            None
+        };
+        if let Some(notice) = notice {
             // Keyboard submission clears the field before delivering the prompt
             if !prompt.is_empty() && self.composer.read(cx).content(cx).is_empty() {
                 self.composer
                     .update(cx, |input, cx| input.set_content(prompt.to_owned(), cx));
             }
-            self.show_info_toast(tr!("composer.remove_legacy_note"));
+            self.show_info_toast(notice);
             cx.notify();
             return None;
         }
@@ -2189,7 +2229,12 @@ impl Waku {
             .map(|attachment| attachment.mention.clone())
             .collect::<Vec<_>>();
         let submission = merged_submission(prompt, &mentions)?;
-        let display_content = (!attachments.is_empty()).then(|| prompt.trim().to_owned());
+        // Direct chats send original Markdown, including meaningful leading spaces and line breaks
+        let display_content = if native {
+            (!attachments.is_empty() || submission != prompt).then(|| prompt.to_owned())
+        } else {
+            (!attachments.is_empty()).then(|| prompt.trim().to_owned())
+        };
         self.discard_current_composer_draft(cx);
         Some(ComposerSubmission {
             prompt: submission,

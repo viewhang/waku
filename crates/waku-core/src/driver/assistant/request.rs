@@ -33,10 +33,14 @@ pub(super) struct Media {
 
 pub(super) fn media_mime(name: &str) -> Option<&'static str> {
     match name.rsplit_once('.')?.1.to_ascii_lowercase().as_str() {
+        "md" | "markdown" => Some("text/markdown"),
+        "txt" | "text" => Some("text/plain"),
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),
         "webp" => Some("image/webp"),
         "gif" => Some("image/gif"),
+        "tif" | "tiff" => Some("image/tiff"),
+        "bmp" => Some("image/bmp"),
         "wav" => Some("audio/wav"),
         "mp3" => Some("audio/mp3"),
         "aiff" | "aif" => Some("audio/aiff"),
@@ -64,18 +68,22 @@ pub(super) fn read_media(
         .map(|attachment| {
             let mime =
                 media_mime(&attachment.name).context("Unsupported model attachment format")?;
-            let modality = if mime.starts_with("image/") {
-                ModelModality::Vision
-            } else if mime.starts_with("audio/") {
-                ModelModality::Audio
-            } else {
-                ModelModality::Video
+            // A text file contributes a user text block on every dialogue protocol
+            let accepted = match mime.split_once('/') {
+                Some(("text", _)) => options.dialogue(),
+                Some(("image", _)) => {
+                    options.accepts(ModelModality::Vision)
+                        && (!matches!(mime, "image/tiff" | "image/bmp") || options.dialogue())
+                }
+                Some(("audio", _)) => options.accepts(ModelModality::Audio),
+                Some(("video", _)) => options.accepts(ModelModality::Video),
+                _ => false,
             };
-            if attachment.is_dir || !options.accepts(modality) {
+            if attachment.is_dir || !accepted {
                 bail!("The selected model and API do not accept {mime} input");
             }
             if options.protocol == ModelProtocol::OpenAiChat
-                && modality == ModelModality::Audio
+                && mime.starts_with("audio/")
                 && !matches!(mime, "audio/wav" | "audio/mp3")
             {
                 bail!("Chat Completions audio requires WAV or MP3");
@@ -90,9 +98,28 @@ pub(super) fn read_media(
             } else {
                 store.read_file(reference, &attachment.path)?
             };
-            total += bytes.len();
-            if bytes.is_empty() || total > MAX_ATTACHMENT_BYTES {
+            if bytes.is_empty() || bytes.len() > MAX_ATTACHMENT_BYTES - total {
                 bail!("Model attachments are empty or exceed Waku's combined size limit");
+            }
+            // Desktop clipboards can supply TIFF or BMP where the model expects a PNG
+            let original_size = bytes.len();
+            let (mime, bytes) = if matches!(mime, "image/tiff" | "image/bmp") {
+                let format = if mime == "image/tiff" {
+                    image::ImageFormat::Tiff
+                } else {
+                    image::ImageFormat::Bmp
+                };
+                let image = image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+                    .decode()?;
+                let mut png = std::io::Cursor::new(Vec::new());
+                image.write_to(&mut png, image::ImageFormat::Png)?;
+                ("image/png", png.into_inner())
+            } else {
+                (mime, bytes)
+            };
+            total += original_size.max(bytes.len());
+            if total > MAX_ATTACHMENT_BYTES {
+                bail!("Model attachments exceed Waku's combined size limit");
             }
             Ok(Media {
                 mime,
@@ -109,6 +136,12 @@ pub(super) fn message(prompt: String, media: Vec<Media>) -> Result<Message> {
         content.push(UserContent::text(prompt));
     }
     for asset in media {
+        if asset.mime.starts_with("text/") {
+            let text = String::from_utf8(asset.bytes)
+                .with_context(|| format!("{} must contain UTF-8 text", asset.name))?;
+            content.push(UserContent::text(text));
+            continue;
+        }
         let data = DocumentSourceKind::Base64(
             base64::engine::general_purpose::STANDARD.encode(asset.bytes),
         );
@@ -1337,6 +1370,38 @@ mod tests {
             is_image: true,
             blob_reference: Some(reference),
         };
+        // Finder files travel as managed attachments, while screenshots travel as blobs
+        let documents = [
+            ("notes.MD", "# 标题\n\n    code"),
+            ("draft.txt", "first\nsecond"),
+        ]
+        .map(|(name, text)| {
+            let file = store
+                .import(
+                    name,
+                    AttachmentUpload::File {
+                        data_base64: base64::engine::general_purpose::STANDARD.encode(text),
+                    },
+                )
+                .unwrap();
+            MessageAttachment {
+                path: file.path,
+                mention: name.into(),
+                name: name.into(),
+                is_dir: false,
+                is_image: false,
+                blob_reference: Some(file.reference),
+            }
+        });
+        let text_only = ServiceModelOptions::default();
+        let files = read_media(&store, &blobs, documents.to_vec(), &text_only).unwrap();
+        let Message::User { content } = message(String::new(), files).unwrap() else {
+            unreachable!()
+        };
+        assert!(
+            matches!(content.first(), UserContent::Text(text) if text.text == "# 标题\n\n    code")
+        );
+        assert!(read_media(&store, &blobs, vec![image.clone()], &text_only).is_err());
         for protocol in [
             ModelProtocol::OpenAiChat,
             ModelProtocol::OpenAiResponses,
@@ -1364,7 +1429,9 @@ mod tests {
                 ],
                 ..Default::default()
             };
-            let mut media = read_media(&store, &blobs, vec![image.clone()], &options).unwrap();
+            let mut attachments = documents.to_vec();
+            attachments.push(image.clone());
+            let mut media = read_media(&store, &blobs, attachments, &options).unwrap();
             if protocol.supports(ModelModality::Audio) {
                 media.push(Media {
                     mime: "audio/wav",
@@ -1429,6 +1496,12 @@ mod tests {
             let body: Value = serde_json::from_slice(&received.body).unwrap();
             let payload = body.to_string();
             assert!(payload.contains(PNG), "{protocol:?}: missing PNG data");
+            for text in ["# 标题\n\n    code", "first\nsecond"] {
+                assert!(
+                    payload.contains(&serde_json::to_string(text).unwrap()),
+                    "{protocol:?}: missing document text"
+                );
+            }
             assert!(
                 body.get("tools").is_none_or(
                     |tools| tools.is_null() || tools.as_array().is_some_and(Vec::is_empty)
@@ -1475,6 +1548,45 @@ mod tests {
                     assert!(payload.contains("video/mp4"));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn clipboard_rasters_are_sent_as_png_to_vision_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::new(dir.path().join("attachments"));
+        let blobs = BlobStore::new(dir.path().join("blobs"));
+        let options = ServiceModelOptions {
+            inputs: vec![ModelModality::Vision],
+            ..Default::default()
+        };
+        for (format, mime, name) in [
+            (image::ImageFormat::Tiff, "image/tiff", "image.tiff"),
+            (image::ImageFormat::Bmp, "image/bmp", "image.bmp"),
+        ] {
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(2, 3)
+                .write_to(&mut encoded, format)
+                .unwrap();
+            let reference = blobs
+                .store_image_bytes(mime, &encoded.into_inner())
+                .unwrap();
+            let image = MessageAttachment {
+                path: blobs.path_for(&reference).unwrap(),
+                mention: name.into(),
+                name: name.into(),
+                is_dir: false,
+                is_image: true,
+                blob_reference: Some(reference),
+            };
+            let media = read_media(&store, &blobs, vec![image], &options).unwrap();
+            assert_eq!(media[0].mime, "image/png");
+            assert_eq!(
+                image::load_from_memory_with_format(&media[0].bytes, image::ImageFormat::Png)
+                    .unwrap()
+                    .height(),
+                3
+            );
         }
     }
 

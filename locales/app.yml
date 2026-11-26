@@ -2260,6 +2260,8 @@ assistant.fields_required:
   en: Enter an assistant name
 assistant.current_project:
   en: "Selected project: %{project}"
+assistant.image_input_unsupported:
+  en: This model does not accept images. Choose a model with vision support.
 assistant.text_only:
   en: This assistant accepts text. Remove attachments to continue
 assistant.test_ok:

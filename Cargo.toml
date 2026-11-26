@@ -103,6 +103,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSImageRep",
   "NSMenu",
   "NSMenuItem",
+  "NSPasteboard",
   "NSResponder",
   "NSRunningApplication",
   "NSView",
