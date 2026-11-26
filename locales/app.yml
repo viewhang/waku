@@ -467,6 +467,10 @@ common.rename:
 
 session.new_task:
   en: New task
+session.delete:
+  en: Delete chat
+session.confirm_delete:
+  en: 'Permanently delete “%{title}”?'
 
 sidebar.today:
   en: Today

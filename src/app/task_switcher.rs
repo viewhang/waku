@@ -304,17 +304,17 @@ impl Waku {
     }
 
     fn open_task_switcher(&mut self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let started_tasks = self
+        let history = self
             .state
             .sessions
             .iter()
-            .filter(|session| session.has_started())
+            .filter(|session| session.has_history_entry())
             .map(|session| session.id)
             .collect::<Vec<_>>();
         let ordered = ordered_task_ids(
             self.state.selected_session,
             &self.task_switcher.recent_session_ids,
-            &started_tasks,
+            &history,
         );
         let Some(highlighted_index) =
             initial_highlight_index(&ordered, self.state.selected_session, reverse)
@@ -417,7 +417,7 @@ impl Waku {
                 .state
                 .sessions
                 .iter()
-                .any(|session| session.id == selected && session.has_started())
+                .any(|session| session.id == selected && session.has_history_entry())
         {
             let was_in_settings = self.settings_page.is_some();
             self.settings_page = None;

@@ -123,18 +123,25 @@ pub(super) fn session_has_active_provider_turn(session: &AgentSession) -> bool {
 pub(super) fn merge_remote_session_catalog(
     local: &mut Vec<AgentSession>,
     remote: Vec<AgentSession>,
+    previous_remote_ids: &mut HashSet<Uuid>,
     has_local_runtime: impl Fn(Uuid) -> bool,
 ) -> Vec<Uuid> {
     let remote_ids = remote
         .iter()
         .map(|session| session.id)
         .collect::<HashSet<_>>();
-    let removed = local
-        .iter()
-        .filter(|session| session.has_started() && !remote_ids.contains(&session.id))
-        .map(|session| session.id)
-        .collect::<Vec<_>>();
-    local.retain(|session| !session.has_started() || remote_ids.contains(&session.id));
+    let mut removed = Vec::new();
+    local.retain(|session| {
+        if session.has_history_entry()
+            && previous_remote_ids.contains(&session.id)
+            && !remote_ids.contains(&session.id)
+        {
+            removed.push(session.id);
+            return false;
+        }
+        true
+    });
+    *previous_remote_ids = remote_ids;
 
     for remote in remote {
         if let Some(local) = local.iter_mut().find(|session| session.id == remote.id) {
@@ -1022,6 +1029,7 @@ impl Waku {
         let removed = merge_remote_session_catalog(
             &mut self.state.sessions,
             snapshot.sessions,
+            &mut self.remote_session_ids,
             |session_id| runtime_ids.contains(&session_id),
         );
         for session_id in &removed {

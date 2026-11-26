@@ -652,7 +652,7 @@ impl PersistedState {
         self.selected_session.filter(|selected| {
             self.sessions
                 .iter()
-                .any(|session| session.id == *selected && session.has_started())
+                .any(|session| session.id == *selected && session.has_history_entry())
         })
     }
 

@@ -95,7 +95,7 @@ pub struct ComposerDraftChange {
 
 impl ComposerDraftKey {
     pub fn for_session(session: &AgentSession) -> Self {
-        if session.has_started() {
+        if session.has_history_entry() {
             Self::Session(session.id)
         } else {
             Self::NewSession(session.project_id)

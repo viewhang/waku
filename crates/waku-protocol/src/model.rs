@@ -1193,6 +1193,11 @@ impl AgentSession {
             || self.provider_cursor.is_some()
     }
 
+    /// An explicitly created assistant chat owns a history entry even before its first message
+    pub fn has_history_entry(&self) -> bool {
+        self.provider == ProviderKind::Assistant || self.has_started()
+    }
+
     /// Drops the loaded transcript so the session returns to its skeleton
     /// state, releasing the heap its messages, blocks and turns occupied.
     ///

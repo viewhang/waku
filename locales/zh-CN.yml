@@ -228,6 +228,8 @@ common.copy: 复制
 common.remove: 移除
 common.rename: 重命名
 session.new_task: 新任务
+session.delete: 删除会话
+session.confirm_delete: '确定永久删除会话「%{title}」吗？'
 sidebar.today: 今天
 sidebar.search: 搜索
 translation.title: 翻译

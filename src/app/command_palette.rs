@@ -897,7 +897,7 @@ impl Waku {
         self.state
             .sessions
             .iter()
-            .filter(|session| session.has_started())
+            .filter(|session| session.has_history_entry())
             .enumerate()
             .map(|(order, session)| {
                 let (project, project_path) = projects

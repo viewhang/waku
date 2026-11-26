@@ -532,14 +532,12 @@ impl PersistedState {
         self.right_panel_width = app_state.right_panel_width;
     }
 
-    /// A session only earns a row once it has started; drafts stay in memory.
-    /// A draft selection is stored as no selection at all, so relaunching
-    /// recreates a draft and lands on the new-session page the user quit from.
+    /// Restore named assistant chats immediately and recreate an unsent CLI task on launch
     fn persistable_selected_session(&self) -> Option<Uuid> {
         self.selected_session.filter(|selected| {
             self.sessions
                 .iter()
-                .any(|session| session.id == *selected && session.has_started())
+                .any(|session| session.id == *selected && session.has_history_entry())
         })
     }
 
@@ -1400,8 +1398,7 @@ impl StateStore {
             }
         }
 
-        // Only sessions the app reported as changed are written. A draft that
-        // has not started yet owns no row, so it counts as removed until it does.
+        // Empty assistant chats own rows from creation while unsent CLI tasks stay in memory
         let mut live = HashSet::with_capacity(state.sessions.len());
         // Applied only after the commit below, so a transaction that rolls back
         // does not leave this connection believing rows it never wrote are on
@@ -1410,7 +1407,7 @@ impl StateStore {
         for session in state
             .sessions
             .iter()
-            .filter(|session| session.has_started())
+            .filter(|session| session.has_history_entry())
         {
             live.insert(session.id);
             // A skeleton's empty transcript means "not fetched", not "empty".
@@ -3574,7 +3571,7 @@ mod tests {
     }
 
     #[test]
-    fn blank_sessions_stay_runtime_only() {
+    fn blank_cli_sessions_stay_runtime_only() {
         let directory = temporary_directory();
         let store = store_in(&directory);
         let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
@@ -3586,6 +3583,35 @@ mod tests {
         assert!(restored.selected_session.is_none());
         assert_eq!(restored.selected_project, state.selected_project);
         fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn empty_assistant_chats_restore_independently_with_their_own_drafts() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/project"));
+        let project = state.projects[0].id;
+        let first = AgentSession::new(project, ProviderKind::Assistant);
+        let second = AgentSession::new(project, ProviderKind::Assistant);
+        let mut drafts = ComposerDrafts::default();
+        drafts.set(ComposerDraftKey::for_session(&first), text_draft("one"));
+        drafts.set(ComposerDraftKey::for_session(&second), text_draft("two"));
+        let first_id = first.id;
+        state.selected_session = Some(second.id);
+        state.push_session(first);
+        state.push_session(second);
+        store.save(&mut state).unwrap();
+
+        let restored = store_in(&directory).load().unwrap();
+        assert_eq!(restored.sessions.len(), 2);
+        assert_eq!(restored.selected_session, state.selected_session);
+        for mut chat in restored.sessions {
+            store.hydrate(&mut chat).unwrap();
+            assert!(!chat.has_started());
+            let expected = if chat.id == first_id { "one" } else { "two" };
+            assert_eq!(drafts.get_for(&chat), Some(&text_draft(expected)));
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

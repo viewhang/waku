@@ -1292,6 +1292,8 @@ pub struct Waku {
     event_wake_tx: smol::channel::Sender<()>,
     task_state_sync_tx: Sender<Result<RemoteTaskStateSnapshot, String>>,
     task_state_sync_events: Receiver<Result<RemoteTaskStateSnapshot, String>>,
+    /// Distinguish remote deletions from local creations still awaiting their first catalog echo
+    remote_session_ids: HashSet<Uuid>,
     runtimes: HashMap<Uuid, SessionRuntime>,
     runtime_attach_pending: HashSet<Uuid>,
     runtime_attach_misses: HashMap<Uuid, u8>,
@@ -2263,7 +2265,7 @@ impl Waku {
             state
                 .sessions
                 .iter()
-                .any(|session| session.id == *session_id && !session.has_started())
+                .any(|session| session.id == *session_id && !session.has_history_entry())
         }) {
             session_navigation.remember_new_task(session_id);
         }
@@ -2777,6 +2779,12 @@ impl Waku {
                 daemon_hostname,
                 session_hydrations: HashSet::new(),
                 pending_session_activation: None,
+                remote_session_ids: state
+                    .sessions
+                    .iter()
+                    .filter(|session| session.has_history_entry())
+                    .map(|session| session.id)
+                    .collect(),
                 state,
                 store,
                 home_directory,

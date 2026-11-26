@@ -111,8 +111,12 @@ fn remote_task_catalog_adds_web_tasks_without_replacing_hydrated_detail() {
     let web_task_id = web_task.id;
 
     let mut catalog = vec![local];
-    let removed =
-        merge_remote_session_catalog(&mut catalog, vec![local_projection, web_task], |_| false);
+    let removed = merge_remote_session_catalog(
+        &mut catalog,
+        vec![local_projection, web_task],
+        &mut HashSet::new(),
+        |_| false,
+    );
 
     assert!(removed.is_empty());
     assert_eq!(catalog.len(), 2);
@@ -125,6 +129,26 @@ fn remote_task_catalog_adds_web_tasks_without_replacing_hydrated_detail() {
     assert_eq!(merged_local.messages.len(), 1);
     assert_eq!(merged_local.messages[0].content, "keep this transcript");
     assert!(catalog.iter().any(|session| session.id == web_task_id));
+}
+
+#[test]
+fn empty_assistant_chat_survives_a_pending_save_and_follows_remote_deletion() {
+    let chat = AgentSession::new(Uuid::new_v4(), ProviderKind::Assistant);
+    let id = chat.id;
+    let projection = chat.list_projection();
+    let mut local = vec![chat];
+    let mut previous = HashSet::new();
+    for remote in [vec![], vec![projection]] {
+        assert!(
+            merge_remote_session_catalog(&mut local, remote, &mut previous, |_| false).is_empty()
+        );
+        assert_eq!(local[0].id, id);
+    }
+    assert_eq!(
+        merge_remote_session_catalog(&mut local, vec![], &mut previous, |_| false),
+        [id]
+    );
+    assert!(local.is_empty());
 }
 
 #[test]

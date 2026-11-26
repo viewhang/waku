@@ -326,6 +326,12 @@ impl Waku {
             return;
         };
         let project_id = self.state.sessions[index].project_id;
+        let assistant_id = self.state.sessions[index].assistant_profile_id();
+        if let Err(error) = self.store.remove_session(session_id) {
+            self.show_error_toast(tr!("errors.save_local_state", error = error));
+            cx.notify();
+            return;
+        }
         let composer_draft_key =
             crate::persistence::ComposerDraftKey::for_session(&self.state.sessions[index]);
         let projectless = self
@@ -347,9 +353,6 @@ impl Waku {
         self.remove_right_panel_session_state(session_id);
         self.remove_composer_draft(composer_draft_key, cx);
         self.state.sessions.remove(index);
-        if let Err(error) = self.store.remove_session(session_id) {
-            self.show_error_toast(tr!("errors.save_local_state", error = error));
-        }
         if self
             .pending_session_activation
             .is_some_and(|pending| pending.session_id == session_id)
@@ -394,9 +397,14 @@ impl Waku {
                 .state
                 .sessions
                 .iter()
-                .filter(|session| session.project_id == project_id)
-                .max_by_key(|session| session.updated_at)
-                .map(|session| session.id);
+                // Sibling assistant chats can each own a separate projectless workspace
+                .filter_map(|session| {
+                    let sibling =
+                        assistant_id.is_some() && session.assistant_profile_id() == assistant_id;
+                    (sibling || session.project_id == project_id).then_some((sibling, session))
+                })
+                .max_by_key(|(sibling, session)| (*sibling, session.updated_at))
+                .map(|(_, session)| session.id);
             if let Some(session_id) = next_session {
                 self.select_session(session_id, cx);
             } else if projectless {

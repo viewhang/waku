@@ -239,6 +239,8 @@ common.remove: 削除
 common.rename: 名前を変更
 
 session.new_task: 新規タスク
+session.delete: チャットを削除
+session.confirm_delete: 'チャット「%{title}」を完全に削除しますか？'
 
 sidebar.today: 今日
 sidebar.search: 検索

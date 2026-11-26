@@ -188,17 +188,9 @@ fn append_sidebar_group_rows(
 fn take_assistant_sidebar_sessions(
     profile_ids: impl IntoIterator<Item = Uuid>,
     sorted: &mut Vec<&AgentSession>,
-    selected_draft: Option<&AgentSession>,
 ) -> HashMap<Uuid, Vec<Uuid>> {
     let mut groups: HashMap<_, Vec<_>> =
         profile_ids.into_iter().map(|id| (id, Vec::new())).collect();
-    if let Some(draft) = selected_draft
-        && let Some(group) = draft
-            .assistant_profile_id()
-            .and_then(|id| groups.get_mut(&id))
-    {
-        group.push(draft.id);
-    }
     sorted.retain(|session| {
         if let Some(group) = session
             .assistant_profile_id()
@@ -1252,7 +1244,7 @@ impl Waku {
     ///
     /// The sidebar re-renders at pulse cadence whenever one of its session
     /// rows shows a working spinner, and rebuilding the snapshot sorts every
-    /// started session and runs calendar math per session — far too much per
+    /// history entry and runs calendar math per session — far too much per
     /// tick for values that move at most once per stream commit. The
     /// fingerprint scans the profile, session and disclosure metadata that
     /// [`Self::sidebar_rows`] uses to group and order rows
@@ -1279,7 +1271,7 @@ impl Waku {
             fingerprint = mix_uuid(fingerprint, profile.id);
         }
         for session in &self.state.sessions {
-            if !session.has_started() && Some(session.id) != self.state.selected_session {
+            if !session.has_history_entry() && Some(session.id) != self.state.selected_session {
                 continue;
             }
             fingerprint = mix_uuid(fingerprint, session.id);
@@ -1339,21 +1331,17 @@ impl Waku {
             .state
             .sessions
             .iter()
-            .filter(|session| session.has_started())
+            .filter(|session| session.has_history_entry())
             .collect::<Vec<_>>();
         sort_sidebar_sessions(&mut sorted_sessions, self.state.sidebar_ordering);
 
         let mut rows = vec![SidebarRow::Shortcuts];
-        let selected_draft = self
-            .selected_session()
-            .filter(|session| !session.has_started());
         let mut assistant_sessions = take_assistant_sidebar_sessions(
             self.state
                 .assistant_profiles
                 .iter()
                 .map(|profile| profile.id),
             &mut sorted_sessions,
-            selected_draft,
         );
         for profile in &self.state.assistant_profiles {
             let group = SidebarGroup::Assistant(profile.id);
@@ -1404,8 +1392,9 @@ impl Waku {
                 }
             }
             SidebarGrouping::Project => {
-                if let Some(draft) =
-                    selected_draft.filter(|session| session.provider != ProviderKind::Assistant)
+                if let Some(draft) = self
+                    .selected_session()
+                    .filter(|session| !session.has_history_entry())
                 {
                     sorted_sessions.insert(0, draft);
                 }
@@ -2003,6 +1992,42 @@ impl Waku {
         cx.notify();
     }
 
+    /// Keep the target fixed while the native confirmation is open
+    fn confirm_remove_session(
+        &mut self,
+        session_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return;
+        };
+        let confirm = window.prompt(
+            gpui::PromptLevel::Warning,
+            &tr!(
+                "session.confirm_delete",
+                title = localized_session_title(session)
+            ),
+            None,
+            &[
+                gpui::PromptButton::cancel(tr!("common.cancel")),
+                gpui::PromptButton::new(tr!("session.delete")),
+            ],
+            cx,
+        );
+        cx.spawn(async move |view, cx| {
+            if confirm.await == Ok(1) {
+                let _ = view.update(cx, |this, cx| this.remove_session(session_id, cx));
+            }
+        })
+        .detach();
+    }
+
     fn render_sidebar_session_item(
         &self,
         session_id: Uuid,
@@ -2162,6 +2187,20 @@ impl Waku {
                             12.0,
                             status_color(&theme, session.status),
                         ))
+                    })
+                    .when(!renaming, |element| {
+                        element.child(
+                            icon_button("delete-session", "icons/trash.svg", theme)
+                                .h(px(18.0))
+                                .flex_none()
+                                .tab_index(0)
+                                .focus_visible(|style| style.border_1().border_color(theme.accent))
+                                .tooltip(Tooltip::text(tr!("session.delete")))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_activation(cx, move |this, window, cx| {
+                                    this.confirm_remove_session(session_id, window, cx);
+                                }),
+                        )
                     }),
             )
             .when(!assistant_child, |row| {
@@ -2207,6 +2246,7 @@ impl Waku {
                 element
                     .track_focus(&row_focus)
                     .tab_index(0)
+                    .tab_group()
                     .focus_visible(|style| style.border_1().border_color(theme.accent))
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                         let key = event.keystroke.key.as_str();
@@ -2247,9 +2287,10 @@ impl Waku {
                             });
                         }),
                         MenuItem::Separator,
-                        MenuItem::new(tr!("common.remove"), move |_, cx| {
-                            let _ = remove_waku
-                                .update(cx, |waku, cx| waku.remove_session(session_id, cx));
+                        MenuItem::new(tr!("session.delete"), move |window, cx| {
+                            let _ = remove_waku.update(cx, |waku, cx| {
+                                waku.confirm_remove_session(session_id, window, cx);
+                            });
                         }),
                     ]
                 },
@@ -2868,7 +2909,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_rows_group_cold_sessions_and_the_selected_draft_under_their_profiles() {
+    fn assistant_rows_keep_consecutive_empty_chats_under_their_profile() {
         let project = Uuid::new_v4();
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
@@ -2877,13 +2918,15 @@ mod tests {
         let old = old.list_projection();
         let mut draft = AgentSession::new(project, ProviderKind::Assistant);
         draft.assistant_id = Some(first);
+        let mut next = AgentSession::new(project, ProviderKind::Assistant);
+        next.assistant_id = Some(first);
         let mut orphan = AgentSession::new(project, ProviderKind::Assistant);
         orphan.assistant_id = Some(Uuid::new_v4());
         let project_session = AgentSession::new(project, ProviderKind::Codex);
-        let mut history = vec![&project_session, &old, &orphan];
+        let mut history = vec![&next, &draft, &project_session, &old, &orphan];
 
-        let groups = take_assistant_sidebar_sessions([first, second], &mut history, Some(&draft));
-        assert_eq!(groups[&first], [draft.id, old.id]);
+        let groups = take_assistant_sidebar_sessions([first, second], &mut history);
+        assert_eq!(groups[&first], [next.id, draft.id, old.id]);
         assert!(groups[&second].is_empty());
         assert_eq!(
             history.iter().map(|session| session.id).collect::<Vec<_>>(),
@@ -2909,6 +2952,7 @@ mod tests {
             rows,
             [
                 SidebarRow::Header(SidebarGroup::Assistant(first)),
+                SidebarRow::AssistantSession(next.id),
                 SidebarRow::AssistantSession(draft.id),
                 SidebarRow::AssistantSession(old.id),
                 SidebarRow::GroupSpacer,
@@ -2916,7 +2960,7 @@ mod tests {
                 SidebarRow::GroupSpacer
             ]
         );
-        assert_eq!(sidebar_session_row_index(&rows, old.id), Some(2));
+        assert_eq!(sidebar_session_row_index(&rows, old.id), Some(3));
     }
 
     #[test]
