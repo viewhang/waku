@@ -1,7 +1,7 @@
 //! Shared editor for model service settings and adding a service from a conversation
 
 use super::assistants::{assistant_button, assistant_button_base, assistant_field};
-use super::model_capabilities::model_capability_badges;
+use super::model_capabilities::{ModelCategory, model_capability_badges};
 use super::*;
 use crate::ui::ActivationExt as _;
 use anyhow::Context as _;
@@ -88,6 +88,9 @@ pub(super) struct ModelServiceForm {
     model_context: Entity<TextInput>,
     model_input_tokens: Entity<TextInput>,
     model_output_tokens: Entity<TextInput>,
+    model_dimensions: Entity<TextInput>,
+    /// Model ID, request generation and the matched public width for this editor
+    dimension_lookup: Option<(String, Uuid, Option<u32>)>,
     model_search: Entity<TextInput>,
     work: Option<Work>,
     status: Option<(NoticeAt, bool, String)>,
@@ -213,6 +216,30 @@ impl Waku {
             },
         )
         .detach();
+        let model_id = cx.new(|cx| TextInput::new(window, cx));
+        cx.on_blur(&model_id.read(cx).focus(), window, |this, _, cx| {
+            this.lookup_embedding_dimensions(cx);
+        })
+        .detach();
+        cx.subscribe(&model_id, |this, field, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Edited)
+                && let Some(form) = this.model_service_form.as_mut()
+                && form
+                    .dimension_lookup
+                    .as_ref()
+                    .is_some_and(|(id, _, _)| id != field.read(cx).content().trim())
+            {
+                let old_default = form.dimension_lookup.take().and_then(|(_, _, width)| width);
+                form.model_dimensions.update(cx, |input, cx| {
+                    if old_default.is_some_and(|width| input.content().trim() == width.to_string())
+                    {
+                        input.clear(cx);
+                    }
+                    input.set_placeholder(tr!("service_model.provider_default"), cx);
+                });
+            }
+        })
+        .detach();
         self.model_service_form = Some(ModelServiceForm {
             generation,
             session,
@@ -235,12 +262,18 @@ impl Waku {
             reveal_added_model: matches!(catalog_action, Some(CatalogAction::Add)),
             removal,
             model_edit: None,
-            model_id: cx.new(|cx| TextInput::new(window, cx)),
+            model_id,
+            dimension_lookup: None,
             model_name: cx.new(|cx| TextInput::new(window, cx)),
             model_group: cx.new(|cx| TextInput::new(window, cx)),
             model_options: ServiceModelOptions::default(),
             model_context: cx.new(|cx| TextInput::new(window, cx).placeholder("128000")),
-            model_input_tokens: cx.new(|cx| TextInput::new(window, cx).placeholder("128000")),
+            model_input_tokens: cx.new(|cx| TextInput::new(window, cx).tab_stop()),
+            model_dimensions: cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .tab_stop()
+                    .placeholder(tr!("service_model.provider_default"))
+            }),
             model_output_tokens: cx.new(|cx| TextInput::new(window, cx).placeholder("65536")),
             model_search,
             work: load_key.then_some(Work::LoadKey),
@@ -494,14 +527,6 @@ impl Waku {
                     .gap(px(8.0))
                     .border_t_1()
                     .border_color(theme.border)
-                    .when(form.session.is_some(), |footer| {
-                        footer.child(
-                            div()
-                                .text_size(sp(11.0))
-                                .text_color(theme.text_secondary)
-                                .child(tr!("assistant.switch_history")),
-                        )
-                    })
                     .child(
                         div()
                             .flex()
@@ -692,35 +717,34 @@ impl Waku {
         let theme = Theme::current(cx);
         let ready = form.work.is_none();
         let query = form.model_search.read(cx).content().trim().to_lowercase();
-        let models = if query.is_empty() {
-            form.models.clone()
-        } else {
-            Rc::new(
-                form.models
-                    .iter()
-                    .filter(|model| {
-                        model.id.to_lowercase().contains(&query)
-                            || model.name.to_lowercase().contains(&query)
-                            || model.options.group.to_lowercase().contains(&query)
-                    })
-                    .cloned()
-                    .collect(),
-            )
-        };
-        let model_count = models.len();
+        // The in-chat provider form saves the full catalog but only offers dialogue models for use
+        let models = form.models.clone();
+        let visible: Vec<_> = models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| model.options.dialogue())
+            .filter(|(_, model)| {
+                query.is_empty()
+                    || model.id.to_lowercase().contains(&query)
+                    || model.name.to_lowercase().contains(&query)
+                    || model.options.group.to_lowercase().contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let model_count = visible.len();
         let selected = form.selected.clone();
         let rows = gpui::uniform_list(
             "model-service-catalog",
-            models.len(),
+            model_count,
             cx.processor(move |_, range: Range<usize>, _, cx| {
-                models[range]
+                visible[range]
                     .iter()
-                    .map(|model| {
+                    .map(|&index| {
+                        let model = &models[index];
                         let id = model.id.clone();
                         let edit_id = id.clone();
                         let remove_id = id.clone();
                         let active = selected.as_deref() == Some(id.as_str());
-                        let supported = model.options.assistant_supported();
                         div()
                             .id(SharedString::from(format!("draft-model-row-{id}")))
                             .w_full()
@@ -739,24 +763,12 @@ impl Waku {
                                         .join(" · "),
                                     theme,
                                 )
-                                .when(supported, |button| {
-                                    button.hover(|style| style.bg(theme.overlay)).on_activation(
-                                        cx,
-                                        move |this, _, cx| {
-                                            if let Some(form) = this.model_service_form.as_mut() {
-                                                form.selected = Some(id.clone());
-                                                cx.notify();
-                                            }
-                                        },
-                                    )
-                                })
-                                .when(!supported, |button| {
-                                    button
-                                        .tab_stop(false)
-                                        .text_color(theme.text_secondary)
-                                        .tooltip(Tooltip::text(tr!(
-                                            "service_model.unsupported_operation"
-                                        )))
+                                .hover(|style| style.bg(theme.overlay))
+                                .on_activation(cx, move |this, _, cx| {
+                                    if let Some(form) = this.model_service_form.as_mut() {
+                                        form.selected = Some(id.clone());
+                                        cx.notify();
+                                    }
                                 })
                                 .min_w_0()
                                 .flex_1()
@@ -837,9 +849,10 @@ impl Waku {
                 )
             })
             .when(model_count > 0, |section| section.child(rows))
-            .when(model_count == 0 && !query.is_empty(), |section| {
-                section.child(tr!("models.none_found"))
-            })
+            .when(
+                model_count == 0 && (!form.models.is_empty() || !query.is_empty()),
+                |section| section.child(tr!("models.none_found")),
+            )
     }
 
     fn close_model_service_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -889,18 +902,35 @@ impl Waku {
                     tools: false,
                     ..Default::default()
                 });
+        form.dimension_lookup = None;
+        form.model_dimensions.update(cx, |input, cx| {
+            input.set_placeholder(tr!("service_model.provider_default"), cx);
+        });
         form.model_group.update(cx, |input, cx| {
             input.set_content(form.model_options.group.clone(), cx)
         });
+        // Older non-dialogue entries used the context window as their input limit
+        let max_input = if form.model_options.dialogue() {
+            form.model_options.max_input_tokens
+        } else {
+            form.model_options
+                .max_input_tokens
+                .or(form.model_options.context_window)
+        };
         for (field, value) in [
-            (&form.model_context, form.model_options.context_window),
             (
-                &form.model_input_tokens,
-                form.model_options.max_input_tokens,
+                &form.model_dimensions,
+                form.model_options
+                    .embedding_dimensions
+                    .map(|value| value.get()),
             ),
+            (&form.model_context, form.model_options.context_window),
+            (&form.model_input_tokens, max_input),
             (
                 &form.model_output_tokens,
-                form.model_options.max_output_tokens,
+                form.model_options
+                    .max_output_tokens
+                    .filter(|_| form.model_options.dialogue()),
             ),
         ] {
             field.update(cx, |input, cx| {
@@ -913,7 +943,75 @@ impl Waku {
         window.on_next_frame(move |window, _| {
             window.on_next_frame(move |window, cx| window.focus(&focus, cx));
         });
+        self.lookup_embedding_dimensions(cx);
         cx.notify();
+    }
+
+    /// Match a manual ID after focus leaves the field or the user selects the embedding type
+    fn lookup_embedding_dimensions(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self
+            .model_service_form
+            .as_mut()
+            .filter(|form| form.model_edit.is_some() && form.model_options.embedding())
+        else {
+            return;
+        };
+        let id = form.model_id.read(cx).content().trim().to_owned();
+        if id.is_empty()
+            || form
+                .dimension_lookup
+                .as_ref()
+                .is_some_and(|(current, _, _)| *current == id)
+        {
+            return;
+        }
+        let Some(base_url) = form.base_url(cx) else {
+            return;
+        };
+        let known = form
+            .models
+            .iter()
+            .find(|model| model.id == id)
+            .and_then(|model| model.catalog_embedding_dimensions);
+        let generation = Uuid::new_v4();
+        form.dimension_lookup = Some((id.clone(), generation, known));
+        if let Some(width) = known {
+            form.prefill_dimensions(width, cx);
+            return;
+        }
+        let daemon = self.daemon.client();
+        cx.spawn(async move |view, cx| {
+            let response = cx
+                .background_executor()
+                .spawn(async move {
+                    daemon.request(
+                        Uuid::nil(),
+                        Uuid::nil(),
+                        Command::LookupEmbeddingDimensions {
+                            base_url,
+                            model_id: id,
+                        },
+                    )
+                })
+                .await;
+            if let Ok(ResponsePayload::EmbeddingDimensions {
+                dimensions: Some(width),
+            }) = response
+            {
+                let _ = view.update(cx, |this, cx| {
+                    let Some(form) = this.model_service_form.as_mut() else {
+                        return;
+                    };
+                    if let Some((_, current, dimensions)) = &mut form.dimension_lookup
+                        && *current == generation
+                    {
+                        *dimensions = Some(width);
+                        form.prefill_dimensions(width, cx);
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
     fn finish_service_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -947,19 +1045,24 @@ impl Waku {
             cx.notify();
             return;
         }
-        let Some(options) = form.model_options_from_fields(cx) else {
-            form.status = Some((NoticeAt::Catalog, true, tr!("service_model.invalid_tokens")));
-            cx.notify();
-            return;
+        let options = match form.model_options_from_fields(cx) {
+            Ok(options) => options,
+            Err(message) => {
+                form.status = Some((NoticeAt::Catalog, true, message));
+                cx.notify();
+                return;
+            }
         };
         let edited_id = form.model_only.then(|| id.clone());
-        let supported = options.assistant_supported();
+        let supported = form.can_select(&options);
+        let catalog_width = form.catalog_width(cx);
         let models = Rc::make_mut(&mut form.models);
         match edit {
             ModelEdit::Add => {
                 let mut model = ServiceModel::new(id.clone());
                 model.name = name;
                 model.options = options;
+                model.catalog_embedding_dimensions = catalog_width;
                 models.push(model);
                 form.selected = supported.then_some(id);
             }
@@ -970,10 +1073,14 @@ impl Waku {
                     model.name = name;
                     model.options = options;
                     if model.id != id {
+                        model.catalog_embedding_dimensions = None;
                         model.aliases.retain(|alias| alias != &id);
                         model
                             .aliases
                             .push(std::mem::replace(&mut model.id, id.clone()));
+                    }
+                    if catalog_width.is_some() {
+                        model.catalog_embedding_dimensions = catalog_width;
                     }
                     if form.selected.as_deref() == Some(previous) {
                         form.selected = supported.then_some(id);
@@ -1078,9 +1185,10 @@ impl Waku {
                             let empty = models.is_empty();
                             ServiceModel::merge_catalog(Rc::make_mut(&mut form.models), models);
                             if form.selected.as_deref().is_some_and(|id| {
-                                !form.models.iter().any(|model| {
-                                    model.id == id && model.options.assistant_supported()
-                                })
+                                !form
+                                    .models
+                                    .iter()
+                                    .any(|model| model.id == id && form.can_select(&model.options))
                             }) {
                                 form.selected = None;
                             }
@@ -1237,67 +1345,26 @@ impl Waku {
     }
 }
 
+/// A dialogue model can advertise several independent input and inference capabilities
+#[derive(Clone, Copy)]
+enum ModelCapability {
+    Reasoning,
+    Tools,
+    Input(ModelModality),
+}
+
 fn render_model_options(form: &ModelServiceForm, cx: &mut Context<Waku>) -> Div {
     let theme = Theme::current(cx);
     let options = &form.model_options;
     let dialogue = options.dialogue();
-    let purpose = model_choices(
-        "model-purpose",
-        tr!("service_model.purpose"),
-        [
-            (ModelPurpose::Chat, tr!("service_model.chat")),
-            (ModelPurpose::ImageGeneration, tr!("service_model.generate")),
-            (ModelPurpose::ImageEdit, tr!("service_model.edit_image")),
-        ],
-        |value| options.purpose == value,
-        cx,
-        |options, value| {
-            options.purpose = value;
-            options.kind = if value == ModelPurpose::Chat {
-                ModelKind::Text
-            } else {
-                ModelKind::Image
-            };
-        },
-    );
-    let kinds = model_choices(
-        "model-kind",
+    let mut content = div().flex().flex_col().gap(px(12.0)).child(model_choices(
+        "model-type",
         tr!("service_model.kind"),
-        [
-            (ModelKind::Text, tr!("service_model.text")),
-            (ModelKind::Image, tr!("service_model.image")),
-            (ModelKind::Embedding, tr!("service_model.embedding")),
-            (ModelKind::Rerank, tr!("service_model.rerank")),
-            (ModelKind::Speech, tr!("service_model.speech")),
-            (ModelKind::Transcription, tr!("service_model.transcription")),
-            (ModelKind::Realtime, tr!("service_model.realtime")),
-            (ModelKind::Video, tr!("service_model.video")),
-            (ModelKind::Moderation, tr!("service_model.moderation")),
-            (ModelKind::Other, tr!("service_model.other")),
-        ],
-        |value| options.kind == value,
+        ModelCategory::TYPES.map(|kind| (kind, kind.label())),
+        |kind| kind.matches(options),
         cx,
-        |options, value| {
-            options.kind = value;
-            options.purpose = if value == ModelKind::Image {
-                if options.purpose == ModelPurpose::Chat
-                    && !options.inputs.contains(&ModelModality::Vision)
-                {
-                    options.inputs.push(ModelModality::Vision);
-                }
-                options.purpose
-            } else {
-                ModelPurpose::Chat
-            };
-        },
-    );
-    let mut content = div().flex().flex_col().gap(px(12.0)).when(
-        matches!(
-            options.kind,
-            ModelKind::Text | ModelKind::Image | ModelKind::Unknown
-        ),
-        |form| form.child(purpose),
-    );
+        |options, kind| kind.select(options),
+    ));
     if dialogue {
         content = content.child(model_choices(
             "model-protocol",
@@ -1318,51 +1385,42 @@ fn render_model_options(form: &ModelServiceForm, cx: &mut Context<Waku>) -> Div 
                 options.inputs.retain(|modality| value.supports(*modality));
             },
         ));
-    }
-    content = content.child(kinds);
-    if dialogue {
+        use ModelCapability::{Input, Reasoning, Tools};
+        let capabilities = [
+            (Reasoning, tr!("service_model.reasoning")),
+            (Input(ModelModality::Vision), tr!("service_model.vision")),
+            (Tools, tr!("service_model.tools")),
+            (
+                Input(ModelModality::Audio),
+                tr!("service_model.audio_input"),
+            ),
+            (
+                Input(ModelModality::Video),
+                tr!("service_model.video_input"),
+            ),
+        ]
+        .into_iter()
+        .filter(|(item, _)| match item {
+            Input(modality) => options.protocol.supports(*modality),
+            _ => true,
+        });
         content = content.child(model_choices(
             "model-capability",
             tr!("service_model.capabilities"),
-            [
-                (true, tr!("service_model.reasoning")),
-                (false, tr!("service_model.tools")),
-            ],
-            |reasoning| {
-                if reasoning {
-                    options.reasoning
-                } else {
-                    options.tools
-                }
+            capabilities,
+            |item| match item {
+                Reasoning => options.reasoning,
+                Tools => options.tools,
+                Input(modality) => options.inputs.contains(&modality),
             },
             cx,
-            |options, reasoning| {
-                if reasoning {
-                    options.reasoning = !options.reasoning;
-                } else {
-                    options.tools = !options.tools;
+            |options, item| match item {
+                Reasoning => options.reasoning = !options.reasoning,
+                Tools => options.tools = !options.tools,
+                Input(modality) if options.inputs.contains(&modality) => {
+                    options.inputs.retain(|value| *value != modality)
                 }
-            },
-        ));
-        let modalities = [
-            (ModelModality::Vision, tr!("service_model.vision")),
-            (ModelModality::Audio, tr!("service_model.audio")),
-            (ModelModality::Video, tr!("service_model.video")),
-        ]
-        .into_iter()
-        .filter(|(value, _)| options.protocol.supports(*value));
-        content = content.child(model_choices(
-            "model-input",
-            tr!("service_model.inputs"),
-            modalities,
-            |value| options.inputs.contains(&value),
-            cx,
-            |options, value| {
-                if options.inputs.contains(&value) {
-                    options.inputs.retain(|item| *item != value);
-                } else {
-                    options.inputs.push(value);
-                }
+                Input(modality) => options.inputs.push(modality),
             },
         ));
     } else if !options.assistant_supported() {
@@ -1387,36 +1445,80 @@ fn render_model_options(form: &ModelServiceForm, cx: &mut Context<Waku>) -> Div 
                 .child(tr!("service_model.rerank_format")),
         );
     }
-    content
-        .child(model_token_field(
+    if options.embedding() {
+        let images = options.accepts(ModelModality::Vision);
+        content = content.child(assistant_field(
+            tr!("service_model.image_input"),
+            toggle_switch(
+                "embedding-image-input",
+                images,
+                false,
+                theme,
+                cx,
+                move |this, _, cx| {
+                    if let Some(form) = this.model_service_form.as_mut() {
+                        let inputs = &mut form.model_options.inputs;
+                        if images {
+                            inputs.retain(|modality| *modality != ModelModality::Vision);
+                        } else {
+                            inputs.push(ModelModality::Vision);
+                        }
+                        cx.notify();
+                    }
+                },
+            )
+            .aria_label(tr!("service_model.image_input")),
+            theme,
+        ));
+        content = content.child(assistant_field(
+            tr!("service_model.embedding_dimensions"),
+            TextField::new("model-embedding-dimensions", form.model_dimensions.clone()),
+            theme,
+        ));
+    }
+    if dialogue {
+        content = content.child(model_token_field(
             "model-context",
             tr!("service_model.context"),
             &form.model_context,
             &[128_000, 200_000, 256_000, 400_000, 512_000, 1_000_000],
             cx,
-        ))
-        .child(model_token_field(
-            "model-max-input",
-            tr!("service_model.max_input"),
-            &form.model_input_tokens,
-            &[128_000, 200_000, 256_000, 512_000, 1_000_000],
-            cx,
-        ))
-        .when(dialogue, |form_el| {
-            form_el.child(model_token_field(
+        ));
+    }
+    if options.assistant_supported() && !options.embedding() {
+        content = if dialogue {
+            content.child(model_token_field(
+                "model-max-input",
+                tr!("service_model.max_input"),
+                &form.model_input_tokens,
+                &[128_000, 200_000, 256_000, 512_000, 1_000_000],
+                cx,
+            ))
+        } else {
+            content.child(assistant_field(
+                tr!("service_model.max_input"),
+                TextField::new("model-max-input", form.model_input_tokens.clone()),
+                theme,
+            ))
+        };
+    }
+    if dialogue {
+        content = content
+            .child(model_token_field(
                 "model-max-output",
                 tr!("service_model.max_output"),
                 &form.model_output_tokens,
                 &[16_000, 32_000, 64_000, 128_000, 256_000],
                 cx,
             ))
-        })
-        .child(
-            div()
-                .text_size(sp(11.0))
-                .text_color(theme.text_secondary)
-                .child(tr!("service_model.token_hint")),
-        )
+            .child(
+                div()
+                    .text_size(sp(11.0))
+                    .text_color(theme.text_secondary)
+                    .child(tr!("service_model.token_hint")),
+            );
+    }
+    content
 }
 
 fn model_choices<T: Copy + 'static>(
@@ -1436,11 +1538,16 @@ fn model_choices<T: Copy + 'static>(
                     if let Some(form) = this.model_service_form.as_mut() {
                         update(&mut form.model_options, value);
                         form.status = None;
+                        this.lookup_embedding_dimensions(cx);
                         cx.notify();
                     }
                 })
                 .when(selected(value), |button| {
-                    button.bg(theme.overlay_strong).border_color(theme.accent)
+                    button
+                        .gap(px(4.0))
+                        .child(icon("icons/check.svg", 12.0, theme.accent))
+                        .bg(theme.overlay_strong)
+                        .border_color(theme.accent)
                 }),
             )
         },
@@ -1520,6 +1627,15 @@ fn model_service_dialog_layer(card: Stateful<Div>) -> AnyElement {
 }
 
 impl ModelServiceForm {
+    /// A session selection becomes the conversation model, while settings can test other operations
+    fn can_select(&self, options: &ServiceModelOptions) -> bool {
+        if self.session.is_some() {
+            options.dialogue()
+        } else {
+            options.assistant_supported()
+        }
+    }
+
     /// Only prefill a credential while the form still points to its saved endpoint
     fn same_endpoint(&self, cx: &App) -> bool {
         let Some(saved) = self
@@ -1534,17 +1650,58 @@ impl ModelServiceForm {
             == Some(saved)
     }
 
-    fn model_options_from_fields(&self, cx: &App) -> Option<ServiceModelOptions> {
+    /// Keep typed overrides when a background catalog match arrives
+    fn prefill_dimensions(&self, width: u32, cx: &mut App) {
+        self.model_dimensions.update(cx, |input, cx| {
+            if input.content().trim().is_empty() {
+                input.set_content(width.to_string(), cx);
+            }
+            input.set_placeholder(tr!("service_model.catalog_dimensions", count = width), cx);
+        });
+    }
+
+    fn catalog_width(&self, cx: &App) -> Option<u32> {
+        self.dimension_lookup
+            .as_ref()
+            .filter(|(id, _, _)| id == self.model_id.read(cx).content().trim())
+            .and_then(|(_, _, width)| *width)
+    }
+
+    /// Parse the fields used by the selected operations and leave provider defaults unset
+    fn model_options_from_fields(&self, cx: &App) -> Result<ServiceModelOptions, String> {
         let mut options = self.model_options.clone();
+        let token_limit = |field: &Entity<TextInput>| {
+            parse_token_limit(field.read(cx).content())
+                .ok_or_else(|| tr!("service_model.invalid_tokens"))
+        };
         options.group = self.model_group.read(cx).content().trim().to_owned();
-        options.context_window = parse_token_limit(self.model_context.read(cx).content())?;
-        options.max_input_tokens = parse_token_limit(self.model_input_tokens.read(cx).content())?;
-        options.max_output_tokens = if options.dialogue() {
-            parse_token_limit(self.model_output_tokens.read(cx).content())?
+        // Catalog input limits still protect the request when an embedding entry has no token fields
+        let embedding_input_limit = options.max_input_tokens.or(options.context_window);
+        options.context_window = None;
+        options.max_output_tokens = None;
+        if options.dialogue() {
+            options.context_window = token_limit(&self.model_context)?;
+            options.max_output_tokens = token_limit(&self.model_output_tokens)?;
+        }
+        options.max_input_tokens = if options.embedding() {
+            embedding_input_limit
+        } else if options.assistant_supported() {
+            token_limit(&self.model_input_tokens)?
         } else {
             None
         };
-        options.valid_token_limits().then_some(options)
+        options.embedding_dimensions = if options.embedding() {
+            parse_token_limit(self.model_dimensions.read(cx).content())
+                .ok_or_else(|| tr!("service_model.invalid_dimensions"))?
+                .filter(|width| Some(*width) != self.catalog_width(cx))
+                .and_then(std::num::NonZeroU32::new)
+        } else {
+            None
+        };
+        options
+            .valid_token_limits()
+            .then_some(options)
+            .ok_or_else(|| tr!("service_model.invalid_tokens"))
     }
 
     /// Return to the supplier draft when the model dialog closes
@@ -1700,6 +1857,7 @@ mod tests {
                 name: "My model".into(),
                 aliases: vec!["original".into()],
                 options: ServiceModelOptions::default(),
+                catalog_embedding_dimensions: None,
                 catalog_metadata_pending: Some(false),
             },
             ServiceModel::new("manual".into()),

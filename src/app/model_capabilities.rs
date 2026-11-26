@@ -7,95 +7,81 @@ use waku_protocol::settings::{ModelKind, ModelModality, ModelPurpose, ServiceMod
 pub(super) enum ModelCategory {
     #[default]
     All,
-    Text,
-    Image,
-    Embedding,
-    Audio,
-    Video,
-    Rerank,
+    Chat,
     Speech,
-    Transcription,
-    Other,
+    Embedding,
+    Rerank,
 }
 
 impl ModelCategory {
-    pub(super) const ALL: [Self; 10] = [
+    pub(super) const TYPES: [Self; 4] = [Self::Chat, Self::Speech, Self::Embedding, Self::Rerank];
+    pub(super) const ALL: [Self; 5] = [
         Self::All,
-        Self::Text,
-        Self::Image,
-        Self::Embedding,
-        Self::Audio,
-        Self::Video,
-        Self::Rerank,
+        Self::Chat,
         Self::Speech,
-        Self::Transcription,
-        Self::Other,
+        Self::Embedding,
+        Self::Rerank,
     ];
 
     pub(super) fn index(self) -> usize {
         self as usize
     }
 
+    /// Provider operation subtypes are kept for dispatch while the editor and filters share four types
     pub(super) fn matches(self, options: &ServiceModelOptions) -> bool {
         match self {
             Self::All => true,
-            Self::Text => options.purpose == ModelPurpose::Chat && options.kind == ModelKind::Text,
-            // Image generation and editing are distinct from a text model accepting an image
-            Self::Image => {
-                options.kind == ModelKind::Image
-                    || matches!(
-                        options.purpose,
-                        ModelPurpose::ImageGeneration | ModelPurpose::ImageEdit
-                    )
-            }
-            Self::Embedding => {
-                options.purpose == ModelPurpose::Chat && options.kind == ModelKind::Embedding
-            }
-            Self::Audio => {
-                options.kind == ModelKind::Realtime || options.accepts(ModelModality::Audio)
-            }
-            Self::Video => {
-                options.kind == ModelKind::Video || options.accepts(ModelModality::Video)
-            }
+            Self::Chat => options.dialogue(),
+            Self::Speech => matches!(
+                options.kind,
+                ModelKind::Speech | ModelKind::Transcription | ModelKind::Realtime
+            ),
+            Self::Embedding => options.embedding(),
             Self::Rerank => {
                 options.purpose == ModelPurpose::Chat && options.kind == ModelKind::Rerank
             }
-            Self::Speech => options.kind == ModelKind::Speech,
-            Self::Transcription => options.kind == ModelKind::Transcription,
-            Self::Other => matches!(
-                options.kind,
-                ModelKind::Moderation | ModelKind::Other | ModelKind::Unknown
-            ),
         }
+    }
+
+    pub(super) fn select(self, options: &mut ServiceModelOptions) {
+        // Selecting an already classified voice model keeps its synthesis or transcription subtype
+        if self.matches(options) {
+            return;
+        }
+        options.kind = match self {
+            Self::Chat => ModelKind::Text,
+            Self::Speech => ModelKind::Speech,
+            Self::Embedding => ModelKind::Embedding,
+            Self::Rerank => ModelKind::Rerank,
+            Self::All => return,
+        };
+        options.purpose = ModelPurpose::Chat;
+        // Capabilities and token limits apply only to the operation they were configured for
+        options.inputs.clear();
+        options.reasoning = false;
+        options.tools = false;
+        options.context_window = None;
+        options.max_input_tokens = None;
+        options.max_output_tokens = None;
     }
 
     pub(super) fn label(self) -> String {
         match self {
             Self::All => tr!("service_model.all"),
-            Self::Text => tr!("service_model.text"),
-            Self::Image => tr!("service_model.image"),
+            Self::Chat => tr!("service_model.chat"),
+            Self::Speech => tr!("service_model.voice"),
             Self::Embedding => tr!("service_model.embedding"),
-            Self::Audio => tr!("service_model.audio"),
-            Self::Video => tr!("service_model.video"),
             Self::Rerank => tr!("service_model.rerank"),
-            Self::Speech => tr!("service_model.speech"),
-            Self::Transcription => tr!("service_model.transcription"),
-            Self::Other => tr!("service_model.other"),
         }
     }
 
     pub(super) fn icon(self) -> &'static str {
         match self {
             Self::All => "icons/list.svg",
-            Self::Text => "icons/case-sensitive.svg",
-            Self::Image => "icons/file-types/image.svg",
-            Self::Embedding => "icons/package.svg",
-            Self::Audio => "icons/file-types/audio.svg",
-            Self::Video => "icons/file-types/video.svg",
-            Self::Rerank => "icons/chevrons-up-down.svg",
+            Self::Chat => "icons/case-sensitive.svg",
             Self::Speech => "icons/file-types/audio.svg",
-            Self::Transcription => "icons/file.svg",
-            Self::Other => "icons/package.svg",
+            Self::Embedding => "icons/package.svg",
+            Self::Rerank => "icons/chevrons-up-down.svg",
         }
     }
 }
@@ -106,6 +92,12 @@ pub(super) fn model_capability_badges(options: &ServiceModelOptions, theme: Them
             options.dialogue() && options.accepts(ModelModality::Vision),
             "service_model.vision",
             "icons/eye.svg",
+            theme.success,
+        ),
+        (
+            options.embedding() && options.accepts(ModelModality::Vision),
+            "service_model.image_input",
+            "icons/file-types/image.svg",
             theme.success,
         ),
         (
@@ -123,19 +115,19 @@ pub(super) fn model_capability_badges(options: &ServiceModelOptions, theme: Them
         (
             options.accepts(ModelModality::Audio),
             "service_model.audio_input",
-            ModelCategory::Audio.icon(),
+            "icons/file-types/audio.svg",
             theme.gauge,
         ),
         (
             options.accepts(ModelModality::Video),
             "service_model.video_input",
-            ModelCategory::Video.icon(),
+            "icons/file-types/video.svg",
             theme.gauge,
         ),
         (
             options.purpose == ModelPurpose::ImageGeneration,
             "service_model.generate",
-            ModelCategory::Image.icon(),
+            "icons/file-types/image.svg",
             theme.success,
         ),
         (
@@ -147,7 +139,7 @@ pub(super) fn model_capability_badges(options: &ServiceModelOptions, theme: Them
         (
             options.kind == ModelKind::Image && options.purpose == ModelPurpose::CatalogOnly,
             "service_model.image",
-            ModelCategory::Image.icon(),
+            "icons/file-types/image.svg",
             theme.text_secondary,
         ),
         (
@@ -171,25 +163,25 @@ pub(super) fn model_capability_badges(options: &ServiceModelOptions, theme: Them
         (
             options.kind == ModelKind::Transcription,
             "service_model.transcription",
-            ModelCategory::Transcription.icon(),
+            "icons/file.svg",
             theme.gauge,
         ),
         (
             options.kind == ModelKind::Realtime,
             "service_model.realtime",
-            ModelCategory::Audio.icon(),
+            "icons/file-types/audio.svg",
             theme.gauge,
         ),
         (
             options.kind == ModelKind::Video,
             "service_model.video",
-            ModelCategory::Video.icon(),
+            "icons/file-types/video.svg",
             theme.gauge,
         ),
         (
             options.kind == ModelKind::Moderation,
             "service_model.moderation",
-            ModelCategory::Other.icon(),
+            "icons/package.svg",
             theme.text_secondary,
         ),
     ];

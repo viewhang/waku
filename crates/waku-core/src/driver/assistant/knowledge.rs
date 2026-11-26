@@ -6,7 +6,7 @@ use waku_protocol::knowledge::KnowledgeModel;
 
 /// Resolved credentials remain on the daemon and never enter the index or wire reply
 pub(crate) struct LibraryModel {
-    pub url: Url,
+    url: Url,
     model: ServiceModel,
     key: String,
     http: reqwest::Client,
@@ -29,7 +29,7 @@ impl LibraryModel {
             .clone();
         ensure!(
             if embedding {
-                model.options.kind == ModelKind::Embedding && model.options.assistant_supported()
+                model.options.embedding()
             } else {
                 model.options.dialogue()
             },
@@ -47,8 +47,21 @@ impl LibraryModel {
         })
     }
 
+    /// A dimension override creates a new vector space while default-width indexes keep their key
+    pub fn index_key(&self, selection: &KnowledgeModel) -> String {
+        let key = format!(
+            "markdown-v2\n{}\n{}\n{}",
+            selection.service_id, self.url, selection.model
+        );
+        match self.model.options.embedding_dimensions {
+            Some(width) => format!("{key}\ndimensions={width}"),
+            None => key,
+        }
+    }
+
     /// Restore batch order from provider indices and normalize vectors for cosine search
     pub fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let options = &self.model.options;
         let value = self
             .runtime
             .block_on(async {
@@ -58,7 +71,7 @@ impl LibraryModel {
                         &self.url,
                         &self.key,
                         "/embeddings",
-                        &serde_json::json!({"model":self.model.id, "input":texts}),
+                        &request::embedding_payload(&self.model.id, texts, options),
                     )
                     .await?;
                     request::read_json(response).await
@@ -76,6 +89,7 @@ impl LibraryModel {
         ensure!(rows.len() == texts.len(), "Incomplete embedding batch");
         rows.sort_by_key(|row| row.index);
         let dimension = rows.first().map_or(0, |row| row.embedding.len());
+        request::check_embedding_width(options, dimension)?;
         rows.into_iter()
             .enumerate()
             .map(|(i, row)| {

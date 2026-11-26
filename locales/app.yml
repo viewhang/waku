@@ -2308,8 +2308,6 @@ assistant.default_model:
   en: Default model
 assistant.choose_model:
   en: Choose a model
-assistant.switch_history:
-  en: The next message sends this conversation’s context to the selected provider
 model_services.settings:
   en: Model Services
 model_services.keywords:
@@ -2420,16 +2418,18 @@ service_model.audio_input:
   en: Audio input
 service_model.video_input:
   en: Video input
-service_model.purpose:
-  en: Model purpose
+service_model.kind:
+  en: Model type (select one)
+service_model.voice:
+  en: Voice
+service_model.image_input:
+  en: Image input
 service_model.chat:
   en: Chat
 service_model.generate:
   en: Generate image
 service_model.edit_image:
   en: Edit image
-service_model.kind:
-  en: Model type
 service_model.text:
   en: Text
 service_model.image:
@@ -2450,16 +2450,24 @@ service_model.other:
   en: Other
 service_model.unsupported_operation:
   en: This model type is available in the catalog. The assistant has no operation configured for it.
+service_model.embedding_dimensions:
+  en: Output vector dimensions
+service_model.provider_default:
+  en: Leave blank for the model default
+service_model.catalog_dimensions:
+  en: "%{count} (models.dev default)"
+service_model.invalid_dimensions:
+  en: Enter a positive whole number or leave the dimensions blank
 service_model.protocol:
   en: Chat protocol
 service_model.capabilities:
-  en: Model capabilities
+  en: Model capabilities (select all that apply)
 service_model.reasoning:
   en: Reasoning
 service_model.tools:
   en: Tools
 service_model.inputs:
-  en: Input modalities
+  en: Input modalities (select all that apply)
 service_model.vision:
   en: Vision
 service_model.audio:

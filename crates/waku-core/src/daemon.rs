@@ -357,6 +357,11 @@ impl Backend for WakuBackend {
                 let models = driver::assistant::list_models(&base_url, &api_key, protocol)?;
                 Ok(ResponsePayload::ModelServiceModels { models })
             }
+            Command::LookupEmbeddingDimensions { base_url, model_id } => {
+                Ok(ResponsePayload::EmbeddingDimensions {
+                    dimensions: driver::assistant::models_dev::embedding_dimensions(&base_url, &model_id)
+                })
+            }
             Command::SyncDraftModelService {
                 base_url,
                 api_key,
@@ -2119,6 +2124,7 @@ fn handle_driver_command(
         | Command::SetModelServiceEnabled { .. }
         | Command::TestModelService { .. }
         | Command::ListModelServiceModels { .. }
+        | Command::LookupEmbeddingDimensions { .. }
         | Command::SyncDraftModelService { .. }
         | Command::SyncModelService { .. }
         | Command::Knowledge { .. }

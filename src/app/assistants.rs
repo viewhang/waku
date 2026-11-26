@@ -39,14 +39,11 @@ impl ModelPickerTarget {
         }
     }
 
+    /// Filter both picker rows and confirmed selections by the operation each screen performs
     fn accepts(self, model: &ServiceModel) -> bool {
         match self {
-            Self::KnowledgeEmbedding => {
-                model.options.kind == waku_protocol::settings::ModelKind::Embedding
-                    && model.options.assistant_supported()
-            }
-            Self::Translation => model.options.dialogue(),
-            Self::Default | Self::Session(_) => model.options.assistant_supported(),
+            Self::KnowledgeEmbedding => model.options.embedding(),
+            Self::Default | Self::Session(_) | Self::Translation => model.options.dialogue(),
         }
     }
 }
@@ -823,15 +820,6 @@ impl Waku {
                     TextField::new("assistant-model-search", search.clone())
                         .icon("icons/search.svg", 13.0),
                 )
-                .when(matches!(target, ModelPickerTarget::Session(_)), |panel| {
-                    panel.child(
-                        div()
-                            .px(px(6.0))
-                            .text_size(sp(11.0))
-                            .text_color(theme.text_secondary)
-                            .child(tr!("assistant.switch_history")),
-                    )
-                })
                 .when(!rows.is_empty(), |panel| panel.child(list))
                 .when(rows.is_empty(), |panel| {
                     panel.child(div().px(px(6.0)).text_color(theme.text_secondary).child(
@@ -1098,4 +1086,36 @@ pub(super) fn assistant_button_base(
         .border_color(theme.border_strong)
         .text_size(sp(12.0))
         .child(label)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use waku_protocol::settings::{ModelKind, ModelModality};
+
+    #[test]
+    fn chat_model_pickers_only_offer_dialogue_models() {
+        let chat = ModelPickerTarget::Session(Uuid::nil());
+        for (id, kind) in [
+            ("multimodal", ModelKind::Text),
+            ("bge-m3", ModelKind::Embedding),
+            ("text-embedding-3-small", ModelKind::Embedding),
+            ("voice", ModelKind::Speech),
+            ("ranker", ModelKind::Rerank),
+        ] {
+            let mut model = ServiceModel::new(id.into());
+            model.options.kind = kind;
+            // Image input can belong to either a dialogue model or an embedding model
+            model.options.inputs = vec![ModelModality::Vision];
+            assert_eq!(chat.accepts(&model), kind == ModelKind::Text, "{id}");
+            assert_eq!(
+                ModelPickerTarget::Default.accepts(&model),
+                chat.accepts(&model)
+            );
+            assert_eq!(
+                ModelPickerTarget::KnowledgeEmbedding.accepts(&model),
+                kind == ModelKind::Embedding
+            );
+        }
+    }
 }

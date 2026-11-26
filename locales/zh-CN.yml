@@ -1127,7 +1127,6 @@ assistant.model_unavailable: "%{model} 已不可用，请重新选择模型"
 assistant.invalid_response: Daemon 返回了意外响应
 assistant.default_model: 默认模型
 assistant.choose_model: 选择模型
-assistant.switch_history: 发送下一条消息时，对话上下文将发送给选中的供应商
 model_services.settings: 模型服务
 model_services.keywords: 模型 服务商 供应商 接口 地址 密钥 同步 OpenAI
 model_services.add: 添加供应商
@@ -1183,26 +1182,31 @@ service_model.ungrouped: 未分组
 service_model.all: 全部
 service_model.audio_input: 音频输入
 service_model.video_input: 视频输入
-service_model.purpose: 模型用途
+service_model.kind: 模型类型（单选）
+service_model.voice: 语音
+service_model.image_input: 图片输入
 service_model.chat: 对话
 service_model.generate: 图像生成
 service_model.edit_image: 图像编辑
-service_model.kind: 模型类型
 service_model.text: 文本
 service_model.image: 图片
 service_model.embedding: 嵌入
 service_model.rerank: 重排
-service_model.speech: 语音
-service_model.transcription: 转录
+service_model.speech: 语音合成
+service_model.transcription: 语音转录
 service_model.realtime: 实时音频
 service_model.moderation: 内容审核
 service_model.other: 其他
 service_model.unsupported_operation: 此模型可在列表中查看，当前助手没有可用的调用方式。
+service_model.embedding_dimensions: 输出向量维度
+service_model.provider_default: 留空使用模型默认维度
+service_model.catalog_dimensions: "%{count}（models.dev 默认维度）"
+service_model.invalid_dimensions: 向量维度须为正整数，可留空使用模型默认值
 service_model.protocol: 对话协议
-service_model.capabilities: 模型能力
+service_model.capabilities: 模型能力（可多选）
 service_model.reasoning: 推理
 service_model.tools: 工具
-service_model.inputs: 输入模态
+service_model.inputs: 输入模态（可多选）
 service_model.vision: 视觉
 service_model.audio: 音频
 service_model.video: 视频

@@ -6,6 +6,10 @@ import type { ServiceModelOptions } from "./ServiceModelOptions";
  */
 export type ServiceModel = { id: string, name?: string, aliases?: Array<string>, options?: ServiceModelOptions,
 /**
+ * Catalog vector width is informational and never forces an API override
+ */
+catalog_embedding_dimensions?: number | null,
+/**
  * True while awaiting metadata, false once configured, absent on older structured rows
  */
 catalog_metadata_pending?: boolean | null, };

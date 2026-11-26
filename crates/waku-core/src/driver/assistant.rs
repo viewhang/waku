@@ -2,7 +2,7 @@
 
 pub(crate) mod knowledge;
 mod library_tools;
-mod models_dev;
+pub(crate) mod models_dev;
 mod request;
 mod search;
 mod transport;

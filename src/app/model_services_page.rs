@@ -1197,72 +1197,55 @@ mod tests {
     use waku_protocol::settings::{ModelKind, ModelModality, ModelProtocol, ModelPurpose};
 
     #[test]
-    fn catalog_filters_by_configured_type_and_supported_inputs() {
-        let mut vision = ServiceModel::new("vision-chat".into());
-        vision.options.group = "Chat".into();
-        vision.options.inputs = vec![ModelModality::Vision, ModelModality::Video];
-        let mut multimodal = ServiceModel::new("multimodal-chat".into());
-        multimodal.options.group = "Chat".into();
-        multimodal.options.protocol = ModelProtocol::Gemini;
-        multimodal.options.inputs = vec![ModelModality::Audio, ModelModality::Video];
-        let mut image = ServiceModel::new("image-editor".into());
-        image.options.group = "Images".into();
-        image.options.kind = ModelKind::Image;
-        image.options.purpose = ModelPurpose::ImageEdit;
-        let mut speech = ServiceModel::discovered("tts".into(), ModelProtocol::OpenAiChat);
-        speech.options.kind = ModelKind::Speech;
-        let mut transcription =
-            ServiceModel::discovered("transcribe".into(), ModelProtocol::OpenAiChat);
-        transcription.options.kind = ModelKind::Transcription;
-        let unknown = ServiceModel::discovered("unknown".into(), ModelProtocol::OpenAiChat);
-        let mut moderation =
-            ServiceModel::discovered("moderation".into(), ModelProtocol::OpenAiChat);
-        moderation.options.kind = ModelKind::Moderation;
-        let models = [
-            vision,
-            image,
-            multimodal,
-            speech,
-            transcription,
-            unknown,
-            moderation,
-        ];
-
+    fn catalog_filters_by_one_model_type_independently_of_capabilities() {
+        let mut chat = ServiceModel::new("multimodal-chat".into());
+        chat.options.group = "Chat".into();
+        chat.options.protocol = ModelProtocol::Gemini;
+        chat.options.inputs = vec![ModelModality::Vision, ModelModality::Audio];
+        let mut models = vec![chat];
+        for (id, kind) in [
+            ("tts", ModelKind::Speech),
+            ("transcribe", ModelKind::Transcription),
+            ("live", ModelKind::Realtime),
+            ("encoder", ModelKind::Embedding),
+            ("ranker", ModelKind::Rerank),
+        ] {
+            let mut model = ServiceModel::new(id.into());
+            model.options.kind = kind;
+            models.push(model);
+        }
+        let mut legacy = ServiceModel::new("image-editor".into());
+        legacy.options.purpose = ModelPurpose::ImageEdit;
+        legacy.options.kind = ModelKind::Image;
+        models.push(legacy);
         let all = CatalogIndex::new(&models, ModelCategory::All, "");
-        assert_eq!(all.counts, [7, 2, 1, 0, 1, 1, 0, 1, 1, 2]);
+        assert_eq!(all.counts, [7, 1, 3, 1, 1]);
         assert!(
-            matches!(all.rows.as_slice(), [CatalogRow::Group(chat), CatalogRow::Model(0), CatalogRow::Model(2), CatalogRow::Group(images), CatalogRow::Model(1), ..]
-            if chat.as_ref() == "Chat" && images.as_ref() == "Images")
+            matches!(all.rows.first(), Some(CatalogRow::Group(name)) if name.as_ref() == "Chat")
         );
-        let images = CatalogIndex::new(&models, ModelCategory::Image, "");
-        assert_eq!(images.counts, all.counts);
-        assert!(matches!(
-            images.rows.as_slice(),
-            [CatalogRow::Group(_), CatalogRow::Model(1)]
-        ));
-        let video = CatalogIndex::new(&models, ModelCategory::Video, "");
-        assert!(matches!(
-            video.rows.as_slice(),
-            [CatalogRow::Group(_), CatalogRow::Model(2)]
-        ));
-        let other = CatalogIndex::new(&models, ModelCategory::Other, "");
-        assert!(matches!(
-            other.rows.as_slice(),
-            [CatalogRow::Model(5), CatalogRow::Model(6)]
-        ));
-        let searched = CatalogIndex::new(&models, ModelCategory::Text, "vision");
-        assert_eq!(searched.counts, [1, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let speech = CatalogIndex::new(&models, ModelCategory::Speech, "");
+        assert_eq!(
+            speech.model_ids(&models),
+            HashSet::from(["tts".into(), "transcribe".into(), "live".into()])
+        );
+        let searched = CatalogIndex::new(&models, ModelCategory::Chat, "multi");
         assert_eq!(
             searched.model_ids(&models),
-            HashSet::from(["vision-chat".into()])
+            HashSet::from(["multimodal-chat".into()])
         );
-        assert_eq!(
-            other.model_ids(&models),
-            HashSet::from(["unknown".into(), "moderation".into()])
+        let mut changed = models[0].options.clone();
+        ModelCategory::Embedding.select(&mut changed);
+        assert!(
+            changed.embedding() && !changed.dialogue() && !changed.accepts(ModelModality::Vision)
         );
-        assert!(matches!(
-            searched.rows.as_slice(),
-            [CatalogRow::Group(_), CatalogRow::Model(0)]
-        ));
+        changed.inputs.push(ModelModality::Vision);
+        assert!(changed.accepts(ModelModality::Vision));
+        assert!(
+            ModelCategory::TYPES
+                .into_iter()
+                .filter(|kind| kind.matches(&changed))
+                .count()
+                == 1
+        );
     }
 }

@@ -380,7 +380,7 @@ impl KnowledgeLibrary {
         let model = LibraryModel::resolve(&self.settings, &config.embedding, true);
         let key = model
             .as_ref()
-            .map(|m| index_key(config, m.url.as_str()))
+            .map(|m| m.index_key(&config.embedding))
             .unwrap_or_default();
         self.current(generation)?;
         index::forget_missing(&mut db, &config.root, &files)?;
@@ -496,14 +496,6 @@ impl KnowledgeLibrary {
         }
         Ok(())
     }
-}
-
-/// A changed endpoint, model, or chunk format requires its own compatible vectors
-fn index_key(config: &LibraryConfig, url: &str) -> String {
-    format!(
-        "markdown-v2\n{}\n{}\n{}",
-        config.embedding.service_id, url, config.embedding.model
-    )
 }
 
 /// Keep each saved folder's filesystem events and revision cache alive across UI switches

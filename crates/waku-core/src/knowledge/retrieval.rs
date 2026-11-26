@@ -52,7 +52,7 @@ impl KnowledgeLibrary {
                     .embed(&[query])?
                     .pop()
                     .context("Missing query vector")?;
-                Ok((index_key(config, model.url.as_str()), vector))
+                Ok((model.index_key(&config.embedding), vector))
             });
             let hits = match vector {
                 Ok((key, vector)) => index::search(db, &config.root, key, query, vector),

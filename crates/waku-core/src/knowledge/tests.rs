@@ -143,6 +143,7 @@ fn knowledge_round_trip_search_citations_watch_and_restart() {
     let mut encoder = ServiceModel::new("encoder".into());
     encoder.options.kind = ModelKind::Embedding;
     service.models.push(encoder.clone());
+    encoder.options.embedding_dimensions = 5.try_into().ok();
     encoder.id = "encoder-v2".into();
     service.models.push(encoder);
     let service_id = service.id;
@@ -158,7 +159,7 @@ fn knowledge_round_trip_search_citations_watch_and_restart() {
     let next_encoder = select("encoder-v2");
     DaemonSettingsStore::open(dir.join("settings.json"))
         .unwrap()
-        .save_model_service(service, None)
+        .save_model_service(service.clone(), None)
         .unwrap();
     let indexed = Arc::new(AtomicUsize::new(0));
     let observed = indexed.clone();
@@ -169,6 +170,11 @@ fn knowledge_round_trip_search_citations_watch_and_restart() {
             let (socket, route, body, _) = http::request(&listener);
             match route.as_str() {
                 "POST /v1/embeddings" => {
+                    if body["model"] == "encoder-v2" {
+                        assert_eq!(body["dimensions"], 5);
+                    } else if let Some(width) = body.get("dimensions") {
+                        assert_eq!(width, 6);
+                    }
                     let texts = body["input"].as_array().unwrap();
                     // Simulate one incompatible model response while the other libraries stay searchable
                     if body["model"] == "encoder-v2" && texts[0] == "部分模型故障" {
@@ -187,8 +193,8 @@ fn knowledge_round_trip_search_citations_watch_and_restart() {
                                 observed_queries.fetch_add(1, Ordering::Relaxed);
                             }
                             let mut vector = embedding(text).to_vec();
-                            if body["model"] == "encoder-v2" {
-                                vector.push(0.0);
+                            if let Some(width) = body["dimensions"].as_u64() {
+                                vector.resize(width as usize, 0.0);
                             }
                             json!({"index":i, "embedding":vector})
                         })
@@ -608,6 +614,37 @@ fn knowledge_round_trip_search_citations_watch_and_restart() {
         );
     }
     call(&client, Op::RemoveLibrary { root: third });
+    // Changing only the width must re-embed the remaining library before its vectors can be searched
+    let before_resize = indexed.load(Ordering::Relaxed);
+    service
+        .models
+        .iter_mut()
+        .find(|m| m.id == "encoder")
+        .unwrap()
+        .options
+        .embedding_dimensions = 6.try_into().ok();
+    client
+        .request(
+            Uuid::nil(),
+            Uuid::nil(),
+            Command::SaveModelService {
+                service,
+                api_key: None,
+            },
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while indexed.load(Ordering::Relaxed) == before_resize {
+        assert!(
+            Instant::now() < deadline,
+            "dimension change did not rebuild the index"
+        );
+        thread::sleep(Duration::from_millis(40));
+    }
+    ready(&client, 1, "");
+    assert!(
+        matches!(call(&client, Op::Search { query: "备份".into() }), KnowledgeResult::Matches { sources, .. } if !sources.is_empty())
+    );
     let KnowledgeResult::Status { status } = call(
         &client,
         Op::RemoveLibrary {

@@ -781,6 +781,29 @@ fn protocol_parameters(
     })
 }
 
+/// Use the same optional output width for individual and batched embedding requests
+pub(super) fn embedding_payload(
+    model: &str,
+    input: impl serde::Serialize,
+    options: &ServiceModelOptions,
+) -> Value {
+    let mut body = json!({"model": model, "input": input});
+    if let Some(dimensions) = options.embedding_dimensions {
+        body["dimensions"] = json!(dimensions);
+    }
+    body
+}
+
+/// A provider that ignores an explicit width cannot supply compatible vectors
+pub(super) fn check_embedding_width(options: &ServiceModelOptions, width: usize) -> Result<()> {
+    if let Some(expected) = options.embedding_dimensions
+        && width != expected.get() as usize
+    {
+        bail!("Expected {expected} embedding dimensions, received {width}");
+    }
+    Ok(())
+}
+
 pub(super) struct Operation<'a> {
     pub url: &'a Url,
     pub key: &'a str,
@@ -806,7 +829,8 @@ impl Operation<'_> {
         {
             bail!("Estimated input exceeds the configured token budget ({estimated} tokens)");
         }
-        if self.prompt.trim().is_empty() {
+        let image_embedding = self.options.embedding() && !self.media.is_empty();
+        if self.prompt.trim().is_empty() && !image_embedding {
             bail!("Enter a prompt for the selected model");
         }
         let (endpoint, payload, label) = match self.options.purpose {
@@ -842,11 +866,32 @@ impl Operation<'_> {
                 return image_result(http, response, store, events, "Edited image").await;
             }
             ModelPurpose::Chat => match self.options.kind {
-                ModelKind::Embedding => (
-                    "/embeddings",
-                    json!({"model":self.model,"input":self.prompt}),
-                    "",
-                ),
+                ModelKind::Embedding => {
+                    let payload = if self.media.is_empty() {
+                        embedding_payload(self.model, self.prompt, self.options)
+                    } else {
+                        // An OpenRouter-compatible embeddings endpoint accepts one joint text/image input
+                        let mut content = Vec::new();
+                        if !self.prompt.trim().is_empty() {
+                            content.push(json!({"type": "text", "text": self.prompt}));
+                        }
+                        for image in self.media {
+                            if !self.options.accepts(ModelModality::Vision)
+                                || !image.mime.starts_with("image/")
+                            {
+                                bail!(
+                                    "The selected embedding model does not accept this attachment"
+                                );
+                            }
+                            let data =
+                                base64::engine::general_purpose::STANDARD.encode(image.bytes);
+                            let url = format!("data:{};base64,{data}", image.mime);
+                            content.push(json!({"type": "image_url", "image_url": {"url": url}}));
+                        }
+                        embedding_payload(self.model, [json!({"content": content})], self.options)
+                    };
+                    ("/embeddings", payload, "")
+                }
                 ModelKind::Rerank => {
                     let mut lines = self
                         .prompt
@@ -884,6 +929,13 @@ impl Operation<'_> {
             .get(key)
             .filter(|value| value.is_array())
             .context("The model returned no results")?;
+        if self.options.kind == ModelKind::Embedding && self.options.embedding_dimensions.is_some()
+        {
+            let vector = output[0]["embedding"]
+                .as_array()
+                .context("Missing embedding vector")?;
+            check_embedding_width(self.options, vector.len())?;
+        }
         let text = format!(
             "\x60\x60\x60json\n{}\n\x60\x60\x60",
             serde_json::to_string_pretty(output)?
@@ -1624,6 +1676,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embedding_image_input_requires_opt_in_and_accepts_an_image_without_text() {
+        let http = super::super::http_client().unwrap();
+        let (events, _) = crate::driver::test_event_channel();
+        let (url, server) = reply(
+            "application/json",
+            json!({"data":[{"embedding":[0.25,0.75]}]}).to_string(),
+        );
+        let mut options = ServiceModelOptions {
+            kind: ModelKind::Embedding,
+            ..Default::default()
+        };
+        for enabled in [false, true] {
+            if enabled {
+                options.inputs.push(ModelModality::Vision);
+            }
+            let operation = Operation {
+                url: &url,
+                key: "",
+                model: "image-encoder",
+                options: &options,
+                prompt: "",
+                media: vec![Media {
+                    mime: "image/png",
+                    name: "sample.png".into(),
+                    bytes: base64::engine::general_purpose::STANDARD
+                        .decode(PNG)
+                        .unwrap(),
+                }],
+            };
+            assert_eq!(operation.send(&http, None, &events).await.is_ok(), enabled);
+        }
+        let request = server.join().unwrap();
+        assert_eq!(request.path, "/v1/embeddings");
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body["input"],
+            json!([{"content":[{"type":"image_url","image_url":{"url":format!("data:image/png;base64,{PNG}")}}]}])
+        );
+        assert!(body.get("dimensions").is_none());
+    }
+
+    #[tokio::test]
     async fn generation_edits_embeddings_and_rerank_dispatch_to_their_endpoints() {
         let http = super::super::http_client().unwrap();
         let root = std::env::temp_dir().join(format!("waku-model-files-{}", uuid::Uuid::new_v4()));
@@ -1659,6 +1753,7 @@ mod tests {
             let options = ServiceModelOptions {
                 purpose,
                 kind,
+                embedding_dimensions: (kind == ModelKind::Embedding).then(|| 2.try_into().unwrap()),
                 ..Default::default()
             };
             let response = match kind {
@@ -1725,7 +1820,10 @@ mod tests {
                 assert_eq!(sent["model"], "demo");
                 match kind {
                     ModelKind::Image => assert_eq!(sent["prompt"], prompt),
-                    ModelKind::Embedding => assert_eq!(sent["input"], prompt),
+                    ModelKind::Embedding => {
+                        assert_eq!(sent["input"], prompt);
+                        assert_eq!(sent["dimensions"], 2);
+                    }
                     ModelKind::Rerank => {
                         assert_eq!(sent["documents"], json!(["red square", "blue circle"]))
                     }

@@ -234,6 +234,11 @@ pub enum Command {
         #[serde(default)]
         protocol: crate::settings::ModelProtocol,
     },
+    /// Look up one manual embedding model in the public catalog without a provider credential
+    LookupEmbeddingDimensions {
+        base_url: String,
+        model_id: String,
+    },
     /// Discover models and metadata before saving a model service
     SyncDraftModelService {
         base_url: String,
@@ -528,6 +533,9 @@ pub enum ResponsePayload {
     },
     ModelServiceModels {
         models: Vec<String>,
+    },
+    EmbeddingDimensions {
+        dimensions: Option<u32>,
     },
     ModelServiceCatalog {
         models: Vec<crate::settings::ServiceModel>,

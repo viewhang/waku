@@ -7,7 +7,11 @@ import type { ModelPurpose } from "./ModelPurpose";
 /**
  * Settings selected per model and resolved on every turn
  */
-export type ServiceModelOptions = { group: string, purpose: ModelPurpose, protocol: ModelProtocol, kind: ModelKind, reasoning: boolean,
+export type ServiceModelOptions = { group: string, purpose: ModelPurpose, protocol: ModelProtocol, kind: ModelKind,
+/**
+ * Omit dimensions from embedding requests when using the provider default
+ */
+embedding_dimensions?: number | null, reasoning: boolean,
 /**
  * Whether the model advertises support for function tools
  */

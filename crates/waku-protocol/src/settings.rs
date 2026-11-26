@@ -63,6 +63,9 @@ pub struct ServiceModel {
     pub aliases: Vec<String>,
     #[serde(default, skip_serializing_if = "ServiceModelOptions::is_default")]
     pub options: ServiceModelOptions,
+    /// Catalog vector width is informational and never forces an API override
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_embedding_dimensions: Option<u32>,
     /// True while awaiting metadata, false once configured, absent on older structured rows
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_metadata_pending: Option<bool>,
@@ -122,6 +125,9 @@ pub struct ServiceModelOptions {
     pub purpose: ModelPurpose,
     pub protocol: ModelProtocol,
     pub kind: ModelKind,
+    /// Omit dimensions from embedding requests when using the provider default
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dimensions: Option<std::num::NonZeroU32>,
     pub reasoning: bool,
     /// Whether the model advertises support for function tools
     pub tools: bool,
@@ -138,6 +144,7 @@ impl Default for ServiceModelOptions {
             purpose: ModelPurpose::Chat,
             protocol: ModelProtocol::OpenAiChat,
             kind: ModelKind::Text,
+            embedding_dimensions: None,
             reasoning: false,
             tools: true,
             inputs: Vec::new(),
@@ -173,10 +180,18 @@ impl ServiceModelOptions {
             }
     }
 
+    /// Inputs to the embedding API produce one numeric vector per item
+    pub fn embedding(&self) -> bool {
+        self.purpose == ModelPurpose::Chat && self.kind == ModelKind::Embedding
+    }
+
     pub fn accepts(&self, modality: ModelModality) -> bool {
         match self.purpose {
             ModelPurpose::ImageEdit => modality == ModelModality::Vision,
             ModelPurpose::ImageGeneration | ModelPurpose::CatalogOnly => false,
+            ModelPurpose::Chat if self.embedding() => {
+                modality == ModelModality::Vision && self.inputs.contains(&modality)
+            }
             ModelPurpose::Chat => {
                 self.dialogue()
                     && self.inputs.contains(&modality)
@@ -235,10 +250,15 @@ impl ServiceModel {
             for alias in &model.aliases {
                 incoming.remove(alias);
             }
-            if let Some(discovered) = discovered
-                && (model.catalog_metadata_pending == Some(true)
-                    || model.catalog_metadata_pending.is_none()
-                        && model.matches_legacy_discovery(&discovered.options))
+            let Some(discovered) = discovered else {
+                continue;
+            };
+            if discovered.catalog_embedding_dimensions.is_some() {
+                model.catalog_embedding_dimensions = discovered.catalog_embedding_dimensions;
+            }
+            if model.catalog_metadata_pending == Some(true)
+                || model.catalog_metadata_pending.is_none()
+                    && model.matches_legacy_discovery(&discovered)
             {
                 model.options = ServiceModelOptions {
                     protocol: model.options.protocol,
@@ -257,6 +277,7 @@ impl ServiceModel {
             name: String::new(),
             aliases: Vec::new(),
             options: ServiceModelOptions::default(),
+            catalog_embedding_dimensions: None,
             catalog_metadata_pending: Some(false),
         }
     }
@@ -272,7 +293,7 @@ impl ServiceModel {
         model
     }
 
-    fn matches_legacy_discovery(&self, discovered: &ServiceModelOptions) -> bool {
+    fn matches_legacy_discovery(&self, discovered: &Self) -> bool {
         if !self.name.is_empty() || !self.aliases.is_empty() {
             return false;
         }
@@ -286,7 +307,16 @@ impl ServiceModel {
             protocol,
             kind: ModelKind::Text,
             purpose: ModelPurpose::Chat,
-            ..discovered.clone()
+            // Old embedding metadata put the catalog vector width in the token output field
+            max_output_tokens: discovered.options.max_output_tokens.or(discovered
+                .catalog_embedding_dimensions
+                .filter(|width| {
+                    discovered
+                        .options
+                        .context_window
+                        .is_none_or(|window| *width <= window)
+                })),
+            ..discovered.options.clone()
         };
         self.options == defaults || self.options == previous_catalog
     }
@@ -320,7 +350,19 @@ fn deserialize_service_models<'de, D: serde::Deserializer<'de>>(
                 catalog_metadata_pending: Some(true),
                 ..ServiceModel::new(id)
             },
-            StoredModel::Model(model) => model,
+            StoredModel::Model(mut model) => {
+                // Older catalogs saved embedding width as output tokens, the editor only set it for chat
+                if model.options.embedding()
+                    && let Some(width) = model
+                        .options
+                        .max_output_tokens
+                        .take()
+                        .filter(|width| *width > 1)
+                {
+                    model.catalog_embedding_dimensions.get_or_insert(width);
+                }
+                model
+            }
         })
         .collect())
 }
@@ -404,6 +446,26 @@ mod tests {
         let round_trip: DaemonSettings =
             serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
         assert_eq!(round_trip, settings);
+    }
+
+    #[test]
+    fn embedding_dimensions_round_trip_independently_of_token_limits() {
+        let legacy: ModelService = serde_json::from_value(serde_json::json!({
+            "id": Uuid::nil(), "name": "Local", "base_url": "http://localhost/v1", "enabled": true,
+            "models": [{"id": "encoder", "options": {"kind": "embedding", "context_window": 8192, "max_output_tokens": 1536}}]
+        })).unwrap();
+        assert_eq!(legacy.models[0].catalog_embedding_dimensions, Some(1536));
+        assert_eq!(legacy.models[0].options.embedding_dimensions, None);
+        assert_eq!(legacy.models[0].options.max_output_tokens, None);
+        let mut data = serde_json::json!({"kind": "embedding", "max_input_tokens": 8, "embedding_dimensions": 512});
+        let options: ServiceModelOptions = serde_json::from_value(data.clone()).unwrap();
+        assert!(options.embedding() && !options.dialogue() && options.valid_token_limits());
+        assert_eq!(
+            serde_json::to_value(options).unwrap()["embedding_dimensions"],
+            512
+        );
+        data["embedding_dimensions"] = 0.into();
+        assert!(serde_json::from_value::<ServiceModelOptions>(data).is_err());
     }
 
     #[test]
