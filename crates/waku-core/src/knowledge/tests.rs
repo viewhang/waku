@@ -99,37 +99,34 @@ fn claims(payload: &Value) -> Value {
         .or_else(|| content[0]["text"].as_str())
         .unwrap();
     let input: Value = serde_json::from_str(prompt).unwrap();
-    if input["question"].as_str().unwrap().contains("预算") {
-        return json!({"claims":[]});
-    }
     let evidence = input["excerpts"].as_array().unwrap();
-    if input["question"] == "跨库核对决策和备份" {
-        let ids: Vec<_> = [("notes", "复核完成"), ("work", "工作库专用")]
-            .into_iter()
-            .map(|(library, excerpt)| {
-                &evidence
-                    .iter()
-                    .find(|e| {
-                        e["library"] == library
-                            && e["document"] == "decision.md"
-                            && e["excerpt"].as_str().unwrap().contains(excerpt)
-                    })
-                    .unwrap()["number"]
-            })
-            .collect();
-        return json!({"claims":[{"text":"已完成复核，工作库留有备份记录","sources":ids}]});
-    }
-    let sources: Vec<_> = ["发布暂缓", "负责人是林"]
+    let (text, required): (&str, &[(&str, &str)]) = match input["question"].as_str().unwrap() {
+        "跨库核对决策和备份" => (
+            "已完成复核，工作库留有备份记录",
+            &[("notes", "复核完成"), ("work", "工作库专用")],
+        ),
+        "预算多少" => ("预算为四万元", &[("notes", "预算为四万元")]),
+        _ => (
+            "发布暂缓，由林跟进",
+            &[("notes", "发布暂缓"), ("notes", "负责人是林")],
+        ),
+    };
+    // The same question can be answered or declined depending on the retrieved passages
+    let sources: Option<Vec<_>> = required
         .iter()
-        .map(|needle| {
+        .map(|(library, quote)| {
             evidence
                 .iter()
-                .find(|e| e["excerpt"].as_str().unwrap().contains(needle))
-                .unwrap()["number"]
-                .clone()
+                .find(|e| {
+                    e["library"] == *library && e["excerpt"].as_str().unwrap().contains(quote)
+                })
+                .map(|e| json!({"number": e["number"], "quote": quote}))
         })
         .collect();
-    json!({"claims":[{"text":"发布暂缓，由林跟进","sources":sources}]})
+    match sources {
+        Some(sources) => json!({"claims":[{"text":text,"sources":sources}]}),
+        None => json!({"claims":[]}),
+    }
 }
 
 #[test]
@@ -269,23 +266,48 @@ fn knowledge_round_trip_search_citations_watch_and_restart() {
     );
     assert!(
         cited_answer(
-            r#"{"claims":[{"text":"invented","sources":[99]}]}"#,
+            r#"{"claims":[{"text":"invented","sources":[{"number":99,"quote":"发布暂缓"}]}]}"#,
             &sources
         )
         .is_err()
     );
+    // A real source number cannot legitimize fabricated text or a quote taken from another note
+    for quote in ["预算为四万元", "负责人是林", " "] {
+        let raw =
+            json!({"claims":[{"text":"未经支持的结论","sources":[{"number":1,"quote":quote}]}]});
+        assert!(cited_answer(&raw.to_string(), &sources).is_err());
+    }
     let (text, sources) = ask("预算多少");
     assert!(text.is_empty() && sources.is_empty());
     eprintln!(
         "two searches, two grounded queries and one source read over loopback: {:?}",
         start.elapsed()
     );
-    fs::write(notes.join("decision.md"), "# 新决策\n复核完成").unwrap();
+    fs::write(
+        notes.join("decision.md"),
+        "# 新决策\n复核完成，预算为四万元",
+    )
+    .unwrap();
     let KnowledgeResult::Passage { changed, text, .. } = call(&client, read()) else {
         panic!()
     };
     assert!(changed && text.contains("复核完成"));
     let changed_stamp = ready(&client, 3, &stamp);
+    let KnowledgeResult::Documents { documents, .. } = call(
+        &client,
+        Op::List {
+            offset: 0,
+            include_folders: Some(true),
+        },
+    ) else {
+        unreachable!()
+    };
+    let listed = documents.iter().find(|d| d.id == hit.document_id).unwrap();
+    assert_eq!(listed.revision, Some(index::revision(&text)));
+    assert_ne!(listed.revision.as_deref(), Some(hit.revision.as_str()));
+    let (text, citations) = ask("预算多少");
+    assert_eq!(text, "预算为四万元 [1]");
+    assert_eq!(citations[0].document_id, hit.document_id);
     fs::remove_file(notes.join("backup.md")).unwrap();
     ready(&client, 2, &changed_stamp);
     assert!(search("KB-42").iter().all(|s| s.path != "backup.md"));
@@ -669,12 +691,8 @@ fn knowledge_readonly_corpus_offsets() {
     );
 }
 
-/// Explicit opt-in exercises saved model services with a disposable index and a specified test corpus
-#[test]
-#[ignore = "sends the supplied WAKU_TEST_LIBRARY and WAKU_TEST_QUESTION to the selected model services"]
-fn knowledge_live_models() -> Result<()> {
-    let root = std::env::var("WAKU_TEST_LIBRARY")?;
-    let query = std::env::var("WAKU_TEST_QUESTION")?;
+/// Build a disposable index with the explicitly selected services for live retrieval checks
+fn live_index(root: String) -> Result<(tempfile::TempDir, Arc<KnowledgeLibrary>, KnowledgeModel)> {
     let settings = Arc::new(DaemonSettingsStore::open(
         crate::DaemonSettings::default_path(),
     )?);
@@ -693,108 +711,194 @@ fn knowledge_live_models() -> Result<()> {
     };
     let embedding = selected("WAKU_TEST_EMBEDDING")?;
     let chat = selected("WAKU_TEST_CHAT")?;
-    let dir = std::env::temp_dir().join(format!("waku-live-knowledge-{}", Uuid::new_v4()));
-    fs::create_dir(&dir)?;
-    let lib = KnowledgeLibrary::open(dir.join("knowledge.sqlite"), settings)?;
-    let result = (|| -> Result<()> {
-        let start = Instant::now();
-        lib.execute(KnowledgeOperation::Configure {
-            config: LibraryConfig { root, embedding },
-        })?;
-        loop {
-            let KnowledgeResult::Status { status } = lib.execute(KnowledgeOperation::Status)?
-            else {
-                unreachable!()
-            };
-            if let Some(error) = status.error {
-                bail!("{error}");
-            }
-            if !status.indexing && status.ready == status.total && status.ready > 0 {
-                eprintln!(
-                    "indexed {} documents in {:?}",
-                    status.ready,
-                    start.elapsed()
-                );
-                break;
-            }
-            ensure!(
-                start.elapsed() < Duration::from_secs(300),
-                "Indexing timed out"
-            );
-            thread::sleep(Duration::from_millis(100));
+    let dir = tempfile::tempdir()?;
+    let lib = KnowledgeLibrary::open(dir.path().join("knowledge.sqlite"), settings)?;
+    let start = Instant::now();
+    lib.execute(KnowledgeOperation::Configure {
+        config: LibraryConfig { root, embedding },
+    })?;
+    loop {
+        let KnowledgeResult::Status { status } = lib.execute(KnowledgeOperation::Status)? else {
+            unreachable!()
+        };
+        if let Some(error) = status.error {
+            bail!("{error}");
         }
-        let start = Instant::now();
-        let KnowledgeResult::Matches { sources, .. } = lib.execute(KnowledgeOperation::Search {
-            query: query.clone(),
-        })?
+        if !status.indexing && status.ready == status.total && status.ready > 0 {
+            eprintln!(
+                "indexed {} documents in {:?}",
+                status.ready,
+                start.elapsed()
+            );
+            break;
+        }
+        ensure!(
+            start.elapsed() < Duration::from_secs(300),
+            "Indexing timed out"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok((dir, lib, chat))
+}
+
+/// Explicit opt-in exercises saved model services with a disposable index and a specified test corpus
+#[test]
+#[ignore = "sends the supplied WAKU_TEST_LIBRARY and WAKU_TEST_QUESTION to the selected model services"]
+fn knowledge_live_models() -> Result<()> {
+    let root = std::env::var("WAKU_TEST_LIBRARY")?;
+    let query = std::env::var("WAKU_TEST_QUESTION")?;
+    let (_index, lib, chat) = live_index(root)?;
+    let start = Instant::now();
+    let KnowledgeResult::Matches { sources, .. } = lib.execute(KnowledgeOperation::Search {
+        query: query.clone(),
+    })?
+    else {
+        unreachable!()
+    };
+    let first = sources.first().context("No passages retrieved")?;
+    eprintln!(
+        "search {:?}, first result {} L{}",
+        start.elapsed(),
+        first.path,
+        first.line
+    );
+    let start = Instant::now();
+    let KnowledgeResult::Answer { text, sources, .. } = lib.execute(KnowledgeOperation::Ask {
+        query,
+        chat: chat.clone(),
+    })?
+    else {
+        unreachable!()
+    };
+    ensure!(
+        !text.is_empty() && !sources.is_empty(),
+        "Question received no supported answer"
+    );
+    if let Ok(term) = std::env::var("WAKU_TEST_EVIDENCE") {
+        ensure!(
+            sources.iter().any(|s| s.text.contains(&term)),
+            "No citation contains the expected supporting term"
+        );
+    }
+    for source in &sources {
+        eprintln!("cited {} L{}", source.path, source.line);
+        let KnowledgeResult::Passage { text, changed, .. } =
+            lib.execute(KnowledgeOperation::Read {
+                id: source.document_id,
+                revision: Some(source.revision.clone()),
+                start: source.start,
+                end: Some(source.end),
+            })?
         else {
             unreachable!()
         };
-        let first = sources.first().context("No passages retrieved")?;
-        eprintln!(
-            "search {:?}, first result {} L{}",
-            start.elapsed(),
-            first.path,
-            first.line
-        );
-        let start = Instant::now();
+        ensure!(!changed && text == source.text, "Cited source changed");
+    }
+    eprintln!(
+        "grounded answer {:?}, {} verified citations",
+        start.elapsed(),
+        sources.len()
+    );
+    if let Ok(unsupported) = std::env::var("WAKU_TEST_UNANSWERABLE") {
         let KnowledgeResult::Answer { text, sources, .. } =
             lib.execute(KnowledgeOperation::Ask {
-                query,
-                chat: chat.clone(),
+                query: unsupported,
+                chat,
             })?
         else {
             unreachable!()
         };
         ensure!(
-            !text.is_empty() && !sources.is_empty(),
-            "Question received no supported answer"
+            text.is_empty() && sources.is_empty(),
+            "The model answered an unsupported question"
         );
-        if let Ok(term) = std::env::var("WAKU_TEST_EVIDENCE") {
-            ensure!(
-                sources.iter().any(|s| s.text.contains(&term)),
-                "No citation contains the expected supporting term"
-            );
-        }
-        for source in &sources {
-            eprintln!("cited {} L{}", source.path, source.line);
-            let KnowledgeResult::Passage { text, changed, .. } =
-                lib.execute(KnowledgeOperation::Read {
-                    id: source.document_id,
-                    revision: Some(source.revision.clone()),
-                    start: source.start,
-                    end: Some(source.end),
-                })?
-            else {
-                unreachable!()
-            };
-            ensure!(!changed && text == source.text, "Cited source changed");
-        }
-        eprintln!(
-            "grounded answer {:?}, {} verified citations",
-            start.elapsed(),
-            sources.len()
+        eprintln!("unsupported question returned no claims or citations");
+    }
+    Ok(())
+}
+
+/// A close distractor and an unrelated question exercise evidence selection and abstention with a real model
+#[test]
+#[ignore = "sends synthetic notes to the selected embedding and dialogue services"]
+fn knowledge_live_evidence_cases() -> Result<()> {
+    let corpus = tempfile::tempdir()?;
+    for (file, text) in [
+        (
+            "decision.md",
+            "银栎迁移项目因校验遗漏而推迟，只有完成双写核验才能发版。",
+        ),
+        ("handoff.md", "银栎迁移项目的复核负责人为许澜。"),
+        (
+            "other.md",
+            "赤槭迁移项目批准预算为七万元，复核负责人为邓杰。",
+        ),
+        ("draft.md", "银栎迁移项目的预算将在下次评审时讨论。"),
+        ("travel.md", "出差餐费凭票报销，餐饮预算采用定额。"),
+        ("schedule.md", "客服接待安排在每周三下午。"),
+    ] {
+        fs::write(corpus.path().join(file), text)?;
+    }
+    let (_index, lib, chat) = live_index(corpus.path().canonicalize()?.display().to_string())?;
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        ("银栎迁移上线还差哪项检查？", &[("decision.md", "双写")]),
+        (
+            "银栎迁移由谁复核？放行条件是什么？",
+            &[("handoff.md", "许澜"), ("decision.md", "双写")],
+        ),
+        ("赤槭迁移由谁复核？", &[("other.md", "邓杰")]),
+        (
+            "银栎迁移最终获批的金额是多少？只回答有记录的具体金额。",
+            &[],
+        ),
+        ("仓库周日几点关门？", &[]),
+    ];
+    for &(question, expected) in cases {
+        let KnowledgeResult::Matches { sources: hits, .. } =
+            lib.execute(KnowledgeOperation::Search {
+                query: question.into(),
+            })?
+        else {
+            unreachable!()
+        };
+        ensure!(
+            expected
+                .iter()
+                .all(|(path, _)| hits.iter().any(|s| s.path == *path)),
+            "Top results missed expected evidence for {question}"
         );
-        if let Ok(unsupported) = std::env::var("WAKU_TEST_UNANSWERABLE") {
-            let KnowledgeResult::Answer { text, sources, .. } =
-                lib.execute(KnowledgeOperation::Ask {
-                    query: unsupported,
-                    chat,
-                })?
-            else {
-                unreachable!()
-            };
+        let KnowledgeResult::Answer { text, sources, .. } =
+            lib.execute(KnowledgeOperation::Ask {
+                query: question.into(),
+                chat: chat.clone(),
+            })?
+        else {
+            unreachable!()
+        };
+        if expected.is_empty() {
             ensure!(
                 text.is_empty() && sources.is_empty(),
-                "The model answered an unsupported question"
+                "Answered without evidence: {question}: {text}"
             );
-            eprintln!("unsupported question returned no claims or citations");
+        } else {
+            for &(path, fact) in expected {
+                ensure!(
+                    text.contains(fact)
+                        && sources
+                            .iter()
+                            .any(|s| s.path == path && s.text.contains(fact)),
+                    "Missing fact or citation for {question}: {text}"
+                );
+            }
+            ensure!(
+                sources
+                    .iter()
+                    .all(|s| expected.iter().any(|(p, _)| s.path == *p)),
+                "Cited a distractor for {question}"
+            );
         }
-        Ok(())
-    })();
-    drop(lib);
-    fs::remove_dir_all(dir)?;
-    result
+        eprintln!("verified {question} ({} citations)", sources.len());
+    }
+    Ok(())
 }
 
 /// Incomplete work stays private to the indexing connection, including across process restarts
@@ -1218,6 +1322,15 @@ fn live_assistant_session(import_only: bool) -> Result<()> {
             fs::write(dest, index::read(&corpus, &path)?)?;
         }
     }
+    // Only the disposable library contains this random value, so the answer must come from a tool
+    let proof = format!("KB-{}", Uuid::new_v4().simple());
+    let evidence_path = format!("acceptance-{}.md", Uuid::new_v4());
+    if !import_only {
+        fs::write(
+            root.join(&evidence_path),
+            format!("银栎验收档案的交接暗号为 {proof}。"),
+        )?;
+    }
     let original = DaemonSettingsStore::open(crate::DaemonSettings::default_path())?;
     let settings = Arc::new(DaemonSettingsStore::open(tmp.path().join("settings.json"))?);
     let select = |name: &str| -> Result<KnowledgeModel> {
@@ -1332,6 +1445,22 @@ fn live_assistant_session(import_only: bool) -> Result<()> {
     ensure!(
         used.contains("knowledge_search") && answer.contains("waku-knowledge://"),
         "Missing semantic tool result or citation"
+    );
+    let id = lib.document_id(&evidence_path)?;
+    let (used, answer) = run("检索知识库，银栎验收档案的交接暗号是什么？请附原文链接。")?;
+    ensure!(
+        used.contains("knowledge_search")
+            && answer.contains(&proof)
+            && answer.contains(&format!("waku-knowledge://document/{id}?")),
+        "Incorrect fact or source in ordinary chat: {answer}"
+    );
+    let (used, answer) = run(
+        "请再次检索银栎验收档案，只回答这份档案中记录的预算审批金额；如果没有具体金额，只回答“未记录”。",
+    )?;
+    ensure!(
+        used.contains("knowledge_search")
+            && answer.trim().trim_end_matches(['。', '.']) == "未记录",
+        "Ordinary chat did not abstain: {answer}"
     );
     let (used, _) = run(
         "帮我新建一篇验收笔记，放在 verify/agent-proof.md，内容写 AGENT-RAG-42。请实际保存文件。",

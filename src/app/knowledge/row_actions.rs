@@ -280,6 +280,7 @@ impl Waku {
         let Some(id) = item.id else { return };
         let doc = &LibraryDocument {
             id,
+            revision: None,
             path: item.path.clone(),
         };
         match action {

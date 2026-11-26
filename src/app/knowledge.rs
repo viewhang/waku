@@ -52,6 +52,7 @@ pub(super) struct KnowledgePage {
     versions: Vec<LibraryVersion>,
     edit_revision: Option<String>,
     edit_original: SharedString,
+    edit_conflicted: bool,
 
     revision: u64,
     busy: bool,
@@ -75,6 +76,7 @@ struct TreeRow {
     path: String,
     name: String,
     id: Option<Uuid>,
+    revision: Option<String>,
     depth: usize,
     /// Precomputed while sorting so an open row menu never traverses the full directory
     can_move_up: bool,
@@ -82,6 +84,7 @@ struct TreeRow {
 }
 
 struct PreviewLocation {
+    revision: String,
     id: Uuid,
     path: String,
     changed: bool,
@@ -91,15 +94,46 @@ struct PreviewLocation {
 /// Only desktop previews replace a passage request with a parsed full document
 enum LibraryResponse {
     Command(KnowledgeResult),
-    Preview {
-        id: Uuid,
-        path: String,
-        changed: bool,
-        document: PreparedDocument,
-    },
+    Preview(LoadedPreview),
+}
+
+struct LoadedPreview {
+    id: Uuid,
+    path: String,
+    revision: String,
+    changed: bool,
+    document: PreparedDocument,
+}
+
+impl LoadedPreview {
+    /// Install parsed Markdown on the UI thread after the source was read in the background
+    fn into_location(self, cx: &mut App) -> PreviewLocation {
+        PreviewLocation {
+            id: self.id,
+            path: self.path,
+            revision: self.revision,
+            changed: self.changed,
+            document: DocumentPreview::new(self.document, cx),
+        }
+    }
 }
 
 impl KnowledgePage {
+    fn has_draft(&self, cx: &App) -> bool {
+        match self.panel {
+            Panel::Edit => self.editor.read(cx).content() != self.edit_original.as_ref(),
+            Panel::EditNew => {
+                !self.title_input.read(cx).content().is_empty()
+                    || !self.editor.read(cx).content().is_empty()
+            }
+            Panel::Import => {
+                !self.url_input.read(cx).content().is_empty()
+                    || !self.path_input.read(cx).content().is_empty()
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn new(window: &mut Window, cx: &mut Context<Waku>) -> Self {
         let rename_input = cx.new(|cx| TextInput::new(window, cx).submit_on_enter().tab_stop());
         cx.subscribe_in(&rename_input, window, |this, _, event, window, cx| {
@@ -181,6 +215,7 @@ impl KnowledgePage {
             versions: vec![],
             edit_revision: None,
             edit_original: "".into(),
+            edit_conflicted: false,
             revision: 0,
             busy: false,
             error: None,
@@ -288,16 +323,27 @@ impl Waku {
         }
         self.knowledge.poll = Some(cx.spawn(async move |view, cx| {
             loop {
-                let Ok(Some((client, browse, loaded, pins))) = view.update(cx, |this, _| {
-                    (this.library_visible()).then(|| {
-                        (
-                            this.daemon.client(),
-                            this.settings_page.is_none(),
-                            this.knowledge.loaded.clone(),
-                            this.state.pinned_documents.clone(),
-                        )
+                let Ok(Some((client, browse, loaded, pins, preview, intent))) =
+                    view.update(cx, |this, _| {
+                        (this.library_visible()).then(|| {
+                            (
+                                this.daemon.client(),
+                                this.settings_page.is_none(),
+                                this.knowledge.loaded.clone(),
+                                this.state.pinned_documents.clone(),
+                                this.knowledge
+                                    .location
+                                    .as_ref()
+                                    .filter(|_| {
+                                        this.knowledge.panel == Panel::Preview
+                                            && !this.knowledge.busy
+                                    })
+                                    .map(|loc| (loc.id, loc.revision.clone())),
+                                this.knowledge.revision,
+                            )
+                        })
                     })
-                }) else {
+                else {
                     return;
                 };
                 let result = cx
@@ -352,7 +398,23 @@ impl Waku {
                             {
                                 return Ok((latest, None));
                             }
-                            Some((document_tree(docs, folders, &positions, &pins), stamp))
+                            // Reparse only the open note when its indexed content has actually changed
+                            let refresh = if let Some((id, revision)) = preview
+                                && docs
+                                    .iter()
+                                    .find(|d| d.id == id)
+                                    .and_then(|d| d.revision.as_ref())
+                                    .is_some_and(|current| current != &revision)
+                            {
+                                Some(reader::load_preview(&client, id, None, 0, None)?)
+                            } else {
+                                None
+                            };
+                            Some((
+                                document_tree(docs, folders, &positions, &pins),
+                                stamp,
+                                refresh,
+                            ))
                         } else {
                             None
                         };
@@ -365,11 +427,27 @@ impl Waku {
                     }
                     match result {
                         Ok((status, rows)) => {
+                            // Another client can switch libraries while this editor still holds an unsaved note
+                            let page = &mut this.knowledge;
+                            if matches!(page.panel, Panel::Edit | Panel::EditNew)
+                                && page.status.config.as_ref().map(|c| &c.root)
+                                    != status.config.as_ref().map(|c| &c.root)
+                                && page.has_draft(cx)
+                            {
+                                let message = tr!("knowledge.draft_library_changed");
+                                if page.poll_error.as_ref() != Some(&message) {
+                                    page.poll_error = Some(message);
+                                    cx.notify();
+                                }
+                                return true;
+                            }
                             if this.knowledge.poll_error.take().is_some() {
                                 cx.notify();
                             }
+                            // A completed user action may already have invalidated this directory snapshot
+                            let rows = rows.filter(|_| this.knowledge.revision == intent);
                             this.apply_library_status(status, false, cx);
-                            if let Some((tree, stamp)) = rows {
+                            if let Some((tree, stamp, refresh)) = rows {
                                 let page = &mut this.knowledge;
                                 let first_load = page.loaded.is_none();
                                 // Renaming and pinning can reorder siblings, so follow documents by ID
@@ -389,13 +467,29 @@ impl Waku {
                                 {
                                     page.cursor = pos;
                                 }
-                                if page.panel == Panel::Preview
-                                    && let Some(loc) = page.location.as_mut()
+                                if let Some(update) = refresh
+                                    && page.revision == intent
+                                    && page.panel == Panel::Preview
+                                    && page
+                                        .location
+                                        .as_ref()
+                                        .is_some_and(|loc| loc.id == update.id)
                                 {
+                                    page.location = Some(update.into_location(cx));
+                                }
+                                if let Some(loc) = page.location.as_mut() {
                                     if let Some(row) =
                                         page.tree.iter().find(|row| row.id == Some(loc.id))
                                     {
                                         loc.path.clone_from(&row.path);
+                                        if matches!(page.panel, Panel::Edit | Panel::EditNew) {
+                                            page.edit_conflicted =
+                                                row.revision.as_ref().is_some_and(|r| {
+                                                    Some(r) != page.edit_revision.as_ref()
+                                                });
+                                        }
+                                    } else if matches!(page.panel, Panel::Edit | Panel::EditNew) {
+                                        page.edit_conflicted = true;
                                     } else {
                                         page.location = None;
                                     }
@@ -487,7 +581,8 @@ impl Waku {
             return;
         }
         let page = &mut self.knowledge;
-        let active_changed = page.status.config != status.config;
+        let active_changed =
+            page.status.config.as_ref().map(|c| &c.root) != status.config.as_ref().map(|c| &c.root);
         if active_changed {
             page.revision += 1;
             page.busy = false;
@@ -507,7 +602,7 @@ impl Waku {
             page.cursor = 0;
             page.error = None;
         }
-        if active_changed || saved_form {
+        if page.status.config != status.config || saved_form {
             page.embedding = status.config.as_ref().map(|c| c.embedding.clone());
             if saved_form {
                 page.close_add_form(cx);
@@ -606,18 +701,7 @@ impl Waku {
     /// A change of document or search must preserve text still waiting to be saved
     fn has_library_draft(&mut self, cx: &mut Context<Self>) -> bool {
         let p = &self.knowledge;
-        let dirty = match p.panel {
-            Panel::Edit => p.editor.read(cx).content() != p.edit_original.as_ref(),
-            Panel::EditNew => {
-                !p.title_input.read(cx).content().is_empty()
-                    || !p.editor.read(cx).content().is_empty()
-            }
-            Panel::Import => {
-                !p.url_input.read(cx).content().is_empty()
-                    || !p.path_input.read(cx).content().is_empty()
-            }
-            _ => false,
-        };
+        let dirty = p.has_draft(cx);
         if dirty {
             self.show_info_toast(tr!("knowledge.unsaved"));
             cx.notify();
@@ -719,7 +803,8 @@ impl Waku {
                         end,
                     } = operation
                     {
-                        return reader::load_preview(&client, id, revision.as_deref(), start, end);
+                        return reader::load_preview(&client, id, revision.as_deref(), start, end)
+                            .map(LibraryResponse::Preview);
                     }
                     request(&client, operation).map(LibraryResponse::Command)
                 })
@@ -752,9 +837,11 @@ impl Waku {
                         page.location = Some(PreviewLocation {
                             id,
                             path,
+                            revision: revision.clone(),
                             changed: false,
                             document: DocumentPreview::new(PreparedDocument::new("", 0), cx),
                         });
+                        page.edit_conflicted = false;
                         page.edit_revision = Some(revision);
                         page.edit_original = "".into();
                         page.title_input.update(cx, |input, cx| {
@@ -822,21 +909,13 @@ impl Waku {
                             input.set_placeholder("", cx);
                             input.set_content(page.edit_original.clone(), cx)
                         });
+                        page.edit_conflicted = false;
                         page.edit_revision = Some(revision);
                         page.panel = Panel::Edit;
                     }
-                    Ok(LibraryResponse::Preview {
-                        id,
-                        path,
-                        changed,
-                        document,
-                    }) => {
-                        page.location = Some(PreviewLocation {
-                            id,
-                            path,
-                            changed,
-                            document: DocumentPreview::new(document, cx),
-                        });
+                    Ok(LibraryResponse::Preview(preview)) => {
+                        let id = preview.id;
+                        page.location = Some(preview.into_location(cx));
                         page.panel = Panel::Preview;
                         page.move_picker = None;
                         page.select_document(id);
@@ -874,10 +953,13 @@ fn document_tree(
     }
     let entries = directories
         .into_iter()
-        .map(|path| (path, None))
-        .chain(docs.into_iter().map(|doc| (doc.path, Some(doc.id))));
+        .map(|path| (path, None, None))
+        .chain(
+            docs.into_iter()
+                .map(|doc| (doc.path, Some(doc.id), doc.revision)),
+        );
     let mut children: HashMap<String, Vec<TreeRow>> = HashMap::new();
-    for (path, id) in entries {
+    for (path, id, revision) in entries {
         let (parent, name) = row_actions::document_parts(&path);
         children
             .entry(parent.to_owned())
@@ -886,6 +968,7 @@ fn document_tree(
                 name: name.to_owned(),
                 path,
                 id,
+                revision,
                 depth: 0,
                 can_move_up: false,
                 can_move_down: false,
@@ -1079,6 +1162,38 @@ impl Waku {
         cx.notify();
     }
 
+    /// Back only abandons a dirty form after the user confirms for this exact edit
+    fn leave_library_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.knowledge.busy {
+            return;
+        }
+        if !self.knowledge.has_draft(cx) {
+            self.library_mode(Panel::Preview, cx);
+            return;
+        }
+        let revision = self.knowledge.revision;
+        let confirm = window.prompt(
+            gpui::PromptLevel::Warning,
+            &tr!("knowledge.confirm_discard"),
+            None,
+            &[
+                gpui::PromptButton::cancel(tr!("knowledge.keep_editing")),
+                gpui::PromptButton::new(tr!("knowledge.discard")),
+            ],
+            cx,
+        );
+        cx.spawn(async move |view, cx| {
+            if confirm.await == Ok(1) {
+                let _ = view.update(cx, |this, cx| {
+                    if this.knowledge.revision == revision {
+                        this.library_mode(Panel::Preview, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
     fn library_mode(&mut self, mode: Panel, cx: &mut Context<Self>) {
         if self.knowledge.busy || (mode != Panel::Preview && self.has_library_draft(cx)) {
             return;
@@ -1092,6 +1207,10 @@ impl Waku {
                 i.clear(cx);
             });
             self.knowledge.url_input.update(cx, |i, cx| i.clear(cx));
+        }
+        // Returning to a preview reconciles any edits or deletion observed while the form was open
+        if mode == Panel::Preview {
+            self.knowledge.loaded = None;
         }
         self.knowledge.panel = mode;
         self.knowledge.move_picker = None;
@@ -1570,16 +1689,7 @@ impl Waku {
             .flex_col()
             .bg(theme.surface);
         if p.status.config.is_none() {
-            return base
-                .items_center()
-                .justify_center()
-                .child(assistant_button(
-                    "library-setup",
-                    tr!("knowledge.configure"),
-                    cx,
-                    |t, _, cx| t.open_settings_page(SettingsPage::Knowledge, cx),
-                ))
-                .into_any_element();
+            return base.into_any_element();
         }
         if p.panel == Panel::Move
             && let Some(picker) = &p.move_picker
@@ -1604,6 +1714,9 @@ impl Waku {
                     );
                 } else {
                     editor = editor.child(tr!("knowledge.edit"));
+                }
+                if p.edit_conflicted {
+                    editor = editor.child(tr!("knowledge.edit_conflict"));
                 }
                 editor = editor.child(
                     div()
@@ -1638,7 +1751,7 @@ impl Waku {
                             "cancel-note",
                             tr!("settings.back"),
                             cx,
-                            |t, _, cx| t.library_mode(Panel::Preview, cx),
+                            |t, window, cx| t.leave_library_form(window, cx),
                         )),
                 )
                 .into_any_element();
@@ -1728,6 +1841,7 @@ mod tests {
             .map(|path| LibraryDocument {
                 id: Uuid::new_v4(),
                 path: path.into(),
+                revision: None,
             })
             .collect();
         let pins = HashSet::from([docs[2].id, docs[3].id]);
@@ -1758,6 +1872,7 @@ mod tests {
             .map(|path| LibraryDocument {
                 id: Uuid::new_v4(),
                 path: path.into(),
+                revision: None,
             })
             .collect();
         let pins = HashSet::from([docs[1].id]);

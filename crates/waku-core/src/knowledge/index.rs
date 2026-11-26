@@ -130,8 +130,8 @@ pub(super) fn list(
     offset: usize,
     include_folders: bool,
 ) -> Result<KnowledgeResult> {
-    let mut stmt = db.prepare("SELECT entries.id,entries.path,entry_order.position FROM
-        (SELECT id,path FROM documents WHERE root=?1 UNION ALL SELECT NULL,path FROM folders WHERE root=?1 AND ?2) entries
+    let mut stmt = db.prepare("SELECT entries.id,entries.path,entry_order.position,entries.revision FROM
+        (SELECT id,path,revision FROM documents WHERE root=?1 UNION ALL SELECT NULL,path,NULL FROM folders WHERE root=?1 AND ?2) entries
         LEFT JOIN entry_order ON entry_order.root=?1 AND entry_order.path=entries.path ORDER BY entries.path LIMIT 51 OFFSET ?3")?;
     let mut rows = stmt.query(params![root, include_folders, offset])?;
     let mut documents = Vec::new();
@@ -151,6 +151,7 @@ pub(super) fn list(
             Some(id) => documents.push(LibraryDocument {
                 id: id.parse()?,
                 path,
+                revision: row.get(3)?,
             }),
             None => folders.push(path),
         }

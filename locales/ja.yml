@@ -1292,3 +1292,13 @@ knowledge.no_versions: "履歴はありません"
 knowledge.unsaved: "変更を保存またはキャンセルしてから文書を切り替えてください"
 
 knowledge.model_requires_tools: "ノートを検索・管理するには、ツール呼び出しに対応した対話モデルを選んでください"
+
+knowledge.confirm_discard: "未保存の変更を破棄しますか？"
+
+knowledge.keep_editing: "編集を続ける"
+
+knowledge.discard: "変更を破棄"
+
+knowledge.edit_conflict: "文書が変更または削除されました。編集中の内容をコピーしてから文書を開き直してください。"
+
+knowledge.draft_library_changed: "ライブラリが切り替わりました。下書きは開いたままです。戻る前に残したい内容をコピーしてください。"

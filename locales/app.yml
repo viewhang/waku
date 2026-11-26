@@ -2687,3 +2687,18 @@ knowledge.unsaved:
 
 knowledge.model_requires_tools:
   en: "Choose a dialogue model with tool calling to let this assistant search and manage notes"
+
+knowledge.confirm_discard:
+  en: "Discard these unsaved changes?"
+
+knowledge.keep_editing:
+  en: "Keep editing"
+
+knowledge.discard:
+  en: "Discard changes"
+
+knowledge.edit_conflict:
+  en: "This note changed or was removed. Your edits are still here. Copy them before reopening the note."
+
+knowledge.draft_library_changed:
+  en: "The active library changed. Your draft is still open. Copy any edits you want to keep before leaving."

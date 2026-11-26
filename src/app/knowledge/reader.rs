@@ -34,7 +34,7 @@ pub(super) fn load_preview(
     expected: Option<&str>,
     start: usize,
     end: Option<usize>,
-) -> anyhow::Result<LibraryResponse> {
+) -> anyhow::Result<LoadedPreview> {
     let KnowledgeResult::Source {
         path,
         text,
@@ -60,7 +60,8 @@ pub(super) fn load_preview(
         );
         start
     };
-    Ok(LibraryResponse::Preview {
+    Ok(LoadedPreview {
+        revision,
         id,
         path,
         changed,

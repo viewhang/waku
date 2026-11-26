@@ -277,11 +277,13 @@ impl KnowledgeLibrary {
             UNION ALL SELECT path || '/' FROM folders WHERE root=?1
         ), entries AS (SELECT substr(path,length(?2)+1) AS tail FROM paths WHERE substr(path,1,length(?2))=?2 AND path!=?2)
         ,names AS (SELECT DISTINCT CASE WHEN ?3 OR instr(tail,'/')=0 THEN tail ELSE substr(tail,1,instr(tail,'/')) END name FROM entries)
-        SELECT name FROM names LEFT JOIN entry_order o ON o.root=?1 AND o.path=?2 || rtrim(name,'/')
+        SELECT name,d.id FROM names
+        LEFT JOIN documents d ON d.root=?1 AND d.path=?2 || name
+        LEFT JOIN entry_order o ON o.root=?1 AND o.path=?2 || rtrim(name,'/')
         ORDER BY CASE WHEN NOT ?3 THEN o.position END NULLS LAST, CASE WHEN NOT ?3 AND substr(name,-1)='/' THEN 0 ELSE 1 END, name LIMIT 51 OFFSET ?4")?;
         let mut paths = stmt
             .query_map(params![config.root, prefix, recursive, offset], |r| {
-                r.get::<_, String>(0)
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let has_more = paths.len() > 50;
@@ -289,11 +291,12 @@ impl KnowledgeLibrary {
         let root = manage::root_dir(Path::new(&config.root))?;
         let next = has_more.then(|| offset + paths.len());
         let mut documents = Vec::with_capacity(paths.len());
-        for entry in paths {
+        for (entry, id) in paths {
             let path = format!("{prefix}{entry}");
             if entry.ends_with('/') {
                 documents.push(serde_json::json!({"path":path,"directory":true}));
-            } else if let Some(details) = manage::entry_details(&root, &path)? {
+            } else if let Some(mut details) = manage::entry_details(&root, &path)? {
+                details["document_id"] = serde_json::json!(id);
                 documents.push(details);
             }
         }
@@ -373,8 +376,12 @@ impl KnowledgeLibrary {
                 s.catalog_revision = uuid::Uuid::new_v4().to_string()
             });
         }
-        let model = LibraryModel::resolve(&self.settings, &config.embedding, true)?;
-        let key = index_key(config, model.url.as_str());
+        // File revisions also drive open previews and conflict notices when embedding is unavailable
+        let model = LibraryModel::resolve(&self.settings, &config.embedding, true);
+        let key = model
+            .as_ref()
+            .map(|m| index_key(config, m.url.as_str()))
+            .unwrap_or_default();
         self.current(generation)?;
         index::forget_missing(&mut db, &config.root, &files)?;
         revisions.retain(|path, _| files.binary_search(path).is_ok());
@@ -429,6 +436,7 @@ impl KnowledgeLibrary {
             s.catalog_revision = index::revision(&manifest);
         });
         drop(catalog_write);
+        let model = model?;
         // A bad document gets retried without permanently starving later notes during an outage
         if let Some(failed) = last_failure.take() {
             let next = pending.partition_point(|(path, _, _)| *path <= &failed);
@@ -651,7 +659,12 @@ fn cited_answer(raw: &str, sources: &[KnowledgeSource]) -> Result<(String, Vec<K
     #[derive(Deserialize)]
     struct Claim {
         text: String,
-        sources: Vec<usize>,
+        sources: Vec<Support>,
+    }
+    #[derive(Deserialize)]
+    struct Support {
+        number: usize,
+        quote: String,
     }
     let json = raw.trim();
     let json = json
@@ -669,10 +682,17 @@ fn cited_answer(raw: &str, sources: &[KnowledgeSource]) -> Result<(String, Vec<K
             "A claim has no supporting source"
         );
         let mut line = claim.text.trim().to_owned();
-        for id in claim.sources {
+        for support in claim.sources {
+            let id = support.number;
             ensure!(
                 id > 0 && id <= sources.len(),
                 "Answer cites an unknown source"
+            );
+            // A valid citation number alone cannot establish that the model saw the claimed evidence
+            let quote = support.quote.trim();
+            ensure!(
+                !quote.is_empty() && sources[id - 1].text.contains(quote),
+                "Answer quotes text missing from its cited excerpt"
             );
             let pos = match used.iter().position(|s| *s == id) {
                 Some(i) => i,

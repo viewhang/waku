@@ -1350,3 +1350,13 @@ knowledge.no_versions: "暂无历史版本"
 knowledge.unsaved: "请先保存或取消当前编辑，再切换文档"
 
 knowledge.model_requires_tools: "让助手检索和管理笔记，需要选择支持工具调用的对话模型"
+
+knowledge.confirm_discard: "放弃尚未保存的修改？"
+
+knowledge.keep_editing: "继续编辑"
+
+knowledge.discard: "放弃修改"
+
+knowledge.edit_conflict: "原文已被修改或删除。当前草稿仍在，请复制需要保留的内容后再重新打开文档。"
+
+knowledge.draft_library_changed: "当前知识库已切换，草稿仍在。离开前请复制需要保留的内容。"

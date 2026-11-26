@@ -172,7 +172,10 @@ impl KnowledgeLibrary {
                 let tx = db.transaction()?;
                 save_position(&tx, dir, root, from, sibling, after)?;
                 tx.commit()?;
-                self.state.lock().status.catalog_revision = Uuid::new_v4().to_string();
+                let mut state = self.state.lock();
+                if state.status.config.as_ref().is_some_and(|c| c.root == root) {
+                    state.status.catalog_revision = Uuid::new_v4().to_string();
+                }
             }
             return Ok(KnowledgeResult::Managed {
                 paths: vec![to.into()],
@@ -281,7 +284,7 @@ impl KnowledgeLibrary {
             rename_new(dir, root_path, dst, src)?;
             return Err(error);
         }
-        self.tree_changed();
+        self.tree_changed(root);
         Ok(KnowledgeResult::Managed {
             paths: vec![to.into()],
         })
@@ -315,17 +318,19 @@ impl KnowledgeLibrary {
             rename_new(dir, Path::new(root), &trash, source)?;
             return Err(error.into());
         }
-        self.tree_changed();
+        self.tree_changed(root);
         Ok(KnowledgeResult::Managed {
             paths: vec![path.into()],
         })
     }
 
     /// Publish path changes immediately and invalidate workers still using the previous paths
-    fn tree_changed(&self) {
+    fn tree_changed(&self, root: &str) {
         let mut state = self.state.lock();
         state.generation += 1;
-        state.status.catalog_revision = Uuid::new_v4().to_string();
+        if state.status.config.as_ref().is_some_and(|c| c.root == root) {
+            state.status.catalog_revision = Uuid::new_v4().to_string();
+        }
         let _ = self.wake.try_send(());
     }
 }

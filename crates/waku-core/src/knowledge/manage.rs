@@ -241,6 +241,73 @@ impl KnowledgeLibrary {
         self.apply_action(config, action, article)
     }
 
+    /// Legacy path calls are scoped to the active library; require an ID if another saved library has that note
+    pub(crate) fn manage_agent_paths(&self, action: LibraryAction) -> Result<KnowledgeResult> {
+        let paths = match &action {
+            LibraryAction::Update { path, .. }
+            | LibraryAction::Delete { path }
+            | LibraryAction::Move { from: path, .. }
+            | LibraryAction::Reorder { path, .. } => std::slice::from_ref(path),
+            LibraryAction::BatchTag { paths, .. } => paths.as_slice(),
+            _ => return self.manage(action),
+        };
+        let _serial = self.writes.lock();
+        let (_, config) = self.active()?;
+        let libraries = self.state.lock().status.libraries.clone();
+        if libraries.len() > 1 {
+            let db = index::connect(&self.path)?;
+            // Probe the existing (root, path) index for each saved library
+            let mut exists =
+                db.prepare("SELECT EXISTS(SELECT 1 FROM documents WHERE root=? AND path=?)")?;
+            for owner in libraries.iter().filter(|c| c.root != config.root) {
+                for path in paths {
+                    let duplicate: bool = exists.query_row([&owner.root, path], |r| r.get(0))?;
+                    ensure!(
+                        !duplicate,
+                        "This path also occurs in another library. Read and use the intended document ID"
+                    );
+                }
+            }
+        }
+        self.apply_action(config, action, None)
+    }
+
+    /// Bind search hits to their registered library and current paths for the duration of the write
+    pub(crate) fn manage_documents(
+        &self,
+        ids: &[Uuid],
+        build: impl FnOnce(Vec<String>) -> Result<LibraryAction>,
+    ) -> Result<KnowledgeResult> {
+        let (first, rest) = ids.split_first().context("Select at least one document")?;
+        let _serial = self.writes.lock();
+        let db = index::connect(&self.path)?;
+        let (root, path) = index::document_location(&db, *first)?;
+        let config = {
+            let state = self.state.lock();
+            let libraries = &state.status.libraries;
+            libraries[super::catalog::position(libraries, &root)?].clone()
+        };
+        let mut paths = vec![path];
+        for id in rest {
+            let (owner, path) = index::document_location(&db, *id)?;
+            ensure!(owner == root, "Group notes by library before tagging them");
+            paths.push(path);
+        }
+        let action = build(paths)?;
+        // An externally replaced directory must never be moved using a stale note identity
+        if let LibraryAction::Move { from: path, .. } | LibraryAction::Reorder { path, .. } =
+            &action
+        {
+            ensure!(
+                root_dir(Path::new(&root))?
+                    .symlink_metadata(valid_path(path)?)?
+                    .is_file(),
+                "The document was replaced"
+            );
+        }
+        self.apply_action(config, action, None)
+    }
+
     /// Allocate and publish the name under the same lock so simultaneous creates get separate entries
     pub(super) fn create_untitled(
         &self,
@@ -632,7 +699,23 @@ impl KnowledgeLibrary {
         if !changes.is_empty() {
             let mut state = self.state.lock();
             state.generation += 1;
-            state.status.indexing = true;
+            if state
+                .status
+                .config
+                .as_ref()
+                .is_some_and(|c| c.root == config.root)
+            {
+                if state
+                    .status
+                    .config
+                    .as_ref()
+                    .is_some_and(|c| c.root == config.root)
+                {
+                    state.status.indexing = true;
+                    state.status.catalog_revision = Uuid::new_v4().to_string();
+                }
+                state.status.catalog_revision = Uuid::new_v4().to_string();
+            }
             let _ = self.wake.try_send(());
         }
         Ok(KnowledgeResult::Managed { paths: reported })

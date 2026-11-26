@@ -74,6 +74,10 @@ pub struct LibraryStatus {
 pub struct LibraryDocument {
     pub id: Uuid,
     pub path: String,
+    /// Older daemons omit the content revision when listing the directory
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, TS)]
