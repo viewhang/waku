@@ -2172,7 +2172,7 @@ impl Waku {
             return;
         }
         if !matches!(source.status, SessionStatus::Idle | SessionStatus::Failed) {
-            self.show_info_toast(tr!("session.stop_before_rewind"));
+            self.show_warning_toast(tr!("session.stop_before_rewind"));
             cx.notify();
             return;
         }

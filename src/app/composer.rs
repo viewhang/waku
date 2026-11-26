@@ -2085,7 +2085,7 @@ impl Waku {
             paths.retain(|path| !is_image_attachment_path(path));
             if paths.len() != count || !images.is_empty() {
                 images.clear();
-                self.show_info_toast(tr!("assistant.image_input_unsupported"));
+                self.show_warning_toast(tr!("assistant.image_input_unsupported"));
                 cx.notify();
             }
         }
@@ -2189,7 +2189,7 @@ impl Waku {
         let notice = if self.composer_attachments.iter().any(|a| a.is_image)
             && !self.composer_accepts_images()
         {
-            Some(tr!("assistant.image_input_unsupported"))
+            Some(tr!("assistant.remove_image_or_switch_model"))
         } else if self.composer_attachments.iter().any(|a| {
             a.blob_reference.is_none()
                 && a.mention
@@ -2205,7 +2205,7 @@ impl Waku {
                 self.composer
                     .update(cx, |input, cx| input.set_content(prompt.to_owned(), cx));
             }
-            self.show_info_toast(notice);
+            self.show_warning_toast(notice);
             cx.notify();
             return None;
         }

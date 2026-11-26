@@ -41,6 +41,8 @@ pub(super) struct KnowledgePage {
     /// Directory operations remember the library and the row that opened the menu
     move_picker: Option<MovePicker>,
     rename_target: Option<TreeItem>,
+    /// Show the field warning after a rejected rename until the name is corrected
+    rename_name_warning: bool,
     drop_hint: Option<(String, DropZone)>,
     hover_expand: Option<gpui::Task<()>>,
     /// Keep the pending rename valid when the same mouse click opens another preview
@@ -136,9 +138,15 @@ impl KnowledgePage {
 
     pub(super) fn new(window: &mut Window, cx: &mut Context<Waku>) -> Self {
         let rename_input = cx.new(|cx| TextInput::new(window, cx).submit_on_enter().tab_stop());
-        cx.subscribe_in(&rename_input, window, |this, _, event, window, cx| {
+        cx.subscribe_in(&rename_input, window, |this, field, event, window, cx| {
             if let InputEvent::Submit(name) = event {
                 this.submit_document_rename(name, window, cx);
+            } else if matches!(event, InputEvent::Edited)
+                && this.knowledge.rename_name_warning
+                && KnowledgePage::valid_rename_name(field.read(cx).content())
+            {
+                this.knowledge.rename_name_warning = false;
+                cx.notify();
             }
         })
         .detach();
@@ -202,6 +210,7 @@ impl KnowledgePage {
             drop_hint: None,
             hover_expand: None,
             rename_target: None,
+            rename_name_warning: false,
             rename_save: None,
             rename_input,
             path_input,
@@ -703,7 +712,7 @@ impl Waku {
         let p = &self.knowledge;
         let dirty = p.has_draft(cx);
         if dirty {
-            self.show_info_toast(tr!("knowledge.unsaved"));
+            self.show_warning_toast(tr!("knowledge.unsaved"));
             cx.notify();
         }
         dirty
@@ -1468,6 +1477,32 @@ impl Waku {
                             TextField::new("knowledge-rename-field", p.rename_input.clone())
                                 .flex_1()
                                 .min_w_0()
+                                .relative()
+                                .when(p.rename_name_warning, |field| {
+                                    // Anchor the warning to the input without resizing virtualized rows
+                                    let hint = div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(5.))
+                                        .px(px(8.))
+                                        .py(px(4.))
+                                        .rounded(px(5.))
+                                        .border_1()
+                                        .border_color(theme.warning)
+                                        .bg(theme.raised)
+                                        .text_color(theme.text)
+                                        .text_size(sp(12.))
+                                        .whitespace_nowrap()
+                                        .child(icon("icons/alert.svg", 13., theme.warning))
+                                        .child(tr!("knowledge.invalid_name"));
+                                    field.child(
+                                        div().absolute().left_0().top_full().child(gpui::deferred(
+                                            gpui::anchored()
+                                                .snap_to_window_with_margin(px(6.))
+                                                .child(hint),
+                                        )),
+                                    )
+                                })
                                 .on_mouse_down_out(cx.listener(Self::click_outside_document_rename))
                                 .on_action(cx.listener(
                                     |this, _: &crate::input::Clear, window, cx| {

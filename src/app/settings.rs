@@ -1234,7 +1234,7 @@ impl Waku {
             .iter()
             .any(|session| !matches!(session.status, SessionStatus::Idle | SessionStatus::Failed))
         {
-            self.show_info_toast(tr!("daemon.stop_active_tasks"));
+            self.show_warning_toast(tr!("daemon.stop_active_tasks"));
             cx.notify();
             return;
         }

@@ -37,6 +37,11 @@ fn edit_filename(input: &mut TextInput, name: &str, cx: &mut Context<TextInput>)
 }
 
 impl KnowledgePage {
+    /// Document and folder renames accept a single nonempty path component
+    pub(super) fn valid_rename_name(name: &str) -> bool {
+        !name.trim().is_empty() && !name.contains(['/', '\\'])
+    }
+
     /// New folders and the rename command share the same inline selection and commit behavior
     pub(super) fn prepare_rename(&mut self, item: TreeItem, cx: &mut Context<Waku>) -> FocusHandle {
         let (_, name) = document_parts(&item.path);
@@ -47,6 +52,7 @@ impl KnowledgePage {
             }
         });
         self.rename_target = Some(item);
+        self.rename_name_warning = false;
         self.rename_input.read(cx).focus()
     }
 }
@@ -289,7 +295,7 @@ impl Waku {
                 if let Some(config) = &self.knowledge.status.config {
                     let path = Path::new(&config.root).join(&doc.path);
                     cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
-                    self.show_info_toast(tr!("common.copied"));
+                    self.show_success_toast(tr!("common.copied"));
                 }
             }
             RowAction::Pin | RowAction::Favorite => {
@@ -419,8 +425,8 @@ impl Waku {
             return true;
         };
         let name = name.trim();
-        if name.is_empty() || name.contains(['/', '\\']) {
-            self.show_error_toast(tr!("knowledge.invalid_name"));
+        if !KnowledgePage::valid_rename_name(name) {
+            page.rename_name_warning = true;
             cx.notify();
             return false;
         }
@@ -558,6 +564,14 @@ impl Waku {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_rename_requires_a_nonempty_name_without_path_separators() {
+        for name in ["", "  ", "笔记/草稿", "笔记\\草稿"] {
+            assert!(!KnowledgePage::valid_rename_name(name));
+        }
+        assert!(KnowledgePage::valid_rename_name("会议 记录.md"));
+    }
 
     /// Typing over a Chinese filename replaces the selected stem and leaves the suffix editable
     #[gpui::test]

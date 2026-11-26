@@ -1105,6 +1105,7 @@ assistant.fields_required: 请输入助手名称
 assistant.current_project: "已选项目：%{project}"
 assistant.text_only: 此助手支持文本输入，请先移除附件
 assistant.image_input_unsupported: 当前模型不支持图片输入，请选择支持视觉的模型
+assistant.remove_image_or_switch_model: 当前模型不支持图片输入，请移除图片或切换到支持视觉的模型后再发送
 assistant.test_ok: 模型连接正常
 assistant.tool_unavailable: 此助手会话未配置该工具，未执行
 assistant.web_search: "联网搜索"
