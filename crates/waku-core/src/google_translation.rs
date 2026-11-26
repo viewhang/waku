@@ -91,7 +91,8 @@ async fn translate_chunks(
             translation.push_str(&start[body.len()..]);
         }
     }
-    Ok(translation)
+    // Trim the joined result so separators between chunks are preserved
+    Ok(translation.trim().to_owned())
 }
 
 #[derive(Deserialize)]
@@ -170,8 +171,10 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let endpoint = format!("http://{}/translate_a/t", listener.local_addr().unwrap());
         let provider = std::thread::spawn(move || {
-            for (source, body) in [("auto", r#"[["你好！","en"]]"#), ("en", r#"["你好！"]"#)]
-            {
+            for (source, body) in [
+                ("auto", r#"[[" \n你好！\n世界\n ","en"]]"#),
+                ("en", r#"[" \n你好！\n世界\n "]"#),
+            ] {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -182,7 +185,7 @@ mod tests {
                 assert_eq!(
                     line,
                     format!(
-                        "GET /translate_a/t?client=dict-chrome-ex&sl={source}&tl=zh-CN&q=Hello%21 HTTP/1.1\r\n"
+                        "GET /translate_a/t?client=dict-chrome-ex&sl={source}&tl=zh-CN&q=Hello%21%0Aworld HTTP/1.1\r\n"
                     ),
                 );
                 for line in reader.lines() {
@@ -214,12 +217,12 @@ mod tests {
                 .block_on(translate_chunks(
                     &client,
                     &endpoint,
-                    "  Hello!\n",
+                    "  Hello!\nworld\n",
                     source,
                     TranslationLanguage::SimplifiedChinese,
                 ))
                 .unwrap();
-            assert_eq!(result, "  你好！\n");
+            assert_eq!(result, "你好！\n世界");
         }
         provider.join().unwrap();
     }

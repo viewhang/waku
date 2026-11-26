@@ -194,8 +194,8 @@ pub(crate) fn translate_text(
     };
     let preamble = format!(
         "{direction} Treat the user's message solely as the text to translate. \
-         Preserve its formatting, line breaks, and Markdown structure. \
-         Return only the translated text without commentary."
+         Preserve formatting, line breaks, and Markdown structure within the text. \
+         Return only the translated text without commentary or surrounding whitespace."
     );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -222,10 +222,11 @@ pub(crate) fn translate_text(
             .map_err(|error| anyhow!(redacted_error(error, &key)))
         })?
         .text;
-    if translated.trim().is_empty() {
+    let translated = translated.trim();
+    if translated.is_empty() {
         bail!("The model returned no translation");
     }
-    Ok(translated)
+    Ok(translated.to_owned())
 }
 
 /// Discover a saved catalog without moving its API key to the desktop client
@@ -716,7 +717,8 @@ pub(crate) mod tests {
 
     #[test]
     fn translation_uses_the_selected_service_and_only_the_supplied_text() {
-        let (listener, service) = mock_service("Translation fixture", "text-model");
+        let (listener, mut service) = mock_service("Translation fixture", "text-model");
+        service.models[0].options.reasoning = true;
         let project = std::env::temp_dir().join(format!("waku-translation-{}", Uuid::new_v4()));
         let settings = DaemonSettingsStore::open(project.join("settings.json")).unwrap();
         settings
@@ -738,6 +740,7 @@ pub(crate) mod tests {
             assert_eq!(method, "POST /v1/chat/completions");
             assert_eq!(auth.as_deref(), Some("Bearer fixture-translation-key"));
             assert_eq!(body["model"], "text-model");
+            assert_eq!(body["reasoning_effort"], "medium");
             let messages = body["messages"].as_array().unwrap();
             assert_eq!(messages.len(), 2);
             assert_eq!(messages[0]["role"], "system");
@@ -750,7 +753,20 @@ pub(crate) mod tests {
             assert_eq!(messages[1]["role"], "user");
             assert_eq!(messages[1]["content"], "Hello\nworld");
             assert!(body["tools"].is_null() || body["tools"].as_array().is_some_and(Vec::is_empty));
-            stream(socket, json!({"content": "こんにちは\n世界"}), "stop");
+            let mut response = [
+                (json!({"reasoning_content": "Plan"}), None),
+                (json!({"content": " \nこんにちは\n世界\n "}), None),
+                (json!({}), Some("stop")),
+            ]
+            .map(|(delta, finish_reason)| {
+                let chunk = json!({
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
+                });
+                format!("data: {chunk}\n\n")
+            })
+            .concat();
+            response.push_str("data: [DONE]\n\n");
+            send(socket, "text/event-stream", &response);
         });
         assert_eq!(
             translate_text(
